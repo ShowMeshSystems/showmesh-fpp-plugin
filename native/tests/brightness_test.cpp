@@ -1,6 +1,7 @@
 #include "showmesh/brightness.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -181,10 +182,10 @@ TEST(AnEmptyApplyListScalesTheWholeUniverse) {
 
 TEST(StaleDuplicateAndUnsupportedFullStatePayloadsAreRejected) {
     BrightnessEngine engine;
-    CHECK(engine.setCeiling(80, 0, kT0).ok);  // revision 1
+    CHECK(engine.setCeiling(80, 0, kT0).ok);  // stateChangedAtMillis == kT0
 
     BrightnessState newer = engine.captureState(kT0);
-    newer.revision = 5;
+    newer.stateChangedAtMillis = kT0 + 1000;
     newer.ceilingTarget = 40;
     newer.ceilingStart = 40;
     CHECK(engine.adoptState(newer) == StateAdoption::kAdopted);
@@ -195,19 +196,132 @@ TEST(StaleDuplicateAndUnsupportedFullStatePayloadsAreRejected) {
     CHECK_NEAR(engine.ceilingAt(kT0), 40.0, 1e-9);
 
     BrightnessState older = newer;
-    older.revision = 4;
+    older.stateChangedAtMillis = kT0 + 500;
     older.ceilingTarget = 100;
     older.ceilingStart = 100;
     CHECK(engine.adoptState(older) == StateAdoption::kRejectedStaleRevision);
     CHECK_NEAR(engine.ceilingAt(kT0), 40.0, 1e-9);
 
     BrightnessState future = newer;
-    future.revision = 9;
+    future.stateChangedAtMillis = kT0 + 2000;
     future.schemaVersion = showmesh::kBrightnessStateSchemaVersion + 1;
     future.ceilingTarget = 100;
     future.ceilingStart = 100;
     CHECK(engine.adoptState(future) == StateAdoption::kRejectedUnsupportedVersion);
     CHECK_NEAR(engine.ceilingAt(kT0), 40.0, 1e-9);
+}
+
+// MultiSync orders full state by (stateChangedAtMillis, instanceId), never
+// by the sender's local revision counter, so two nodes converge on the
+// same state regardless of which one adopts first.
+TEST(TwoEnginesWithEqualTimestampsConvergeRegardlessOfAdoptionOrder) {
+    BrightnessEngine a;
+    a.setInstanceId("node-a");
+    CHECK(a.setCeiling(40, 0, kT0).ok);
+
+    BrightnessEngine b;
+    b.setInstanceId("node-b");
+    CHECK(b.setCeiling(70, 0, kT0).ok);
+
+    const BrightnessState stateA = a.captureState(kT0);
+    const BrightnessState stateB = b.captureState(kT0);
+
+    // a adopts b's state, b adopts a's state: both timestamps are equal,
+    // so the tiebreak is instanceId, and "node-b" > "node-a" wins on both
+    // sides regardless of adoption order.
+    const StateAdoption aResult = a.adoptState(stateB);
+    const StateAdoption bResult = b.adoptState(stateA);
+    CHECK(aResult == StateAdoption::kAdopted);
+    CHECK(bResult == StateAdoption::kRejectedStaleRevision);
+    CHECK_NEAR(a.ceilingAt(kT0), 70.0, 1e-9);
+    CHECK_NEAR(b.ceilingAt(kT0), 70.0, 1e-9);
+
+    // Now adopt in the opposite order starting from two fresh engines:
+    // the outcome does not depend on which engine goes first.
+    BrightnessEngine c;
+    c.setInstanceId("node-a");
+    CHECK(c.setCeiling(40, 0, kT0).ok);
+    BrightnessEngine d;
+    d.setInstanceId("node-b");
+    CHECK(d.setCeiling(70, 0, kT0).ok);
+    const BrightnessState stateC = c.captureState(kT0);
+    const BrightnessState stateD = d.captureState(kT0);
+    CHECK(d.adoptState(stateC) == StateAdoption::kRejectedStaleRevision);
+    CHECK(c.adoptState(stateD) == StateAdoption::kAdopted);
+    CHECK_NEAR(c.ceilingAt(kT0), 70.0, 1e-9);
+    CHECK_NEAR(d.ceilingAt(kT0), 70.0, 1e-9);
+}
+
+TEST(AGenuinelyOlderStateIsRefusedByTimestamp) {
+    BrightnessEngine engine;
+    engine.setInstanceId("node-a");
+    CHECK(engine.setCeiling(50, 0, kT0 + 10'000).ok);
+
+    BrightnessState olderFromOtherNode = engine.captureState(kT0 + 10'000);
+    olderFromOtherNode.instanceId = "node-z";  // would win a tiebreak
+    olderFromOtherNode.stateChangedAtMillis = kT0;  // but it is strictly older
+    olderFromOtherNode.ceilingTarget = 5;
+    olderFromOtherNode.ceilingStart = 5;
+
+    CHECK(engine.adoptState(olderFromOtherNode) == StateAdoption::kRejectedStaleRevision);
+    CHECK_NEAR(engine.ceilingAt(kT0 + 10'000), 50.0, 1e-9);
+}
+
+// finding 2: an adopted fade window with an implausible magnitude must
+// never overflow the composition on a later frame.
+TEST(AnImplausibleFadeWindowIsRejectedBeforeAdoption) {
+    BrightnessEngine engine;
+    BrightnessState state = engine.captureState(kT0);
+    state.stateChangedAtMillis = kT0 + 1000;
+    state.ceilingTarget = 0;
+    state.ceilingFadeStartMillis = INT64_MIN;
+    state.ceilingFadeEndMillis = INT64_MAX;
+    CHECK(engine.adoptState(state) == StateAdoption::kRejectedInvalidFadeWindow);
+    // Nothing was adopted: the ceiling is still the untouched default.
+    CHECK_NEAR(engine.ceilingAt(kT0), 100.0, 1e-9);
+
+    // An inverted-but-plausible-magnitude window is refused the same way.
+    BrightnessState inverted = engine.captureState(kT0);
+    inverted.stateChangedAtMillis = kT0 + 1000;
+    inverted.ceilingFadeStartMillis = kT0 + 5000;
+    inverted.ceilingFadeEndMillis = kT0;
+    CHECK(engine.adoptState(inverted) == StateAdoption::kRejectedInvalidFadeWindow);
+
+    // A window longer than the registered action's own 86400-second bound
+    // is refused too.
+    BrightnessState tooLong = engine.captureState(kT0);
+    tooLong.stateChangedAtMillis = kT0 + 1000;
+    tooLong.ceilingFadeStartMillis = kT0;
+    tooLong.ceilingFadeEndMillis = kT0 + (showmesh::kMaxFadeSeconds + 1) * 1000;
+    CHECK(engine.adoptState(tooLong) == StateAdoption::kRejectedInvalidFadeWindow);
+
+    // A plausible window is still adopted normally.
+    BrightnessState ok = engine.captureState(kT0);
+    ok.stateChangedAtMillis = kT0 + 1000;
+    ok.ceilingFadeStartMillis = kT0;
+    ok.ceilingFadeEndMillis = kT0 + 10'000;
+    ok.ceilingTarget = 10;
+    CHECK(engine.adoptState(ok) == StateAdoption::kAdopted);
+}
+
+// finding 5: an inverted persisted window must settle at the darker
+// value, never at the target, which is what RES-018 section 1 requires.
+TEST(AnInvertedPersistedFadeWindowSettlesDarkerNotAtTheTarget) {
+    BrightnessState persisted;
+    persisted.revision = 1;
+    persisted.ceilingTarget = 90;
+    persisted.ceilingStart = 90;
+    // Inverted: end before start.
+    persisted.ceilingFadeStartMillis = kT0 + 10'000;
+    persisted.ceilingFadeEndMillis = kT0;
+    persisted.lastAppliedCeiling = 5;
+    persisted.persistedAtMillis = kT0;
+
+    BrightnessEngine engine;
+    CHECK(engine.restoreFromPersisted(persisted, kT0 + 50'000) == StateAdoption::kAdopted);
+    // The darker of lastAppliedCeiling (5) and target (90) is 5, never 90.
+    CHECK_NEAR(engine.ceilingAt(kT0 + 50'000), 5.0, 1e-9);
+    CHECK(!engine.fadingAt(kT0 + 50'000));
 }
 
 TEST(ALateJoinerConvergesOnTheCurrentFadePositionAndTarget) {
@@ -318,6 +432,40 @@ TEST(APersistedPayloadMissingAFieldIsRejectedRatherThanDefaulted) {
 
     CHECK(!showmesh::decodeBrightnessState("not json").ok);
     CHECK(!showmesh::decodeBrightnessState("[1,2,3]").ok);
+}
+
+// finding 3: a representable but absurd revision (1e19) or an outright
+// unrepresentable one (1e300) must fail the decode, not wedge the node by
+// being adopted as newer-than-everything forever.
+TEST(APersistedPayloadWithAnAbsurdRevisionIsRejected) {
+    BrightnessEngine engine;
+    const std::string encoded = showmesh::encodeBrightnessState(engine.captureState(kT0));
+    const std::string needle = "\"revision\":0";
+    const std::size_t pos = encoded.find(needle);
+    CHECK(pos != std::string::npos);
+
+    std::string tampered = encoded;
+    tampered.replace(pos, needle.size(), "\"revision\":1e19");
+    CHECK(!showmesh::decodeBrightnessState(tampered).ok);
+
+    tampered = encoded;
+    tampered.replace(pos, needle.size(), "\"revision\":1e300");
+    CHECK(!showmesh::decodeBrightnessState(tampered).ok);
+}
+
+// finding 3: a field cast to TimeMillis must be range-checked against
+// int64, not merely finite; 1e300 is finite but its cast is undefined
+// behavior.
+TEST(APersistedPayloadWithAnUnrepresentableTimeIsRejected) {
+    BrightnessEngine engine;
+    const std::string encoded = showmesh::encodeBrightnessState(engine.captureState(kT0));
+    const std::string needle = "\"persistedAtMillis\":" + std::to_string(kT0);
+    const std::size_t pos = encoded.find(needle);
+    CHECK(pos != std::string::npos);
+
+    std::string tampered = encoded;
+    tampered.replace(pos, needle.size(), "\"persistedAtMillis\":1e300");
+    CHECK(!showmesh::decodeBrightnessState(tampered).ok);
 }
 
 TEST(ExclusionsSplitApplyRangesCorrectlyAtEveryEdge) {

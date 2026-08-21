@@ -73,7 +73,7 @@ ValidationResult BrightnessEngine::setCeiling(int targetPercent, std::int64_t fa
     ValidationResult result = validateActionInput(targetPercent, fadeSeconds);
     if (!result.ok) return result;
     ceiling_.fadeTo(static_cast<double>(targetPercent), fadeSeconds * 1000, now);
-    bumpRevision();
+    bumpRevision(now);
     return ValidationResult{};
 }
 
@@ -81,7 +81,7 @@ ValidationResult BrightnessEngine::setGain(int targetPercent, std::int64_t fadeS
     ValidationResult result = validateActionInput(targetPercent, fadeSeconds);
     if (!result.ok) return result;
     gain_.fadeTo(static_cast<double>(targetPercent), fadeSeconds * 1000, now);
-    bumpRevision();
+    bumpRevision(now);
     return ValidationResult{};
 }
 
@@ -151,6 +151,8 @@ BrightnessState BrightnessEngine::captureState(TimeMillis now) const {
     BrightnessState s;
     s.schemaVersion = kBrightnessStateSchemaVersion;
     s.revision = revision_;
+    s.stateChangedAtMillis = stateChangedAtMillis_;
+    s.instanceId = instanceId_;
     s.ceilingStart = ceiling_.start();
     s.ceilingTarget = ceiling_.target();
     s.ceilingFadeStartMillis = ceiling_.startMillis();
@@ -165,21 +167,51 @@ BrightnessState BrightnessEngine::captureState(TimeMillis now) const {
     return s;
 }
 
+namespace {
+
+// A fade window is plausible when it is not inverted, its endpoints fall
+// in a sane epoch band, and its span does not exceed the registered
+// action's own maximum. The zero/zero sentinel means no fade is recorded.
+// Spans are computed in double so no adopted magnitude can overflow this
+// check itself.
+bool fadeWindowIsPlausible(TimeMillis start, TimeMillis end) {
+    if (start == 0 && end == 0) return true;
+    if (end < start) return false;
+    if (start < kEarliestPlausibleEpochMillis || start > kLatestPlausibleEpochMillis) return false;
+    if (end < kEarliestPlausibleEpochMillis || end > kLatestPlausibleEpochMillis) return false;
+    const double spanMillis = static_cast<double>(end) - static_cast<double>(start);
+    return spanMillis <= static_cast<double>(kMaxFadeSeconds) * 1000.0;
+}
+
+}  // namespace
+
 StateAdoption BrightnessEngine::adoptState(const BrightnessState& state) {
     if (state.schemaVersion != kBrightnessStateSchemaVersion) {
         return StateAdoption::kRejectedUnsupportedVersion;
     }
-    // Equal revisions are rejected too: a duplicated or delayed payload
-    // carries no newer information, and re-adopting it could only move
-    // this node backwards to the sender's older sample of the same state.
-    if (state.revision <= revision_) {
+    if (!fadeWindowIsPlausible(state.ceilingFadeStartMillis, state.ceilingFadeEndMillis) ||
+        !fadeWindowIsPlausible(state.gainFadeStartMillis, state.gainFadeEndMillis)) {
+        return StateAdoption::kRejectedInvalidFadeWindow;
+    }
+    // Full state is ordered by (stateChangedAtMillis, instanceId) compared
+    // lexicographically, not by the sender's local revision counter, so
+    // two nodes that each ran one command converge on the same state
+    // regardless of which one adopts first.
+    const bool newer = state.stateChangedAtMillis != stateChangedAtMillis_
+                            ? state.stateChangedAtMillis > stateChangedAtMillis_
+                            : state.instanceId > instanceId_;
+    if (!newer) {
         return StateAdoption::kRejectedStaleRevision;
     }
     ceiling_.restore(clampPercent(state.ceilingStart), clampPercent(state.ceilingTarget), state.ceilingFadeStartMillis,
                      state.ceilingFadeEndMillis);
     gain_.restore(clampPercent(state.gainStart), clampPercent(state.gainTarget), state.gainFadeStartMillis,
                   state.gainFadeEndMillis);
-    revision_ = state.revision;
+    stateChangedAtMillis_ = state.stateChangedAtMillis;
+    instanceId_ = state.instanceId;
+    // revision_ is local-only: bumped so this node knows its own state
+    // changed and republishes, never copied from the sender.
+    ++revision_;
     return StateAdoption::kAdopted;
 }
 
@@ -188,11 +220,25 @@ namespace {
 // A persisted fade is placeable only if its window is coherent and the
 // current time is not before the window began. A clock that moved
 // backwards across the restart makes the recorded window meaningless.
+// Callers must not reach this for the start==end==0 "no fade recorded"
+// sentinel or for an inverted window; both are handled before this runs.
 bool fadeTimingIsTrustworthy(TimeMillis startMillis, TimeMillis endMillis, TimeMillis persistedAt, TimeMillis now) {
-    if (endMillis <= startMillis) return false;  // no fade recorded, or an inverted window
+    if (endMillis <= startMillis) return false;
     if (now < startMillis) return false;
     if (persistedAt != 0 && now < persistedAt) return false;
     return true;
+}
+
+// Resolves one persisted fade window to one of three outcomes: no fade was
+// recorded, the window is inverted (never trustworthy, must settle dark),
+// or it may be a real fade that fadeTimingIsTrustworthy still has to
+// clear.
+enum class FadeWindowShape { kNone, kInverted, kCandidate };
+
+FadeWindowShape classifyFadeWindow(TimeMillis startMillis, TimeMillis endMillis) {
+    if (startMillis == 0 && endMillis == 0) return FadeWindowShape::kNone;
+    if (endMillis < startMillis) return FadeWindowShape::kInverted;
+    return FadeWindowShape::kCandidate;
 }
 
 }  // namespace
@@ -215,11 +261,18 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
     }
 
     revision_ = state.revision;
+    stateChangedAtMillis_ = state.stateChangedAtMillis;
+    instanceId_ = state.instanceId;
     lastAppliedCeiling_ = clampPercent(state.lastAppliedCeiling);
     lastAppliedGain_ = clampPercent(state.lastAppliedGain);
 
-    if (state.ceilingFadeEndMillis <= state.ceilingFadeStartMillis) {
+    const FadeWindowShape ceilingShape = classifyFadeWindow(state.ceilingFadeStartMillis, state.ceilingFadeEndMillis);
+    if (ceilingShape == FadeWindowShape::kNone) {
         ceiling_.settle(clampPercent(state.ceilingTarget));
+    } else if (ceilingShape == FadeWindowShape::kInverted) {
+        // An inverted window is never trustworthy timing: settle darker
+        // rather than at the target, which RES-018 section 1 requires.
+        ceiling_.settle(safeCeiling);
     } else if (fadeTimingIsTrustworthy(state.ceilingFadeStartMillis, state.ceilingFadeEndMillis, state.persistedAtMillis, now)) {
         ceiling_.restore(clampPercent(state.ceilingStart), clampPercent(state.ceilingTarget), state.ceilingFadeStartMillis,
                          state.ceilingFadeEndMillis);
@@ -227,8 +280,11 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
         ceiling_.settle(safeCeiling);
     }
 
-    if (state.gainFadeEndMillis <= state.gainFadeStartMillis) {
+    const FadeWindowShape gainShape = classifyFadeWindow(state.gainFadeStartMillis, state.gainFadeEndMillis);
+    if (gainShape == FadeWindowShape::kNone) {
         gain_.settle(clampPercent(state.gainTarget));
+    } else if (gainShape == FadeWindowShape::kInverted) {
+        gain_.settle(safeGain);
     } else if (fadeTimingIsTrustworthy(state.gainFadeStartMillis, state.gainFadeEndMillis, state.persistedAtMillis, now)) {
         gain_.restore(clampPercent(state.gainStart), clampPercent(state.gainTarget), state.gainFadeStartMillis,
                       state.gainFadeEndMillis);

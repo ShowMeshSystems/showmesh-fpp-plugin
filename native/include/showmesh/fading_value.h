@@ -50,8 +50,12 @@ class FadingValue {
         if (now >= endMillis_) {
             return target_;
         }
-        const double elapsed = static_cast<double>(now - startMillis_);
-        const double span = static_cast<double>(endMillis_ - startMillis_);
+        // Subtracting as int64 first can overflow (undefined behavior) for
+        // an adopted window with extreme endpoints; subtracting as double
+        // cannot, regardless of what validation ran before this value was
+        // restored.
+        const double elapsed = static_cast<double>(now) - static_cast<double>(startMillis_);
+        const double span = static_cast<double>(endMillis_) - static_cast<double>(startMillis_);
         return start_ + (target_ - start_) * (elapsed / span);
     }
 

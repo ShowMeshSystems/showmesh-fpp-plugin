@@ -52,10 +52,14 @@ struct CommandOutcome {
 class ObservationSink {
  public:
     virtual ~ObservationSink() = default;
-    virtual void publish(const PlaylistEntryObservation& observation) = 0;
+    // Returns true when the observation was accepted. The caller must not
+    // treat gap evidence as acknowledged, or count a publication as having
+    // happened, on a false return.
+    virtual bool publish(const PlaylistEntryObservation& observation) = 0;
     // Reports an observation whose identity could not be established. It
-    // is never silently downgraded to filename identity.
-    virtual void publishUnavailable(const PlaylistEntryObservation& observation) = 0;
+    // is never silently downgraded to filename identity. Returns true when
+    // accepted; see publish().
+    virtual bool publishUnavailable(const PlaylistEntryObservation& observation) = 0;
 };
 
 // PlaylistDefinitionSource resolves a playlist's complete definition. The
@@ -74,15 +78,44 @@ class PlaylistDefinitionSource {
 // Clock is injected so the whole runtime is testable without waiting.
 using Clock = TimeMillis (*)();
 
+// EngineAccessor is the only way to reach the shared BrightnessEngine. It
+// holds the runtime's engine mutex for its own lifetime, so a caller can
+// never retain an unguarded reference and read or write the engine off
+// the lock: the mutex releases only when the accessor's temporary is
+// destroyed at the end of the calling expression or statement.
+class EngineAccessor {
+ public:
+    EngineAccessor(BrightnessEngine& engine, std::mutex& mutex) : engine_(engine), lock_(mutex) {}
+    BrightnessEngine* operator->() { return &engine_; }
+    const BrightnessEngine* operator->() const { return &engine_; }
+    BrightnessEngine& operator*() { return engine_; }
+    const BrightnessEngine& operator*() const { return engine_; }
+
+ private:
+    BrightnessEngine& engine_;
+    std::lock_guard<std::mutex> lock_;
+};
+
 // ShowMeshRuntime owns the brightness engine, the callback handoff, and
 // the worker thread. An adapter creates one, forwards FPP's lifecycle and
 // callbacks into it, and does nothing else.
+//
+// engine_ is reached from three fppd threads: the output thread
+// (modifyChannelData, encodeFullState), FPP's command thread
+// (applyBrightnessCommand), and the MultiSync thread
+// (adoptEncodedFullState). engineMutex_ is held across every mutation and
+// every read of engine_, including through EngineAccessor, because
+// FadingValue::fadeTo writes its target before its window, and a frame
+// landing between those two writes would read the new target against the
+// old, already-expired window.
 class ShowMeshRuntime {
  public:
     ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock);
     ~ShowMeshRuntime();
 
-    BrightnessEngine& brightness() { return engine_; }
+    // Guarded engine access. The returned accessor holds engineMutex_ for
+    // its own lifetime; do not store it past the expression that uses it.
+    EngineAccessor brightness() { return EngineAccessor(engine_, engineMutex_); }
 
     // Parses and applies the registered action's two string arguments.
     // Reports a message an operator can act on rather than throwing: this
@@ -126,6 +159,7 @@ class ShowMeshRuntime {
     ObservationSink* sink_;
     Clock clock_;
 
+    std::mutex engineMutex_;
     BrightnessEngine engine_;
     CallbackHandoff handoff_;
     SequenceState sequence_;
@@ -133,6 +167,11 @@ class ShowMeshRuntime {
     std::thread worker_;
     std::mutex wakeMutex_;
     std::condition_variable wake_;
+    // Guarded by wakeMutex_. Set before notify_one() and checked by the
+    // worker's wait predicate, so a notification that arrives before the
+    // worker starts waiting is not lost: the predicate already sees it
+    // true instead of the worker blocking for up to 250ms regardless.
+    bool hasWork_ = false;
     std::atomic<bool> running_{false};
 
     std::atomic<std::uint64_t> published_{0};

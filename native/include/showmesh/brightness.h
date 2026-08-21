@@ -18,6 +18,13 @@ constexpr int kMaxPercent = 100;
 // The registered action's own bound on a fade, one day in seconds.
 constexpr std::int64_t kMaxFadeSeconds = 86400;
 
+// A fade window's endpoints, and any other persisted or wire epoch-millis
+// field, are rejected outside this band: wide enough for the plugin's
+// realistic lifetime, narrow enough that an adopted INT64_MIN/INT64_MAX or
+// 1e300 payload cannot pass as a real timestamp.
+constexpr TimeMillis kEarliestPlausibleEpochMillis = 946684800000;  // 2000-01-01T00:00:00Z
+constexpr TimeMillis kLatestPlausibleEpochMillis = 4102444800000;   // 2100-01-01T00:00:00Z
+
 // A half-open channel span, one-based to match how FPP addresses channels
 // in its own configuration.
 struct ChannelRange {
@@ -61,7 +68,16 @@ constexpr int kBrightnessStateSchemaVersion = 1;
 // twice is indistinguishable from applying it once.
 struct BrightnessState {
     int schemaVersion = kBrightnessStateSchemaVersion;
+    // Local monotonic counter, meaningful only to the node that produced
+    // it; never compared across nodes. MultiSync ordering uses
+    // stateChangedAtMillis and instanceId instead.
     std::uint64_t revision = 0;
+
+    // The clock value when this state last changed on the node that owns
+    // it, and that node's persistent identity. Together they order full
+    // state across nodes: see BrightnessEngine::adoptState.
+    TimeMillis stateChangedAtMillis = 0;
+    std::string instanceId;
 
     double ceilingStart = 100.0;
     double ceilingTarget = 100.0;
@@ -83,8 +99,12 @@ struct BrightnessState {
 
 enum class StateAdoption {
     kAdopted,
+    // Ordered no later than what this node already holds, by
+    // (stateChangedAtMillis, instanceId).
     kRejectedStaleRevision,
     kRejectedUnsupportedVersion,
+    // The fade window is inverted or its magnitude is implausible.
+    kRejectedInvalidFadeWindow,
 };
 
 // BrightnessEngine owns the composition, the two fades, and the channel
@@ -96,6 +116,12 @@ class BrightnessEngine {
 
     ValidationResult configureRanges(const RangeConfig& config, std::uint32_t totalChannels);
     const RangeConfig& ranges() const { return ranges_; }
+
+    // The persistent per-node identity carried in captureState() and
+    // compared in adoptState(). Set once by the adapter; empty when the
+    // host has no identity yet.
+    void setInstanceId(std::string id) { instanceId_ = std::move(id); }
+    const std::string& instanceId() const { return instanceId_; }
 
     // Sets the ceiling, the value FPP's scheduler owns. Rejects input
     // outside the registered action's own declared bounds rather than
@@ -137,7 +163,10 @@ class BrightnessEngine {
     std::uint64_t revision() const { return revision_; }
 
  private:
-    void bumpRevision() { ++revision_; }
+    void bumpRevision(TimeMillis now) {
+        ++revision_;
+        stateChangedAtMillis_ = now;
+    }
     void recomputeScaledSpans();
 
     FadingValue ceiling_{100.0};
@@ -150,6 +179,8 @@ class BrightnessEngine {
     std::vector<ChannelRange> scaledSpans_;
     std::uint32_t totalChannels_ = 0;
     std::uint64_t revision_ = 0;
+    TimeMillis stateChangedAtMillis_ = 0;
+    std::string instanceId_;
     double lastAppliedCeiling_ = 100.0;
     double lastAppliedGain_ = 100.0;
 };

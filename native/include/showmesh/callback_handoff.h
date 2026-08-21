@@ -30,25 +30,45 @@ struct CallbackEvidence {
     PlaylistAction action = PlaylistAction::kUnknown;
     TimeMillis observedAtMillis = 0;
 
+    // True when the copy lost bytes off the end of the source. playlistName
+    // and section determine entry identity: two different values that
+    // share their first 255 or 63 bytes must never read as the same entry.
+    bool playlistNameTruncated = false;
+    bool sectionTruncated = false;
+    bool sequenceFilenameTruncated = false;
+    bool mediaFilenameTruncated = false;
+
     // Truncates rather than allocating. A name longer than the bound is a
     // deformed input, and losing its tail is better than doing unbounded
-    // work on the callback thread.
-    static void copyField(char* dest, std::size_t capacityWithNul, const char* source) {
+    // work on the callback thread. Returns true when the source had more
+    // bytes than fit, so the caller can refuse to treat the copy as
+    // complete.
+    static bool copyField(char* dest, std::size_t capacityWithNul, const char* source) {
         if (source == nullptr) {
             dest[0] = '\0';
-            return;
+            return false;
         }
         std::size_t i = 0;
         for (; i + 1 < capacityWithNul && source[i] != '\0'; ++i) {
             dest[i] = source[i];
         }
         dest[i] = '\0';
+        return source[i] != '\0';
     }
 
-    void setPlaylistName(const char* s) { copyField(playlistName, sizeof(playlistName), s); }
-    void setSection(const char* s) { copyField(section, sizeof(section), s); }
-    void setSequenceFilename(const char* s) { copyField(sequenceFilename, sizeof(sequenceFilename), s); }
-    void setMediaFilename(const char* s) { copyField(mediaFilename, sizeof(mediaFilename), s); }
+    void setPlaylistName(const char* s) { playlistNameTruncated = copyField(playlistName, sizeof(playlistName), s); }
+    void setSection(const char* s) { sectionTruncated = copyField(section, sizeof(section), s); }
+    void setSequenceFilename(const char* s) {
+        sequenceFilenameTruncated = copyField(sequenceFilename, sizeof(sequenceFilename), s);
+    }
+    void setMediaFilename(const char* s) {
+        mediaFilenameTruncated = copyField(mediaFilename, sizeof(mediaFilename), s);
+    }
+
+    // True when a field that determines entry identity was truncated.
+    // sequenceFilename and mediaFilename are corroborating evidence, not
+    // identity, so their truncation does not gate this.
+    bool identityFieldTruncated() const { return playlistNameTruncated || sectionTruncated; }
 
     // Two observations describe the same playlist entry when the playlist,
     // section, and position all match. The action deliberately does not

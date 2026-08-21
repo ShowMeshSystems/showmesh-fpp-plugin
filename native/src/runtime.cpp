@@ -57,7 +57,12 @@ bool playlistNameIsPathSafe(const std::string& name) {
 }
 
 ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock)
-    : definitions_(definitions), sink_(sink), clock_(clock), handoff_(16) {}
+    : definitions_(definitions), sink_(sink), clock_(clock), handoff_(16) {
+    if (definitions_ != nullptr) {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        engine_.setInstanceId(definitions_->instanceUuid());
+    }
+}
 
 ShowMeshRuntime::~ShowMeshRuntime() { stop(); }
 
@@ -78,7 +83,11 @@ CommandOutcome ShowMeshRuntime::applyBrightnessCommand(const std::string& target
         return CommandOutcome{false, "fade seconds must be between 0 and 86400"};
     }
 
-    ValidationResult result = engine_.setCeiling(static_cast<int>(percent), seconds, clock_());
+    ValidationResult result;
+    {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        result = engine_.setCeiling(static_cast<int>(percent), seconds, clock_());
+    }
     if (!result.ok) {
         return CommandOutcome{false, result.error};
     }
@@ -100,20 +109,33 @@ void ShowMeshRuntime::observeCallback(const char* playlistName, const char* acti
     evidence.action = playlistActionFromName(action == nullptr ? std::string() : std::string(action));
     evidence.observedAtMillis = clock_();
     handoff_.offer(evidence);
+    // hasWork_ is set under wakeMutex_ before notifying so the worker's
+    // wait predicate observes it even if this notify lands before the
+    // worker calls wait_for; otherwise the notification is lost and the
+    // worker sits idle for up to 250ms.
+    {
+        std::lock_guard<std::mutex> lock(wakeMutex_);
+        hasWork_ = true;
+    }
     wake_.notify_one();
 }
 
 void ShowMeshRuntime::modifyChannelData(std::uint8_t* channelData, std::size_t channelCount) {
+    std::lock_guard<std::mutex> lock(engineMutex_);
     engine_.applyToFrame(channelData, channelCount, clock_());
 }
 
-std::string ShowMeshRuntime::encodeFullState() { return encodeBrightnessState(engine_.captureState(clock_())); }
+std::string ShowMeshRuntime::encodeFullState() {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    return encodeBrightnessState(engine_.captureState(clock_()));
+}
 
 StateAdoption ShowMeshRuntime::adoptEncodedFullState(const std::uint8_t* data, int length) {
     if (data == nullptr || length <= 0) return StateAdoption::kRejectedUnsupportedVersion;
     BrightnessStateDecode decoded =
         decodeBrightnessState(std::string(reinterpret_cast<const char*>(data), static_cast<std::size_t>(length)));
     if (!decoded.ok) return StateAdoption::kRejectedUnsupportedVersion;
+    std::lock_guard<std::mutex> lock(engineMutex_);
     return engine_.adoptState(decoded.state);
 }
 
@@ -123,13 +145,6 @@ bool ShowMeshRuntime::drainOnce() {
     if (!handoff_.take(&evidence, &coalesced)) return false;
     unacknowledgedCoalesced_ += coalesced;
 
-    const std::string instanceUuid = definitions_ == nullptr ? std::string() : definitions_->instanceUuid();
-    const std::string definition =
-        definitions_ == nullptr ? std::string() : definitions_->definitionFor(evidence.playlistName);
-
-    IdentityResolution resolution =
-        resolveEntryIdentity(instanceUuid, evidence.playlistName, definition, evidence.section, evidence.position);
-
     PlaylistEntryObservation observation;
     observation.schemaVersion = kObservationSchemaVersion;
     observation.sequenceFilename = evidence.sequenceFilename;
@@ -138,6 +153,24 @@ bool ShowMeshRuntime::drainOnce() {
     observation.observedAtMillis = evidence.observedAtMillis;
     observation.sequence = sequence_.next();
     observation.coalescedSincePreviousAcknowledged = unacknowledgedCoalesced_;
+
+    if (evidence.identityFieldTruncated()) {
+        // A truncated playlist name or section can share its bounded
+        // prefix with a different entry's; reporting it as identity would
+        // be confidently wrong, so it is reported unavailable instead and
+        // never reaches resolveEntryIdentity.
+        observation.unavailable = IdentityUnavailable::kTruncatedIdentityField;
+        ++unavailable_;
+        if (sink_ != nullptr) sink_->publishUnavailable(observation);
+        return true;
+    }
+
+    const std::string instanceUuid = definitions_ == nullptr ? std::string() : definitions_->instanceUuid();
+    const std::string definition =
+        definitions_ == nullptr ? std::string() : definitions_->definitionFor(evidence.playlistName);
+
+    IdentityResolution resolution =
+        resolveEntryIdentity(instanceUuid, evidence.playlistName, definition, evidence.section, evidence.position);
 
     if (!resolution.ok) {
         observation.unavailable = resolution.reason;
@@ -153,9 +186,11 @@ bool ShowMeshRuntime::drainOnce() {
 
     observation.identity = resolution.identity;
     observation.entryKey = resolution.entryKey;
-    ++published_;
-    if (sink_ != nullptr) sink_->publish(observation);
-    unacknowledgedCoalesced_ = 0;
+    const bool accepted = sink_ != nullptr && sink_->publish(observation);
+    if (accepted) {
+        ++published_;
+        unacknowledgedCoalesced_ = 0;
+    }
     return true;
 }
 
@@ -165,7 +200,8 @@ void ShowMeshRuntime::workerLoop() {
             if (!running_.load()) return;
         }
         std::unique_lock<std::mutex> lock(wakeMutex_);
-        wake_.wait_for(lock, std::chrono::milliseconds(250));
+        wake_.wait_for(lock, std::chrono::milliseconds(250), [this] { return hasWork_ || !running_.load(); });
+        hasWork_ = false;
     }
 }
 
@@ -176,6 +212,10 @@ void ShowMeshRuntime::start() {
 
 void ShowMeshRuntime::stop() {
     if (!running_.exchange(false)) return;
+    {
+        std::lock_guard<std::mutex> lock(wakeMutex_);
+        hasWork_ = true;
+    }
     wake_.notify_all();
     if (worker_.joinable()) worker_.join();
 }

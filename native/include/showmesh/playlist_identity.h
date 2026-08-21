@@ -24,6 +24,11 @@ enum class IdentityUnavailable {
     kMissingDefinition,
     kUnsupportedDefinitionShape,
     kNegativePosition,
+    // A field that determines identity (playlist name or section) was
+    // truncated on the callback thread: the copy is bounded evidence of a
+    // longer value, never the value itself, so building identity from it
+    // would be confidently wrong rather than merely missing.
+    kTruncatedIdentityField,
 };
 
 const char* identityUnavailableReason(IdentityUnavailable reason);
