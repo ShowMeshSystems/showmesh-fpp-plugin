@@ -2,6 +2,7 @@
 
 #include <clocale>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include "check.h"
@@ -102,11 +103,13 @@ TEST(MemberOrderDoesNotChangeTheCanonicalForm) {
 // brightness state codec must all still use "." rather than silently
 // discarding the fractional part or emitting invalid JSON.
 TEST(NumberHandlingIsUnaffectedByAThreadWideCommaDecimalLocale) {
-    // A skip here reads as a pass, which is exactly how this test rode
-    // green through CI while CLocaleGuard was fully neutered: debian:trixie,
-    // what CI actually runs on, ships only C, C.utf8, and POSIX. The
-    // native-core CI job installs de_DE.UTF-8 explicitly so this is a hard
-    // failure rather than a silent skip on the machines that matter.
+    // A skip here reads as a pass, which is how this test rode green
+    // through CI while CLocaleGuard was fully neutered. CI installs a
+    // comma-decimal locale and sets SHOWMESH_REQUIRE_LOCALE_TEST, which
+    // makes an absent locale a failure there. It stays a loud skip
+    // elsewhere because this suite also ships in the source bundle and is
+    // run on FPP hosts, which carry only C and POSIX and must not fail a
+    // post-compile validation over a locale they were never going to have.
     const char* installed = nullptr;
     for (const char* candidate : {"de_DE.UTF-8", "de_DE", "de_DE.ISO8859-1"}) {
         if (std::setlocale(LC_NUMERIC, candidate) != nullptr) {
@@ -115,10 +118,17 @@ TEST(NumberHandlingIsUnaffectedByAThreadWideCommaDecimalLocale) {
         }
     }
     if (installed == nullptr) {
-        ::showmesh_test::reportFailure(
-            __FILE__, __LINE__,
-            "no comma-decimal locale (tried de_DE.UTF-8, de_DE, de_DE.ISO8859-1) is installed here; "
-            "install one rather than letting this test skip");
+        const char* required = std::getenv("SHOWMESH_REQUIRE_LOCALE_TEST");
+        if (required != nullptr && required[0] != '\0' && required[0] != '0') {
+            ::showmesh_test::reportFailure(
+                __FILE__, __LINE__,
+                "no comma-decimal locale (tried de_DE.UTF-8, de_DE, de_DE.ISO8859-1) is installed, and "
+                "SHOWMESH_REQUIRE_LOCALE_TEST demands one");
+            return;
+        }
+        std::fprintf(stderr,
+                     "SKIP NumberHandlingIsUnaffectedByAThreadWideCommaDecimalLocale: no comma-decimal "
+                     "locale installed here, and SHOWMESH_REQUIRE_LOCALE_TEST is not set\n");
         return;
     }
 

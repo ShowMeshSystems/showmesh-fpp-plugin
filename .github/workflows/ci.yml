@@ -73,9 +73,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
 
       # ubuntu-latest carries only C.UTF-8 by default, the same gap as
-      # debian:trixie. The locale test in json_test.cpp fails hard rather
-      # than skipping when no comma-decimal locale is present, so this
-      # generates one instead of letting CLocaleGuard's coverage go quiet.
+      # debian:trixie, and a skipped locale test reads as a pass. Generate
+      # one and demand it here, so CLocaleGuard's coverage cannot go quiet.
       # localedef, not locale-gen: a minimal image's /etc/locale.gen has no
       # de_DE entry to uncomment, so locale-gen silently generates nothing.
       - name: Generate a comma-decimal locale
@@ -87,9 +86,13 @@ jobs:
         run: make -C native check-host-neutral
 
       - name: Build and test
+        env:
+          SHOWMESH_REQUIRE_LOCALE_TEST: "1"
         run: make -C native test CXX=${{ matrix.compiler }}
 
       - name: Build and test under the address and undefined-behavior sanitizers
+        env:
+          SHOWMESH_REQUIRE_LOCALE_TEST: "1"
         run: |
           make -C native clean
           make -C native test CXX=${{ matrix.compiler }} \
@@ -98,6 +101,8 @@ jobs:
       # The callback handoff is the one place two threads meet, so the
       # thread sanitizer is the check that actually constrains it.
       - name: Build and test under the thread sanitizer
+        env:
+          SHOWMESH_REQUIRE_LOCALE_TEST: "1"
         run: |
           make -C native clean
           make -C native test CXX=${{ matrix.compiler }} \
@@ -211,6 +216,9 @@ jobs:
       # The native component ships as source compiled on the host, so what
       # matters is that the bundle builds on its own: extracted into an
       # empty directory, with nothing else from this repository present.
+      # SHOWMESH_REQUIRE_LOCALE_TEST is deliberately not set here: this step
+      # stands in for an FPP host running the bundle's tests as a
+      # post-compile validation, and such a host carries only C and POSIX.
       - name: Build the native bundle standalone
         run: |
           set -eux
