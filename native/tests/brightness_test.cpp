@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -679,20 +680,16 @@ TEST(AClockCorrectedBackwardsStillOutranksWhatItReplaced) {
 // finding 5b: two nodes with an empty instanceId and an equal timestamp
 // must not both reject each other. That deadlock was verified at 20
 // percent and 70 percent; the content hash tiebreak is what gives them a
-// total order instead.
+// total order instead. This exercises the tiebreak with genuinely
+// different ceiling targets, which already differ before the hash is
+// even computed; it does not exercise the lastApplied-exclusion fix
+// (ConvergedNodesWithDivergentPerNodeRenderHistoryStayConverged below
+// does, and is the only test in this file that is load-bearing for it).
 TEST(EqualTimestampsAndEmptyInstanceIdsStillConvergeInsteadOfDeadlocking) {
     BrightnessEngine a;
     CHECK(a.setCeiling(20, 0, kT0).ok);
     BrightnessEngine b;
     CHECK(b.setCeiling(70, 0, kT0).ok);
-
-    // Exercise applyToFrame before capturing, as the adapters' output
-    // thread would: lastAppliedCeiling/Gain are no longer the untouched
-    // 100 default, which is what let the two now-excluded fields leak
-    // into the ordering hash undetected.
-    std::vector<std::uint8_t> data = frame(4, 255);
-    a.applyToFrame(data.data(), data.size(), kT0);
-    b.applyToFrame(data.data(), data.size(), kT0);
 
     const BrightnessState stateA = a.captureState(kT0);
     const BrightnessState stateB = b.captureState(kT0);
@@ -706,6 +703,8 @@ TEST(EqualTimestampsAndEmptyInstanceIdsStillConvergeInsteadOfDeadlocking) {
     CHECK_NEAR(a.ceilingAt(kT0), b.ceilingAt(kT0), 1e-9);
 }
 
+// Same tiebreak as above with three hosts instead of two; also not
+// load-bearing for the lastApplied-exclusion fix, for the same reason.
 TEST(ThreeOrMoreHostsWithEqualTimestampsAndEmptyIdsConverge) {
     BrightnessEngine a;
     BrightnessEngine b;
@@ -713,11 +712,6 @@ TEST(ThreeOrMoreHostsWithEqualTimestampsAndEmptyIdsConverge) {
     CHECK(a.setCeiling(10, 0, kT0).ok);
     CHECK(b.setCeiling(50, 0, kT0).ok);
     CHECK(c.setCeiling(90, 0, kT0).ok);
-
-    std::vector<std::uint8_t> data = frame(4, 255);
-    a.applyToFrame(data.data(), data.size(), kT0);
-    b.applyToFrame(data.data(), data.size(), kT0);
-    c.applyToFrame(data.data(), data.size(), kT0);
 
     const BrightnessState sa = a.captureState(kT0);
     const BrightnessState sb = b.captureState(kT0);
@@ -828,6 +822,21 @@ TEST(AStateNearTheTopOfTheEpochBandIsAdoptedWhenTheReceiversClockIsAlsoNearIt) {
     state.ceilingStart = 33;
     CHECK(engine.adoptState(state, nearTop) == StateAdoption::kAdopted);
     CHECK_NEAR(engine.ceilingAt(nearTop), 33.0, 1e-9);
+}
+
+// A receiver clock near TimeMillis's maximum must not make the
+// now + kMaxOrderingKeyAheadOfNowMillis bound overflow. UBSan traps the
+// addition form of this check; the state here is ordinary and must still
+// be adopted once the comparison is done as a subtraction instead.
+TEST(AReceiverClockNearTheMaximumTimeMillisDoesNotOverflowTheOrderingBound) {
+    const TimeMillis hugeNow = std::numeric_limits<TimeMillis>::max() - 10;
+    BrightnessEngine engine;
+    BrightnessState state = engine.captureState(kT0);
+    state.stateChangedAtMillis = kT0 + 1000;
+    state.ceilingTarget = 55;
+    state.ceilingStart = 55;
+    CHECK(engine.adoptState(state, hugeNow) == StateAdoption::kAdopted);
+    CHECK_NEAR(engine.ceilingAt(kT0), 55.0, 1e-9);
 }
 
 // finding 1: lastAppliedCeiling and lastAppliedGain are per-node render

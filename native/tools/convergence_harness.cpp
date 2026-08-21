@@ -1,19 +1,23 @@
 // Standalone diagnostic: runs the randomized MultiSync convergence model
 // (convergence_model.h) across every {node count, instance-id mode}
 // configuration and prints the disagreement rate. Not part of `make -C
-// native test`; compiled and run manually, once against the pre-fix
-// brightness.cpp/.h and once against the fix, to produce the before/after
-// numbers reported for defect 1.
+// native test`, since a disagreement rate is not a pass/fail assertion;
+// `make -C native convergence-harness` builds and runs it against the
+// current engine so the build itself cannot silently bit-rot again, and
+// its own build target is deliberately absent from the release bundle's
+// git-archive path list in the repository root Makefile.
 //
-// Build (from native/):
+// Build by hand against a historical engine (from native/), to reproduce
+// a before/after comparison against a prior brightness.cpp/.h:
 //   c++ -std=c++17 -O2 -Iinclude -Itools tools/convergence_harness.cpp \
 //       src/brightness.cpp src/json.cpp src/sha256.cpp -o /tmp/convergence_harness
 //
-// The pre-fix build additionally needs
+// A pre-defect-3 engine (adoptState(state), no receiver-clock parameter)
+// additionally needs
 //   -DLEGACY_ONE_ARG_ADOPT_STATE
 // which selects the one-argument adoptState(state) call instead of
-// adoptState(state, now); the pre-fix header does not declare the
-// two-argument form.
+// adoptState(state, now); that header does not declare the two-argument
+// form.
 
 #include <cstdio>
 #include <random>

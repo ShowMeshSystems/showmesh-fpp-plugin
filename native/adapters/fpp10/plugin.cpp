@@ -37,12 +37,17 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
         showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
+        // start() before registering the settings listener: start() spawns
+        // the worker thread and can throw, and a throwing constructor never
+        // runs this object's destructor, so a listener registered first
+        // would leave the global settings registry holding a callback that
+        // captures a freed this.
+        runtime_.start();
         registerSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName,
                                   [this](const std::string&) {
                                       showmesh::adapter::configureChannelRanges(&*runtime_.brightness(),
                                                                                 FPPD_MAX_CHANNELS);
                                   });
-        runtime_.start();
     }
 
     ~ShowMeshFpp10Plugin() override { quiesce(); }

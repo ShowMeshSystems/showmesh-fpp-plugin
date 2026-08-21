@@ -45,6 +45,22 @@ check-host-neutral:
 	fi
 	@echo "check-host-neutral: OK"
 
+# A diagnostic, not a correctness gate: it prints a disagreement rate
+# rather than asserting one, so it stays out of `test`. It exists as a
+# make target at all so it cannot silently stop compiling again the next
+# time BrightnessEngine's adoptState signature changes; it is not part of
+# `all` and native/tools is deliberately absent from the repository root
+# Makefile's release-native-bundle git-archive path list.
+CONVERGENCE_HARNESS_BINARY := $(BUILD)/convergence_harness
+
+.PHONY: convergence-harness
+convergence-harness: $(CONVERGENCE_HARNESS_BINARY)
+	$(CONVERGENCE_HARNESS_BINARY)
+
+$(CONVERGENCE_HARNESS_BINARY): tools/convergence_harness.cpp tools/convergence_model.h src/brightness.cpp src/json.cpp src/sha256.cpp include/showmesh/brightness.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -Itools tools/convergence_harness.cpp src/brightness.cpp src/json.cpp src/sha256.cpp -o $@
+
 .PHONY: clean
 clean:
 	rm -rf $(BUILD)

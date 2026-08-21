@@ -254,7 +254,13 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state, TimeMil
     // commands, for the rest of the process's life. now is the receiver's
     // own clock, not the sender's, which is why this check lives here
     // rather than in the sender-agnostic timestampIsPlausible above.
-    if (state.stateChangedAtMillis > now + kMaxOrderingKeyAheadOfNowMillis) {
+    // Written as a subtraction on the bounded side rather than
+    // now + kMaxOrderingKeyAheadOfNowMillis: state.stateChangedAtMillis is
+    // already known plausible (checked above), but now comes from an
+    // injectable Clock and can be anywhere in TimeMillis's range, so adding
+    // to it can overflow. Subtracting the small constant from the bounded
+    // value cannot.
+    if (state.stateChangedAtMillis - kMaxOrderingKeyAheadOfNowMillis > now) {
         return StateAdoption::kRejectedImplausibleTimestamp;
     }
     if (!fadeWindowIsPlausible(state.ceilingFadeStartMillis, state.ceilingFadeEndMillis) ||

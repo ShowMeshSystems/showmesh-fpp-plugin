@@ -68,8 +68,17 @@ TEST(GuardRestoresThePreviousLocaleOnDestruction) {
         if (custom != static_cast<locale_t>(0)) break;
     }
     if (custom == static_cast<locale_t>(0)) {
+        const char* required = std::getenv("SHOWMESH_REQUIRE_LOCALE_TEST");
+        if (required != nullptr && required[0] != '\0' && required[0] != '0') {
+            ::showmesh_test::reportFailure(
+                __FILE__, __LINE__,
+                "no de_DE locale (tried de_DE.UTF-8, de_DE, de_DE.ISO8859-1) is installed, and "
+                "SHOWMESH_REQUIRE_LOCALE_TEST demands one");
+            return;
+        }
         std::fprintf(stderr,
-                     "SKIP GuardRestoresThePreviousLocaleOnDestruction: no de_DE locale installed here\n");
+                     "SKIP GuardRestoresThePreviousLocaleOnDestruction: no de_DE locale installed here, and "
+                     "SHOWMESH_REQUIRE_LOCALE_TEST is not set\n");
         return;
     }
 

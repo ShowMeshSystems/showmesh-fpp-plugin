@@ -7,16 +7,28 @@
 // of the second adversarial pass, run manually and reported in the
 // session's evidence, not a CI gate.
 //
-// Model: each node issues local setCeiling commands at random simulated
-// times, applies output frames on its own schedule (skewing its private
-// lastAppliedCeiling/lastAppliedGain independently of every other node),
-// and broadcasts its full state to every other node whenever its own
-// revision() changes, exactly as the adapters' publishFullStateIfChanged
-// would. Delivery is a discrete-event queue: a message can be duplicated,
-// delivered out of order, and delayed by a random amount, and receiving
-// one can itself trigger a further broadcast (an adoption bumps
-// revision()), which is how a real gossip mesh converges, and also how a
-// bug in the ordering key turns into an unbounded rebroadcast storm.
+// Model: at each command round, every node issues a local setCeiling
+// command within the same simulated instant (a near-simultaneous burst,
+// not one random node at a time), applies output frames on its own
+// schedule (skewing its private lastAppliedCeiling/lastAppliedGain
+// independently of every other node), and broadcasts its full state to
+// every other node whenever its own revision() changes, exactly as the
+// adapters' publishFullStateIfChanged would. Delivery is a discrete-event
+// queue: a message can be duplicated, delivered out of order, and delayed
+// by a random amount, and receiving one can itself trigger a further
+// broadcast (an adoption bumps revision()), which is how a real gossip
+// mesh converges, and also how a bug in the ordering key turns into an
+// unbounded rebroadcast storm.
+//
+// The burst is what makes this model able to observe a genuine conflict:
+// one acting node per command, spaced hundreds of milliseconds apart, is
+// resolved by the timestamp tier alone almost every time, so the hash
+// tiebreak is exercised only when two broadcasts happen to carry
+// byte-identical content and can never observe a real disagreement. Every
+// node committing its own independent choice at the same simulated
+// millisecond is what a real MultiSync burst (e.g. several controllers
+// all reacting to one show-wide command) looks like, and is the case that
+// actually stresses the ordering key's tie-break tiers.
 
 #include <cstdint>
 #include <map>
@@ -32,6 +44,9 @@ namespace convergence_model {
 struct SimConfig {
     int nodeCount = 3;
     bool distinctInstanceIds = false;
+    // Number of command rounds. Every round, every node issues one command
+    // at the same simulated millisecond, so the total number of setCeiling
+    // calls in a trial is commandCount * nodeCount.
     int commandCount = 8;
     // Every node applies an output frame at roughly this interval for the
     // whole simulated window (plus a tail past the last command), the way
@@ -75,7 +90,6 @@ TrialResult runTrial(const SimConfig& cfg, std::uint64_t seed, AdoptFn adopt) {
     std::uniform_int_distribution<int> fadeDist(0, 300);
     std::uniform_int_distribution<int> delayDist(0, 4000);
     std::uniform_int_distribution<int> dupDist(0, 4);  // 20% duplication
-    std::uniform_int_distribution<int> nodeDist(0, cfg.nodeCount - 1);
     std::uniform_int_distribution<int> jitterDist(0, 900);
 
     constexpr TimeMillis kBase = 2'000'000'000'000;  // well inside the plausible band
@@ -91,12 +105,19 @@ TrialResult runTrial(const SimConfig& cfg, std::uint64_t seed, AdoptFn adopt) {
     TimeMillis t = kBase;
     for (int i = 0; i < cfg.commandCount; ++i) {
         t += 500 + jitterDist(rng);
-        Event e;
-        e.kind = Event::Kind::kCommand;
-        e.actingNode = nodeDist(rng);
-        e.targetPercent = percentDist(rng);
-        e.fadeSeconds = fadeDist(rng);
-        queue.emplace(t, e);
+        // Every node commands at this same simulated millisecond: a
+        // near-simultaneous burst, not one random node at a time, so real
+        // conflicting content lands at an equal stateChangedAtMillis
+        // instead of always being resolved by the timestamp tier before
+        // the hash tiebreak is ever reached.
+        for (int node = 0; node < cfg.nodeCount; ++node) {
+            Event e;
+            e.kind = Event::Kind::kCommand;
+            e.actingNode = node;
+            e.targetPercent = percentDist(rng);
+            e.fadeSeconds = fadeDist(rng);
+            queue.emplace(t, e);
+        }
     }
     const TimeMillis frameHorizon = t + cfg.tailMillis;
     std::uniform_int_distribution<int> frameJitterDist(0, 10);

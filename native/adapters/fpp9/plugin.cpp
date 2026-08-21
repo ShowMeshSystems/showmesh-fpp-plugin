@@ -42,19 +42,33 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
         showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
+        // start() before registering the settings listener: start() spawns
+        // the worker thread and can throw, and a throwing constructor never
+        // runs this object's destructor, so a listener registered first
+        // would leave the global settings registry holding a callback that
+        // captures a freed this.
+        runtime_.start();
         registerSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName,
                                   [this](const std::string&) {
                                       showmesh::adapter::configureChannelRanges(&*runtime_.brightness(),
                                                                                 FPPD_MAX_CHANNELS);
                                   });
-        runtime_.start();
     }
 
     ~ShowMeshFpp9Plugin() override {
-        // Withdrawn before anything else: the callback above captures this,
-        // and settings.h's listener registry is a global that outlives this
-        // object.
-        unregisterSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName);
+        // PluginManager::INSTANCE is itself a static, and its destructor
+        // calls Cleanup(), which deletes this. If fppd exits by a path that
+        // skips the explicit Cleanup() call in fppd.cpp, that delete happens
+        // during static destruction instead, at which point settings.cpp's
+        // own SettingsConfig static may already be destroyed: locking its
+        // destroyed mutex throws out of this noexcept destructor and calls
+        // std::terminate. Nothing this destructor can check tells it which
+        // case it is in, so the settings-registry call is guarded rather
+        // than assumed safe.
+        try {
+            unregisterSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName);
+        } catch (...) {
+        }
         runtime_.stop();
         if (command_ != nullptr) {
             // removeCommand only unregisters; a Command subclass declared

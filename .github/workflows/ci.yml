@@ -90,6 +90,14 @@ jobs:
           SHOWMESH_REQUIRE_LOCALE_TEST: "1"
         run: make -C native test CXX=${{ matrix.compiler }}
 
+      # A diagnostic, not a pass/fail gate (it prints a disagreement rate,
+      # it does not assert one), so this only proves the build itself has
+      # not bit-rotted against BrightnessEngine's current adoptState
+      # signature, which is exactly what let it go uncompiled for a whole
+      # signature change last time.
+      - name: Build and run the MultiSync convergence harness
+        run: make -C native convergence-harness CXX=${{ matrix.compiler }}
+
       - name: Build and test under the address and undefined-behavior sanitizers
         env:
           SHOWMESH_REQUIRE_LOCALE_TEST: "1"
