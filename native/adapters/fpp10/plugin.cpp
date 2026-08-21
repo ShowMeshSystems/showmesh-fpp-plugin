@@ -18,6 +18,7 @@
 
 #include "brightness_command.h"
 #include "callback_fields.h"
+#include "channel_ranges.h"
 #include "fpp_definition_source.h"
 #include "showmesh/runtime.h"
 
@@ -35,6 +36,7 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         : FPPPlugin(showmesh::kPluginName), runtime_(&definitions_, nullptr, nowMillis) {
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
+        showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
         runtime_.start();
     }
 
@@ -77,7 +79,7 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
     }
 
     void publishFullStateIfChanged() {
-        const std::uint64_t revision = runtime_.brightness().revision();
+        const std::uint64_t revision = runtime_.brightness()->revision();
         if (revision == publishedRevision_) return;
         publishedRevision_ = revision;
         std::string payload = runtime_.encodeFullState();
