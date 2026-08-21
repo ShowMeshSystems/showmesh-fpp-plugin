@@ -102,6 +102,7 @@ class Parser {
         // this guard a comma-decimal locale set elsewhere in the process
         // would silently misparse every fractional number in this text.
         const CLocaleGuard localeGuard;
+        if (!localeGuard.ok()) return failAt("could not establish the C numeric locale");
         skipWhitespace();
         Value v;
         if (!parseValue(&v)) return fail();
@@ -473,6 +474,7 @@ bool formatNumber(double value, std::string* out) {
     // LC_NUMERIC; without this guard a comma-decimal locale would emit
     // "1,5" instead of "1.5", which is not valid JSON.
     const CLocaleGuard localeGuard;
+    if (!localeGuard.ok()) return false;
     if (!std::isfinite(value)) return false;
     if (value == 0.0) {
         *out = "0";  // negative zero is also "0"

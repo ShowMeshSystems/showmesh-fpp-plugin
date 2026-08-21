@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
+
+#include "showmesh/json.h"
+#include "showmesh/sha256.h"
 
 namespace showmesh {
 namespace {
@@ -40,6 +44,40 @@ double clampPercent(double v) {
     if (v < static_cast<double>(kMinPercent)) return static_cast<double>(kMinPercent);
     if (v > static_cast<double>(kMaxPercent)) return static_cast<double>(kMaxPercent);
     return v;
+}
+
+// stateChangedAtMillis is the ordering key, not a fade endpoint, but a
+// hostile or corrupted value here is the same class of wedge: zero is the
+// "never changed locally" sentinel a fresh engine reports, and everything
+// else must fall inside the plausible epoch band.
+bool timestampIsPlausible(TimeMillis t) {
+    if (t == 0) return true;
+    return t >= kEarliestPlausibleEpochMillis && t <= kLatestPlausibleEpochMillis;
+}
+
+// The third tier of the MultiSync ordering key. Two states can share an
+// equal (stateChangedAtMillis, instanceId), most commonly two nodes that
+// both have no instanceId yet; hashing the actual value fields is what
+// still gives them a total order instead of each rejecting the other.
+// revision, schemaVersion, instanceId, stateChangedAtMillis, and
+// persistedAtMillis are deliberately excluded: they are either
+// bookkeeping or already compared by the first two tiers, and including
+// persistedAtMillis in particular would make the hash differ on every
+// write of otherwise-identical content.
+std::string orderingContentHash(const BrightnessState& state) {
+    std::vector<json::Value::Member> members;
+    members.emplace_back("ceilingStart", json::Value::makeNumber(state.ceilingStart));
+    members.emplace_back("ceilingTarget", json::Value::makeNumber(state.ceilingTarget));
+    members.emplace_back("ceilingFadeStartMillis", json::Value::makeNumber(static_cast<double>(state.ceilingFadeStartMillis)));
+    members.emplace_back("ceilingFadeEndMillis", json::Value::makeNumber(static_cast<double>(state.ceilingFadeEndMillis)));
+    members.emplace_back("gainStart", json::Value::makeNumber(state.gainStart));
+    members.emplace_back("gainTarget", json::Value::makeNumber(state.gainTarget));
+    members.emplace_back("gainFadeStartMillis", json::Value::makeNumber(static_cast<double>(state.gainFadeStartMillis)));
+    members.emplace_back("gainFadeEndMillis", json::Value::makeNumber(static_cast<double>(state.gainFadeEndMillis)));
+    members.emplace_back("lastAppliedCeiling", json::Value::makeNumber(state.lastAppliedCeiling));
+    members.emplace_back("lastAppliedGain", json::Value::makeNumber(state.lastAppliedGain));
+    json::CanonicalResult canonical = json::canonicalize(json::Value::makeObject(std::move(members)));
+    return sha256Hex(canonical.ok ? canonical.text : std::string());
 }
 
 }  // namespace
@@ -189,17 +227,30 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state) {
     if (state.schemaVersion != kBrightnessStateSchemaVersion) {
         return StateAdoption::kRejectedUnsupportedVersion;
     }
+    if (!timestampIsPlausible(state.stateChangedAtMillis)) {
+        return StateAdoption::kRejectedImplausibleTimestamp;
+    }
     if (!fadeWindowIsPlausible(state.ceilingFadeStartMillis, state.ceilingFadeEndMillis) ||
         !fadeWindowIsPlausible(state.gainFadeStartMillis, state.gainFadeEndMillis)) {
         return StateAdoption::kRejectedInvalidFadeWindow;
     }
-    // Full state is ordered by (stateChangedAtMillis, instanceId) compared
-    // lexicographically, not by the sender's local revision counter, so
-    // two nodes that each ran one command converge on the same state
-    // regardless of which one adopts first.
-    const bool newer = state.stateChangedAtMillis != stateChangedAtMillis_
-                            ? state.stateChangedAtMillis > stateChangedAtMillis_
-                            : state.instanceId > instanceId_;
+    // Full state is ordered by (stateChangedAtMillis, instanceId,
+    // canonicalStateHash) compared lexicographically as a total order, not
+    // by the sender's local revision counter, so two nodes that each ran
+    // one command converge on the same state regardless of which one
+    // adopts first. The hash tier matters because two nodes with an empty
+    // instanceId and an equal timestamp would otherwise tie and each
+    // reject the other's state forever.
+    bool newer;
+    if (state.stateChangedAtMillis != stateChangedAtMillis_) {
+        newer = state.stateChangedAtMillis > stateChangedAtMillis_;
+    } else if (state.instanceId != instanceId_) {
+        newer = state.instanceId > instanceId_;
+    } else {
+        const std::string incomingHash = orderingContentHash(state);
+        const std::string currentHash = orderingContentHash(captureState(0));
+        newer = incomingHash > currentHash;
+    }
     if (!newer) {
         return StateAdoption::kRejectedStaleRevision;
     }
@@ -208,7 +259,10 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state) {
     gain_.restore(clampPercent(state.gainStart), clampPercent(state.gainTarget), state.gainFadeStartMillis,
                   state.gainFadeEndMillis);
     stateChangedAtMillis_ = state.stateChangedAtMillis;
-    instanceId_ = state.instanceId;
+    // instanceId_ is this node's own persistent identity, never assigned
+    // from an adopted payload: doing so would make this node permanently
+    // impersonate the peer it just adopted from, including across a
+    // restart once captureState() persists it.
     // revision_ is local-only: bumped so this node knows its own state
     // changed and republishes, never copied from the sender.
     ++revision_;
@@ -230,14 +284,15 @@ bool fadeTimingIsTrustworthy(TimeMillis startMillis, TimeMillis endMillis, TimeM
 }
 
 // Resolves one persisted fade window to one of three outcomes: no fade was
-// recorded, the window is inverted (never trustworthy, must settle dark),
-// or it may be a real fade that fadeTimingIsTrustworthy still has to
-// clear.
-enum class FadeWindowShape { kNone, kInverted, kCandidate };
+// recorded, the window is inverted or its magnitude is implausible (never
+// trustworthy, must settle dark; this is the same fadeWindowIsPlausible
+// check adoptState applies, which restoreFromPersisted must not skip), or
+// it may be a real fade that fadeTimingIsTrustworthy still has to clear.
+enum class FadeWindowShape { kNone, kImplausible, kCandidate };
 
 FadeWindowShape classifyFadeWindow(TimeMillis startMillis, TimeMillis endMillis) {
     if (startMillis == 0 && endMillis == 0) return FadeWindowShape::kNone;
-    if (endMillis < startMillis) return FadeWindowShape::kInverted;
+    if (!fadeWindowIsPlausible(startMillis, endMillis)) return FadeWindowShape::kImplausible;
     return FadeWindowShape::kCandidate;
 }
 
@@ -260,6 +315,19 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
         return StateAdoption::kRejectedUnsupportedVersion;
     }
 
+    if (!timestampIsPlausible(state.stateChangedAtMillis)) {
+        // A corrupted or hostile persisted stateChangedAtMillis is the
+        // same class of wedge as one arriving over MultiSync: adopting it
+        // verbatim would make every future legitimate peer state compare
+        // older forever. Settle darker and refuse to adopt the ordering
+        // key, exactly as an unsupported schema version does.
+        ceiling_.settle(safeCeiling);
+        gain_.settle(safeGain);
+        lastAppliedCeiling_ = safeCeiling;
+        lastAppliedGain_ = safeGain;
+        return StateAdoption::kRejectedImplausibleTimestamp;
+    }
+
     revision_ = state.revision;
     stateChangedAtMillis_ = state.stateChangedAtMillis;
     instanceId_ = state.instanceId;
@@ -269,9 +337,10 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
     const FadeWindowShape ceilingShape = classifyFadeWindow(state.ceilingFadeStartMillis, state.ceilingFadeEndMillis);
     if (ceilingShape == FadeWindowShape::kNone) {
         ceiling_.settle(clampPercent(state.ceilingTarget));
-    } else if (ceilingShape == FadeWindowShape::kInverted) {
-        // An inverted window is never trustworthy timing: settle darker
-        // rather than at the target, which RES-018 section 1 requires.
+    } else if (ceilingShape == FadeWindowShape::kImplausible) {
+        // An inverted or implausibly-magnituded window is never
+        // trustworthy timing: settle darker rather than at the target,
+        // which RES-018 section 1 requires.
         ceiling_.settle(safeCeiling);
     } else if (fadeTimingIsTrustworthy(state.ceilingFadeStartMillis, state.ceilingFadeEndMillis, state.persistedAtMillis, now)) {
         ceiling_.restore(clampPercent(state.ceilingStart), clampPercent(state.ceilingTarget), state.ceilingFadeStartMillis,
@@ -283,7 +352,7 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
     const FadeWindowShape gainShape = classifyFadeWindow(state.gainFadeStartMillis, state.gainFadeEndMillis);
     if (gainShape == FadeWindowShape::kNone) {
         gain_.settle(clampPercent(state.gainTarget));
-    } else if (gainShape == FadeWindowShape::kInverted) {
+    } else if (gainShape == FadeWindowShape::kImplausible) {
         gain_.settle(safeGain);
     } else if (fadeTimingIsTrustworthy(state.gainFadeStartMillis, state.gainFadeEndMillis, state.persistedAtMillis, now)) {
         gain_.restore(clampPercent(state.gainStart), clampPercent(state.gainTarget), state.gainFadeStartMillis,

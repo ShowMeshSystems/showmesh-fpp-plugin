@@ -78,6 +78,16 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // adjustment, so a duplicate or delayed payload cannot apply twice.
     void multiSyncData(const uint8_t* data, int len) override { runtime_.adoptEncodedFullState(data, len); }
 
+    // Refreshes the configured ranges when the operator edits the
+    // ShowMeshChannelRanges setting itself. This does not cover FPP
+    // recomputing its own output ranges on an output-config reload with
+    // the setting untouched: no FPPPlugin virtual fires for that, see the
+    // comment on configureChannelRanges().
+    void settingChanged(const std::string& key, const std::string&) override {
+        if (key != showmesh::adapter::kChannelRangesSettingName) return;
+        showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
+    }
+
  private:
     void publishFullStateIfChanged() {
         const std::uint64_t revision = runtime_.brightness()->revision();

@@ -102,6 +102,11 @@ TEST(MemberOrderDoesNotChangeTheCanonicalForm) {
 // brightness state codec must all still use "." rather than silently
 // discarding the fractional part or emitting invalid JSON.
 TEST(NumberHandlingIsUnaffectedByAThreadWideCommaDecimalLocale) {
+    // A skip here reads as a pass, which is exactly how this test rode
+    // green through CI while CLocaleGuard was fully neutered: debian:trixie,
+    // what CI actually runs on, ships only C, C.utf8, and POSIX. The
+    // native-core CI job installs de_DE.UTF-8 explicitly so this is a hard
+    // failure rather than a silent skip on the machines that matter.
     const char* installed = nullptr;
     for (const char* candidate : {"de_DE.UTF-8", "de_DE", "de_DE.ISO8859-1"}) {
         if (std::setlocale(LC_NUMERIC, candidate) != nullptr) {
@@ -110,9 +115,10 @@ TEST(NumberHandlingIsUnaffectedByAThreadWideCommaDecimalLocale) {
         }
     }
     if (installed == nullptr) {
-        std::fprintf(stderr,
-                     "  SKIP NumberHandlingIsUnaffectedByAThreadWideCommaDecimalLocale: "
-                     "no comma-decimal locale (tried de_DE.UTF-8, de_DE, de_DE.ISO8859-1) is installed here\n");
+        ::showmesh_test::reportFailure(
+            __FILE__, __LINE__,
+            "no comma-decimal locale (tried de_DE.UTF-8, de_DE, de_DE.ISO8859-1) is installed here; "
+            "install one rather than letting this test skip");
         return;
     }
 

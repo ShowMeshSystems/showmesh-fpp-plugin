@@ -1,6 +1,8 @@
 #include "showmesh/runtime.h"
 
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -201,13 +203,14 @@ TEST(ATruncatedSectionProducesAnUnavailableObservation) {
     CHECK(sink.unavailable[0].unavailable == showmesh::IdentityUnavailable::kTruncatedIdentityField);
 }
 
-// The gap belongs to whoever accepts it. An unavailable observation
-// acknowledges nothing, so the coalesced count must still be riding on the
-// next observation that does get published.
-TEST(TheCoalescedGapIsCarriedUntilSomethingAcceptsIt) {
+// The gap belongs to whoever accepts it. A REJECTED delivery, of either
+// kind, acknowledges nothing, so the coalesced count must still be riding
+// on the next observation.
+TEST(ARejectedDeliveryOfEitherKindCarriesTheGapForward) {
     FakeDefinitions definitions;
     definitions.definition = "";
     RecordingSink sink;
+    sink.acceptUnavailable = false;
     ShowMeshRuntime runtime(&definitions, &sink, testClock);
 
     for (int i = 0; i < 40; ++i) {
@@ -221,7 +224,7 @@ TEST(TheCoalescedGapIsCarriedUntilSomethingAcceptsIt) {
     const std::uint32_t firstGap = sink.unavailable[0].coalescedSincePreviousAcknowledged;
     CHECK_EQ(firstGap, static_cast<std::uint32_t>(24));
 
-    // Still unacknowledged, so the next one reports at least as much.
+    // Rejected, so the next one still reports at least as much.
     CHECK(runtime.drainOnce());
     CHECK(sink.unavailable[1].coalescedSincePreviousAcknowledged >= firstGap);
 
@@ -233,6 +236,29 @@ TEST(TheCoalescedGapIsCarriedUntilSomethingAcceptsIt) {
 
     CHECK(runtime.drainOnce());
     CHECK_EQ(sink.published[1].coalescedSincePreviousAcknowledged, static_cast<std::uint32_t>(0));
+}
+
+// finding 7: an unavailable observation is still an observation the
+// coordinator can acknowledge. publishUnavailable()'s return value was
+// previously discarded, so the same gap was re-reported forever
+// regardless of what the sink returned. Accepting it must clear the gap
+// exactly as an accepted publish does.
+TEST(AnAcceptedUnavailableObservationClearsTheGap) {
+    FakeDefinitions definitions;
+    definitions.definition = "";
+    RecordingSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+
+    for (int i = 0; i < 40; ++i) {
+        runtime.observeCallback("Main Show", "playing", "mainPlaylist", i, "", "");
+    }
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.unavailable[0].coalescedSincePreviousAcknowledged, static_cast<std::uint32_t>(24));
+
+    // Accepted (RecordingSink::acceptUnavailable defaults true): the very
+    // next observation reports zero rather than carrying 24 forward.
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.unavailable[1].coalescedSincePreviousAcknowledged, static_cast<std::uint32_t>(0));
 }
 
 // A sink that refuses a publish must not be credited with one, and the
@@ -305,36 +331,85 @@ TEST(TheWorkerThreadDrainsWhatTheCallbackOffers) {
     runtime.stop();
 }
 
-// The lost-wakeup regression for finding 10: a single observation must be
-// drained well under the 250ms poll fallback, proving the worker woke on
-// the notification rather than on the next timeout.
+// The lost-wakeup regression for finding 10 (and finding 8 of the
+// follow-up review: the previous version of this test passed with the
+// fix fully reverted, ten runs out of ten, because a 20ms sleep only
+// makes it *likely* the worker is parked in wait_for, never guarantees
+// it). setTestHookBeforeWait pins the worker in the exact gap between its
+// last failed drainOnce() and wait_for(), so the notify below is driven
+// into that gap deterministically rather than by timing luck.
 TEST(TheWorkerWakesPromptlyRatherThanWaitingForThePollTimeout) {
     FakeDefinitions definitions;
     RecordingSink sink;
     ShowMeshRuntime runtime(&definitions, &sink, testClock);
+
+    std::mutex hookMutex;
+    std::condition_variable hookCv;
+    bool workerParkedInGap = false;
+    bool releaseWorker = false;
+
+    runtime.setTestHookBeforeWait([&] {
+        std::unique_lock<std::mutex> lock(hookMutex);
+        workerParkedInGap = true;
+        hookCv.notify_all();
+        hookCv.wait(lock, [&] { return releaseWorker; });
+    });
+
     runtime.start();
 
-    // The first observation can be drained by the worker's own startup
-    // loop without ever waiting, which would pass even with the lost
-    // wakeup bug present. Waiting for it to land, then sleeping past the
-    // point the worker has gone idle in wait_for, reproduces the actual
-    // race: a notify that lands in the gap between the worker's last
-    // failed drainOnce() and its wait_for() call.
-    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "", "");
-    while (runtime.publishedCount() == 0) std::this_thread::yield();
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // Block until the worker has drained its startup work and is sitting
+    // in the hook, i.e. it has not yet taken wakeMutex_ to enter wait_for.
+    {
+        std::unique_lock<std::mutex> lock(hookMutex);
+        hookCv.wait(lock, [&] { return workerParkedInGap; });
+    }
 
+    // This notify lands while the worker is still held in the hook,
+    // before it can be waiting on the condition variable: exactly the gap
+    // a lost wakeup happens in.
     const auto begin = std::chrono::steady_clock::now();
-    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 1, "", "");
-    while (runtime.publishedCount() < 2) {
+    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "", "");
+
+    {
+        std::lock_guard<std::mutex> lock(hookMutex);
+        releaseWorker = true;
+    }
+    hookCv.notify_all();
+
+    while (runtime.publishedCount() < 1) {
         std::this_thread::yield();
         if (std::chrono::steady_clock::now() - begin > std::chrono::seconds(2)) break;
     }
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     runtime.stop();
 
-    CHECK_EQ(runtime.publishedCount(), static_cast<std::uint64_t>(2));
+    CHECK_EQ(runtime.publishedCount(), static_cast<std::uint64_t>(1));
+    // A correct predicate on wait_for observes hasWork_ already set and
+    // returns immediately; a lost wakeup instead waits out the full 250ms
+    // poll fallback.
     CHECK(elapsed < std::chrono::milliseconds(200));
+}
+
+// finding 12: sequenceFilename and mediaFilename truncation is recorded on
+// the callback thread but was never carried past drainOnce(). Identity
+// still gates on playlistName and section only, so this observation must
+// still publish, but the evidence must say a filename was cut.
+TEST(TruncatedSequenceAndMediaFilenamesAreCarriedAsEvidenceNotDropped) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+
+    const std::string longSequence(300, 's');
+    const std::string longMedia(300, 'm');
+    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, longSequence.c_str(), longMedia.c_str());
+    CHECK(runtime.drainOnce());
+
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(1));
+    const PlaylistEntryObservation& o = sink.published[0];
+    CHECK(o.unavailable == showmesh::IdentityUnavailable::kNone);
+    CHECK(o.sequenceFilenameTruncated);
+    CHECK(o.mediaFilenameTruncated);
+    CHECK_EQ(o.sequenceFilename.size(), showmesh::kMaxFilenameLength);
 }
 
 TEST(AnAbsentSinkIsNotACrash) {

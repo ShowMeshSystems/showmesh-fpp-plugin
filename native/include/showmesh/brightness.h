@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -100,11 +101,15 @@ struct BrightnessState {
 enum class StateAdoption {
     kAdopted,
     // Ordered no later than what this node already holds, by
-    // (stateChangedAtMillis, instanceId).
+    // (stateChangedAtMillis, instanceId, canonicalStateHash).
     kRejectedStaleRevision,
     kRejectedUnsupportedVersion,
     // The fade window is inverted or its magnitude is implausible.
     kRejectedInvalidFadeWindow,
+    // stateChangedAtMillis itself falls outside the plausible epoch band:
+    // the ordering key, not a fade endpoint, but the same class of
+    // hostile-payload wedge.
+    kRejectedImplausibleTimestamp,
 };
 
 // BrightnessEngine owns the composition, the two fades, and the channel
@@ -115,13 +120,17 @@ class BrightnessEngine {
     BrightnessEngine() = default;
 
     ValidationResult configureRanges(const RangeConfig& config, std::uint32_t totalChannels);
-    const RangeConfig& ranges() const { return ranges_; }
+    // Returned by value: EngineAccessor's lock releases at the end of the
+    // calling expression, so a reference into ranges_ would outlive it.
+    RangeConfig ranges() const { return ranges_; }
 
     // The persistent per-node identity carried in captureState() and
     // compared in adoptState(). Set once by the adapter; empty when the
-    // host has no identity yet.
+    // host has no identity yet. Never overwritten by adoptState: it is
+    // this node's own identity, not a peer's.
     void setInstanceId(std::string id) { instanceId_ = std::move(id); }
-    const std::string& instanceId() const { return instanceId_; }
+    // Returned by value for the same reason as ranges().
+    std::string instanceId() const { return instanceId_; }
 
     // Sets the ceiling, the value FPP's scheduler owns. Rejects input
     // outside the registered action's own declared bounds rather than
@@ -163,9 +172,14 @@ class BrightnessEngine {
     std::uint64_t revision() const { return revision_; }
 
  private:
+    // A local change always orders strictly after whatever it replaces:
+    // max(now, stateChangedAtMillis_ + 1) rather than plain now, so a
+    // local command landing in the same millisecond as an already-adopted
+    // peer state is never lost to it, and a host whose clock is stepped
+    // backwards by NTP still outranks what it is replacing.
     void bumpRevision(TimeMillis now) {
         ++revision_;
-        stateChangedAtMillis_ = now;
+        stateChangedAtMillis_ = std::max(now, stateChangedAtMillis_ + 1);
     }
     void recomputeScaledSpans();
 

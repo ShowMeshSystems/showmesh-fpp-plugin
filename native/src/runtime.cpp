@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <string>
 
 #include "showmesh/brightness_codec.h"
@@ -139,16 +140,32 @@ StateAdoption ShowMeshRuntime::adoptEncodedFullState(const std::uint8_t* data, i
     return engine_.adoptState(decoded.state);
 }
 
+namespace {
+
+// unacknowledgedCoalesced_ carries gap evidence forward across every
+// observation nothing has accepted yet, potentially for as long as a sink
+// stays unreachable. Saturating rather than wrapping keeps a pathological
+// run reporting "at least this many dropped" instead of wrapping back
+// through zero and understating the gap.
+std::uint32_t saturatingAdd(std::uint32_t a, std::uint32_t b) {
+    const std::uint32_t sum = a + b;
+    return sum < a ? std::numeric_limits<std::uint32_t>::max() : sum;
+}
+
+}  // namespace
+
 bool ShowMeshRuntime::drainOnce() {
     CallbackEvidence evidence;
     std::uint32_t coalesced = 0;
     if (!handoff_.take(&evidence, &coalesced)) return false;
-    unacknowledgedCoalesced_ += coalesced;
+    unacknowledgedCoalesced_ = saturatingAdd(unacknowledgedCoalesced_, coalesced);
 
     PlaylistEntryObservation observation;
     observation.schemaVersion = kObservationSchemaVersion;
     observation.sequenceFilename = evidence.sequenceFilename;
     observation.mediaFilename = evidence.mediaFilename;
+    observation.sequenceFilenameTruncated = evidence.sequenceFilenameTruncated;
+    observation.mediaFilenameTruncated = evidence.mediaFilenameTruncated;
     observation.action = evidence.action;
     observation.observedAtMillis = evidence.observedAtMillis;
     observation.sequence = sequence_.next();
@@ -161,7 +178,12 @@ bool ShowMeshRuntime::drainOnce() {
         // never reaches resolveEntryIdentity.
         observation.unavailable = IdentityUnavailable::kTruncatedIdentityField;
         ++unavailable_;
-        if (sink_ != nullptr) sink_->publishUnavailable(observation);
+        // An unavailable observation is still an observation the
+        // coordinator can acknowledge: only clear the gap on acceptance,
+        // never on a refusal, which must still ride forward.
+        if (sink_ != nullptr && sink_->publishUnavailable(observation)) {
+            unacknowledgedCoalesced_ = 0;
+        }
         return true;
     }
 
@@ -178,9 +200,9 @@ bool ShowMeshRuntime::drainOnce() {
         observation.identity.section = evidence.section;
         observation.identity.position = evidence.position;
         ++unavailable_;
-        if (sink_ != nullptr) sink_->publishUnavailable(observation);
-        // An unavailable observation is not an acknowledgment of the gap:
-        // nothing has accepted the record of what was dropped.
+        if (sink_ != nullptr && sink_->publishUnavailable(observation)) {
+            unacknowledgedCoalesced_ = 0;
+        }
         return true;
     }
 
@@ -199,6 +221,7 @@ void ShowMeshRuntime::workerLoop() {
         while (drainOnce()) {
             if (!running_.load()) return;
         }
+        if (testHookBeforeWait_) testHookBeforeWait_();
         std::unique_lock<std::mutex> lock(wakeMutex_);
         wake_.wait_for(lock, std::chrono::milliseconds(250), [this] { return hasWork_ || !running_.load(); });
         hasWork_ = false;

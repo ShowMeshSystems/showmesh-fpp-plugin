@@ -63,6 +63,13 @@ bool readMillis(const json::Value& object, const char* name, TimeMillis* out, st
         *error = std::string("field \"") + name + "\" is not a representable time";
         return false;
     }
+    if (d != std::floor(d)) {
+        // A fractional millisecond cannot come from a real clock read;
+        // truncating it silently (as static_cast would) turns 1.5 into 1
+        // without either side noticing the payload was malformed.
+        *error = std::string("field \"") + name + "\" is not a whole number of milliseconds";
+        return false;
+    }
     *out = static_cast<TimeMillis>(d);
     return true;
 }

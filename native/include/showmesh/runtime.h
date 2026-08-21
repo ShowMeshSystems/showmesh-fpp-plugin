@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -152,6 +153,17 @@ class ShowMeshRuntime {
     std::uint64_t publishedCount() const { return published_.load(); }
     std::uint64_t unavailableCount() const { return unavailable_.load(); }
 
+    // Test seam only, never called in production. Runs on the worker
+    // thread immediately after its last failed drainOnce() and
+    // immediately before it takes wakeMutex_ to enter wait_for. This is
+    // the exact gap a lost wakeup happens in: a notify landing here, before
+    // the predicate is (re-)armed under the lock, must still be observed
+    // by wait_for rather than requiring the 250ms poll fallback. A test
+    // can block here on its own signal so a racing observeCallback() is
+    // driven deterministically instead of depending on a sleep to usually
+    // land in the gap.
+    void setTestHookBeforeWait(std::function<void()> hook) { testHookBeforeWait_ = std::move(hook); }
+
  private:
     void workerLoop();
 
@@ -173,6 +185,9 @@ class ShowMeshRuntime {
     // true instead of the worker blocking for up to 250ms regardless.
     bool hasWork_ = false;
     std::atomic<bool> running_{false};
+
+    // Test seam only; see setTestHookBeforeWait().
+    std::function<void()> testHookBeforeWait_;
 
     std::atomic<std::uint64_t> published_{0};
     std::atomic<std::uint64_t> unavailable_{0};

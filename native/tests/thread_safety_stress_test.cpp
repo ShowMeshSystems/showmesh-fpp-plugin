@@ -97,3 +97,53 @@ TEST(ThreeThreadsHittingTheRuntimeLikeTheAdaptersDoProduceNoTornFrame) {
 
     CHECK(!sawOutOfRange.load());
 }
+
+// finding 10: EngineAccessor's own comment says the lock releases only
+// when the accessor temporary is destroyed at the end of the calling
+// expression, but ranges() and instanceId() returned references into
+// engine_ that outlived that temporary. A verifier reproduced a race
+// through instanceId() under ThreadSanitizer. Returning both by value
+// (this test's regression target) copies the data out while the lock is
+// still held, before the accessor's destructor runs.
+TEST(ConcurrentIdentityAndRangeReadsDoNotRaceEngineAccessorMutations) {
+    NullDefinitions definitions;
+    NullSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, nowMillis);
+    runtime.start();
+
+    std::atomic<bool> stop{false};
+
+    std::thread writerThread([&] {
+        int i = 0;
+        while (!stop.load()) {
+            runtime.brightness()->setInstanceId("node-" + std::to_string(i % 8));
+            RangeConfig config;
+            config.apply.push_back(ChannelRange{1, static_cast<std::uint32_t>(16 + (i % 8))});
+            runtime.brightness()->configureRanges(config, 64);
+            ++i;
+            std::this_thread::yield();
+        }
+    });
+
+    std::thread readerThread([&] {
+        while (!stop.load()) {
+            const std::string& id = runtime.brightness()->instanceId();
+            const RangeConfig& config = runtime.brightness()->ranges();
+            // Actually touch the returned data after EngineAccessor's
+            // lock has released, not merely bind a name to it: a
+            // reference-returning accessor is only provably racy once
+            // its result is read, not merely held.
+            volatile std::size_t idLen = id.size();
+            volatile std::size_t rangeCount = config.apply.size();
+            (void)idLen;
+            (void)rangeCount;
+            std::this_thread::yield();
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    stop.store(true);
+    writerThread.join();
+    readerThread.join();
+    runtime.stop();
+}
