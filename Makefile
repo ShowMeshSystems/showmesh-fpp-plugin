@@ -137,14 +137,50 @@ release-arm64:
 release-armv7:
 	$(call build_and_package,arm,GOARM=7,armv7,$(DIST))
 
-# Builds all three platforms, writes the checksums file the pinned
-# contract names, then verifies it against the tarballs just produced, on
-# every invocation rather than as a trusted one-time claim.
+# The resident component ships as architecture-independent source, not a
+# binary: FPP 10 replaces the HTTP framework and revamps the plugin
+# manager, so the adapter is compiled on the host against that host's own
+# installed headers. The bundle carries the host-neutral core, both
+# adapters, their build files, the core tests, the version pins, and the
+# license. The tests travel with it so an installer can run them on the
+# host after compiling, as a validation step before activation.
+NATIVE_BUNDLE := showmesh-fpp-plugin-native_$(DIST_VERSION).tar.gz
+
+.PHONY: release-native-bundle
+release-native-bundle:
+	mkdir -p $(DIST)
+	rm -f $(DIST)/$(NATIVE_BUNDLE)
+	@if [ "$(TAR_IS_GNU)" = "yes" ]; then \
+		$(TAR) --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' \
+			--exclude='build' --exclude='.DS_Store' \
+			-cf - LICENSE native/include native/src native/tests native/adapters native/Makefile \
+			| gzip -n -9 > $(DIST)/$(NATIVE_BUNDLE); \
+	else \
+		echo "WARNING: GNU tar not found on PATH; the native source bundle will not reproduce byte-for-byte across two local runs." >&2; \
+		tar --exclude='build' --exclude='.DS_Store' -czf $(DIST)/$(NATIVE_BUNDLE) LICENSE native/include native/src native/tests native/adapters native/Makefile; \
+	fi
+	@echo "release-native-bundle: wrote $(DIST)/$(NATIVE_BUNDLE)"
+
+# Builds every artifact, writes the checksums file the pinned contract
+# names, then verifies it against what was just produced, on every
+# invocation rather than as a trusted one-time claim.
 .PHONY: release
-release: release-amd64 release-arm64 release-armv7
-	cd $(DIST) && sha256sum showmesh-fpp-plugin_$(DIST_VERSION)_linux_*.tar.gz > showmesh-fpp-plugin_$(DIST_VERSION)_SHA256SUMS
+release: release-amd64 release-arm64 release-armv7 release-native-bundle
+	cd $(DIST) && sha256sum showmesh-fpp-plugin_$(DIST_VERSION)_linux_*.tar.gz $(NATIVE_BUNDLE) > showmesh-fpp-plugin_$(DIST_VERSION)_SHA256SUMS
 	cd $(DIST) && sha256sum -c showmesh-fpp-plugin_$(DIST_VERSION)_SHA256SUMS
+	$(MAKE) release-manifest
 	@echo "release: built and self-verified $(DIST)/showmesh-fpp-plugin_$(DIST_VERSION)_SHA256SUMS"
+
+# The manifest is what the packaging repository turns into its committed
+# lock file. It names every artifact, its size, and its SHA-256, so an
+# installer verifies against a hash committed beside the install script
+# rather than one fetched from the same mutable location as the artifact.
+# It carries no timestamp, so two builds of one commit produce the same
+# manifest.
+.PHONY: release-manifest
+release-manifest:
+	@scripts/write-release-manifest.sh "$(DIST)" "$(DIST_VERSION)" "$(COMMIT)" > $(DIST)/release-manifest.json
+	@scripts/verify-release-manifest.sh "$(DIST)" "$(DIST_VERSION)"
 
 # The stronger claim `release`'s own sha256sum -c cannot make: two
 # independent builds of the same commit produce byte-identical TARBALLS,

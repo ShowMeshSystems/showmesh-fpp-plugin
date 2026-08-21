@@ -191,6 +191,18 @@ jobs:
       - name: Verify the release build is reproducible
         run: make verify-reproducible VERSION=0.0.0-ci.${{ github.sha }}
 
+      # The native component ships as source compiled on the host, so what
+      # matters is that the bundle builds on its own: extracted into an
+      # empty directory, with nothing else from this repository present.
+      - name: Build the native bundle standalone
+        run: |
+          set -eux
+          sudo apt-get update -o Acquire::Retries=2
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libjsoncpp-dev
+          mkdir -p /tmp/bundle
+          tar -xzf dist/showmesh-fpp-plugin-native_0.0.0-ci.${{ github.sha }}.tar.gz -C /tmp/bundle
+          make -C /tmp/bundle/native test
+
       - name: Confirm every artifact is a static Linux binary for its named architecture
         run: |
           set -eux
