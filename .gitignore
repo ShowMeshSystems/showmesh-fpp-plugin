@@ -1,0 +1,27 @@
+# Build output
+/bin/
+/dist/
+/build/
+*.o
+*.a
+*.so
+
+# Go
+/vendor/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Credentials and host-specific state, never committed
+*.pem
+*.key
+credential
+artifacts/
+
+# Editor and OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
