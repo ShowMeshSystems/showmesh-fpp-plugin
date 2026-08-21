@@ -3,6 +3,7 @@
 /dist/
 /build/
 /native/build/
+/native/adapters/build/
 *.o
 *.a
 *.so

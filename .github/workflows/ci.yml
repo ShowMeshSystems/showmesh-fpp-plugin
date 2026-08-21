@@ -92,6 +92,75 @@ jobs:
           make -C native test CXX=${{ matrix.compiler }} \
             CXXFLAGS="-std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread"
 
+  fpp-adapters:
+    # Each adapter is compiled against the FPP major it is for, at a pinned
+    # tag and commit recorded in native/adapters/FPP-PINS.md. FPP 10
+    # versions and checks its plugin ABI at dlopen, so the two adapters are
+    # separate binaries and are built separately here.
+    #
+    # This proves the adapters agree with those headers and export what the
+    # loader looks up. It is not evidence that the plugin loads into a
+    # running fppd or behaves correctly on hardware.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: debian:trixie
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - major: fpp9
+            ref: "9.5.3"
+            commit: 7979a4bb0bb9068fea71f3b447e273d5c0ea01e3
+          - major: fpp10
+            ref: "10.0-beta5"
+            commit: 741cfc4344bd0d1b913941d507c3a123a8c82e5a
+    steps:
+      - name: Install the toolchain
+        run: |
+          set -eux
+          apt-get update -o Acquire::Retries=2
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            g++ make pkg-config binutils git ca-certificates gawk libjsoncpp-dev
+
+      # FPP 9 headers reach for libhttpserver, which Debian does not
+      # package. FPP installs 0.19.0 from source and so does this job, so
+      # the HTTP_RESPONSE_CONST decision fpp-pch.h makes from the installed
+      # version matches what a real host would decide.
+      - name: Install libhttpserver 0.19.0
+        if: matrix.major == 'fpp9'
+        run: |
+          set -eux
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libmicrohttpd-dev autoconf automake libtool
+          git clone --depth 1 --branch 0.19.0 https://github.com/etr/libhttpserver /tmp/libhttpserver
+          cd /tmp/libhttpserver
+          ./bootstrap
+          mkdir build && cd build
+          ../configure --prefix=/usr --disable-examples
+          make -j"$(nproc)"
+          make install
+
+      - uses: actions/checkout@v5
+
+      - name: Check out FPP at the pinned tag
+        run: |
+          set -eux
+          git config --global --add safe.directory '*'
+          git clone --depth 1 --branch "${{ matrix.ref }}" https://github.com/FalconChristmas/fpp.git /tmp/fpp
+          actual=$(git -C /tmp/fpp rev-parse HEAD)
+          echo "FPP ${{ matrix.ref }} is at $actual"
+          # The tag is a moving name; the commit is the pin. A tag that was
+          # repointed must fail here rather than silently change what this
+          # build proves.
+          test "$actual" = "${{ matrix.commit }}"
+
+      - name: Compile the adapter against the pinned headers
+        run: make -C native/adapters ${{ matrix.major }} FPP_SRC=/tmp/fpp/src
+
+      - name: Verify the loader-visible symbols
+        run: make -C native/adapters verify-${{ matrix.major }} FPP_SRC=/tmp/fpp/src
+
   release-artifacts:
     # FPP hosts carry no Go toolchain, so this binary ships as a prebuilt,
     # sha256-verified static binary. This job is that pipeline: three

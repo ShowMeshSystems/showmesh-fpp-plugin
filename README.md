@@ -2,12 +2,11 @@
 
 The ShowMesh runtime that lives on an FPP host.
 
-**Status: the Go macro helper is extracted and builds here independently, and
-the host-neutral C++ core exists with its own tests. The FPP 9 and FPP 10
-adapters have not been written, and the identity publisher stops short of the
-coordinator wire contract, which another repository owns.** Nothing here has
-been installed on a real FPP host, and no release, public or private, has been
-published.
+**Status: the Go macro helper, the host-neutral C++ core, and both FPP
+adapters exist and are built and tested in CI. The identity publisher stops
+short of the coordinator wire contract, which another repository owns.**
+Nothing here has been installed on a real FPP host, and no release, public or
+private, has been published.
 
 ## What this plugin does and why it exists
 
@@ -182,6 +181,44 @@ running show's thread. When the queue is full the oldest pending observation is
 dropped so the newest state survives, and the drop is counted. That count is
 the gap evidence: current-state convergence is the invariant, and a coalesced
 delivery must never read as a complete event history.
+
+## The FPP adapters
+
+`native/adapters/` is the only code in this repository that includes an FPP
+header. Each adapter owns nothing but its major's plugin lifecycle and forwards
+everything else into the host-neutral runtime:
+
+| | FPP 9 | FPP 10 |
+|---|---|---|
+| Plugin ABI | unversioned | versioned and checked at `dlopen` |
+| Teardown | destructor | `shutdown()`, before the object is destroyed |
+| HTTP registration | libhttpserver surface | that surface is gone |
+| Header prerequisites | jsoncpp and libhttpserver | jsoncpp |
+
+They are separate translation units producing separate shared objects. One
+binary cannot serve both majors, and an `#ifdef`'d lifecycle would hide that.
+
+```sh
+make -C native/adapters fpp9  FPP_SRC=/opt/fpp/src
+make -C native/adapters fpp10 FPP_SRC=/opt/fpp/src
+make -C native/adapters verify-fpp10 FPP_SRC=/opt/fpp/src
+```
+
+`FPP_SRC` points at the installed FPP tree, which is how a host compiles it:
+against that host's own headers, never against a version assumed at release
+time. The verify targets check that the shared object exports what the loader
+looks up by name, including FPP 10's ABI-version and logger-layout
+fingerprints, which that loader refuses a plugin without.
+
+CI compiles both against pinned tags and commits recorded in
+[`native/adapters/FPP-PINS.md`](native/adapters/FPP-PINS.md), and fails if a
+tag has been repointed away from its pinned commit. Compiling proves the
+adapters agree with those headers and export the right symbols. It is not
+evidence that the plugin loads into a running `fppd`.
+
+The callback does one thing: read the bounded fields out of FPP's playlist
+JSON and hand them to the runtime. The definition fetch, the hash, the
+sequence, and the publish all happen on the worker thread.
 
 ## Coordinator seam
 
