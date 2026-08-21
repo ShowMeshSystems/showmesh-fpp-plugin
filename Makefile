@@ -192,7 +192,7 @@ verify-reproducible:
 	$(call build_and_package,amd64,,amd64,$(DIST)/.reproducible-a)
 	$(call build_and_package,amd64,,amd64,$(DIST)/.reproducible-b)
 	@if [ "$(TAR_IS_GNU)" != "yes" ]; then \
-		echo "verify-reproducible: SKIPPED the byte-for-byte comparison — no GNU tar on PATH, so neither tarball was built deterministically and comparing them would only prove that, not reproducibility" >&2; \
+		echo "verify-reproducible: SKIPPED the byte-for-byte comparison: no GNU tar on PATH, so neither tarball was built deterministically and comparing them would only prove that, not reproducibility" >&2; \
 		exit 1; \
 	fi
 	@if ! cmp -s $(DIST)/.reproducible-a/showmesh-fpp-plugin_$(DIST_VERSION)_linux_amd64.tar.gz $(DIST)/.reproducible-b/showmesh-fpp-plugin_$(DIST_VERSION)_linux_amd64.tar.gz; then \
