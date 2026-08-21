@@ -9,7 +9,7 @@
 //
 // Build by hand against a historical engine (from native/), to reproduce
 // a before/after comparison against a prior brightness.cpp/.h:
-//   c++ -std=c++17 -O2 -Iinclude -Itools tools/convergence_harness.cpp \
+//   c++ -std=c++17 -O2 -Iinclude -Itools tools/convergence_harness.cpp
 //       src/brightness.cpp src/json.cpp src/sha256.cpp -o /tmp/convergence_harness
 //
 // A pre-defect-3 engine (adoptState(state), no receiver-clock parameter)
