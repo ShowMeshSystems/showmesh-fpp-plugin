@@ -70,14 +70,20 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         } catch (...) {
         }
         runtime_.stop();
-        if (command_ != nullptr) {
-            // removeCommand only unregisters; a Command subclass declared
-            // here has its vtable in this library, so the registry must not
-            // be left holding it.
-            CommandManager::INSTANCE.removeCommand(command_);
-            delete command_;
-            command_ = nullptr;
-        }
+        // Withdrawn by NAME, and never deleted, because on FPP 9 this
+        // destructor runs after CommandManager has already deleted every
+        // registered command: fppd.cpp calls CommandManager::Cleanup()
+        // immediately before PluginManager::Cleanup(), and that Cleanup()
+        // deletes what it holds. Reaching through command_ to unregister
+        // would read a freed object's name, and deleting it would free it
+        // twice. Removing by name is a no-op in that ordering and still
+        // withdraws the registration in the reverse one, where this object
+        // would otherwise be left holding a vtable in a library about to be
+        // unmapped. The command is deliberately not deleted in either case:
+        // ownership passed to CommandManager at addCommand(), and the only
+        // path that reaches here is process shutdown.
+        command_ = nullptr;
+        CommandManager::INSTANCE.removeCommand(showmesh::kBrightnessCommandName);
     }
 
     // FPP's callback thread. Copy the bounded evidence and return: no
