@@ -314,16 +314,26 @@ TEST(TheWorkerWakesPromptlyRatherThanWaitingForThePollTimeout) {
     ShowMeshRuntime runtime(&definitions, &sink, testClock);
     runtime.start();
 
-    const auto begin = std::chrono::steady_clock::now();
+    // The first observation can be drained by the worker's own startup
+    // loop without ever waiting, which would pass even with the lost
+    // wakeup bug present. Waiting for it to land, then sleeping past the
+    // point the worker has gone idle in wait_for, reproduces the actual
+    // race: a notify that lands in the gap between the worker's last
+    // failed drainOnce() and its wait_for() call.
     runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "", "");
-    while (runtime.publishedCount() == 0) {
+    while (runtime.publishedCount() == 0) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    const auto begin = std::chrono::steady_clock::now();
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 1, "", "");
+    while (runtime.publishedCount() < 2) {
         std::this_thread::yield();
         if (std::chrono::steady_clock::now() - begin > std::chrono::seconds(2)) break;
     }
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     runtime.stop();
 
-    CHECK_EQ(runtime.publishedCount(), static_cast<std::uint64_t>(1));
+    CHECK_EQ(runtime.publishedCount(), static_cast<std::uint64_t>(2));
     CHECK(elapsed < std::chrono::milliseconds(200));
 }
 
