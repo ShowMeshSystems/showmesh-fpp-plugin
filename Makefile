@@ -4,7 +4,10 @@ BIN_DIR  := ./bin
 BIN      := $(BIN_DIR)/showmesh-fpp-plugin
 
 VERSION    ?= dev
-COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+# --short alone abbreviates to whatever length is unambiguous in the
+# clone's own object count, so a shallow CI clone and a full local clone
+# stamp different lengths for the same commit. --short=12 fixes the length.
+COMMIT     := $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo none)
 BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 GOLANGCI_LINT_VERSION ?= v2.6.2
@@ -96,6 +99,27 @@ DIST_LDFLAGS := -X $(MODULE)/internal/version.Version=$(DIST_VERSION) \
                 -X $(MODULE)/internal/version.Commit=$(COMMIT) \
                 -X $(MODULE)/internal/version.BuildDate=$(DIST_COMMIT_DATE)
 
+# The exact toolchain release builds use, so a local go1.26 and CI's
+# go1.25 do not produce different bytes for the same commit. Read from
+# go.mod's `go` line rather than duplicated here, so the two cannot drift.
+# GOTOOLCHAIN names an exact version (no "+auto" suffix), so `go` always
+# switches to it, downloading it if needed, even when a newer `go` is on
+# PATH; this pin applies only to the release build commands, not to
+# `make build`/`make test`, which still exercise whatever `go` is on PATH.
+GO_RELEASE_TOOLCHAIN := go$(shell awk '/^go [0-9]/{print $$2; exit}' go.mod)
+
+# Refuses to build a release artifact from a dirty working tree. The
+# manifest's sourceCommit and the binaries' stamped commit both name HEAD;
+# with uncommitted or untracked changes present, that name would not
+# describe what was actually built.
+.PHONY: check-clean-tree
+check-clean-tree:
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "release: refusing to build from a dirty working tree" >&2; \
+		git status --porcelain >&2; \
+		exit 1; \
+	fi
+
 # The determinism flags below (--sort, --owner, --group, --numeric-owner,
 # --mtime) are GNU tar's, not macOS bsdtar's. TAR_IS_GNU gates on that at
 # parse time so a machine with neither still gets a correct tarball, just
@@ -114,7 +138,7 @@ TAR_IS_GNU := $(shell $(TAR) --version 2>/dev/null | grep -qi 'gnu tar' && echo 
 define build_and_package
 	mkdir -p $(4)
 	rm -f $(4)/showmesh-fpp-plugin
-	GOOS=linux GOARCH=$(1) $(2) CGO_ENABLED=0 go build -trimpath -ldflags "$(DIST_LDFLAGS)" -o $(4)/showmesh-fpp-plugin $(CMD)
+	GOOS=linux GOARCH=$(1) $(2) CGO_ENABLED=0 GOTOOLCHAIN=$(GO_RELEASE_TOOLCHAIN) go build -trimpath -ldflags "$(DIST_LDFLAGS)" -o $(4)/showmesh-fpp-plugin $(CMD)
 	chmod 0755 $(4)/showmesh-fpp-plugin
 	if [ "$(TAR_IS_GNU)" = "yes" ]; then \
 		$(TAR) --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' -C $(4) -cf - showmesh-fpp-plugin | gzip -n -9 > $(4)/showmesh-fpp-plugin_$(DIST_VERSION)_linux_$(3).tar.gz; \
@@ -125,17 +149,27 @@ define build_and_package
 	rm -f $(4)/showmesh-fpp-plugin
 endef
 
+# Each arch builds its intermediate binary in its own subdirectory rather
+# than $(DIST) directly, so `make -j` running the three release-ARCH
+# targets together never has two of them overwrite the same intermediate
+# ./dist/showmesh-fpp-plugin path before it is packaged.
 .PHONY: release-amd64
-release-amd64:
-	$(call build_and_package,amd64,,amd64,$(DIST))
+release-amd64: check-clean-tree
+	$(call build_and_package,amd64,,amd64,$(DIST)/.build-amd64)
+	mv $(DIST)/.build-amd64/showmesh-fpp-plugin_$(DIST_VERSION)_linux_amd64.tar.gz $(DIST)/
+	rmdir $(DIST)/.build-amd64
 
 .PHONY: release-arm64
-release-arm64:
-	$(call build_and_package,arm64,,arm64,$(DIST))
+release-arm64: check-clean-tree
+	$(call build_and_package,arm64,,arm64,$(DIST)/.build-arm64)
+	mv $(DIST)/.build-arm64/showmesh-fpp-plugin_$(DIST_VERSION)_linux_arm64.tar.gz $(DIST)/
+	rmdir $(DIST)/.build-arm64
 
 .PHONY: release-armv7
-release-armv7:
-	$(call build_and_package,arm,GOARM=7,armv7,$(DIST))
+release-armv7: check-clean-tree
+	$(call build_and_package,arm,GOARM=7,armv7,$(DIST)/.build-armv7)
+	mv $(DIST)/.build-armv7/showmesh-fpp-plugin_$(DIST_VERSION)_linux_armv7.tar.gz $(DIST)/
+	rmdir $(DIST)/.build-armv7
 
 # The resident component ships as architecture-independent source, not a
 # binary: FPP 10 replaces the HTTP framework and revamps the plugin
@@ -147,27 +181,24 @@ release-armv7:
 NATIVE_BUNDLE := showmesh-fpp-plugin-native_$(DIST_VERSION).tar.gz
 
 .PHONY: release-native-bundle
-release-native-bundle:
+release-native-bundle: check-clean-tree
 	mkdir -p $(DIST)
 	rm -f $(DIST)/$(NATIVE_BUNDLE)
-	@if [ "$(TAR_IS_GNU)" = "yes" ]; then \
-		$(TAR) --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' \
-			--exclude='build' --exclude='.DS_Store' \
-			-cf - LICENSE native/include native/src native/tests native/adapters native/Makefile \
-			| gzip -n -9 > $(DIST)/$(NATIVE_BUNDLE); \
-	else \
-		echo "WARNING: GNU tar not found on PATH; the native source bundle will not reproduce byte-for-byte across two local runs." >&2; \
-		tar --exclude='build' --exclude='.DS_Store' -czf $(DIST)/$(NATIVE_BUNDLE) LICENSE native/include native/src native/tests native/adapters native/Makefile; \
-	fi
+	git archive --format=tar HEAD -- \
+		LICENSE native/include native/src native/tests native/adapters native/Makefile \
+		| gzip -n -9 > $(DIST)/$(NATIVE_BUNDLE)
 	@echo "release-native-bundle: wrote $(DIST)/$(NATIVE_BUNDLE)"
 
 # Builds every artifact, writes the checksums file the pinned contract
 # names, then verifies it against what was just produced, on every
-# invocation rather than as a trusted one-time claim.
+# invocation rather than as a trusted one-time claim. The architecture
+# check runs here, not only in CI, because sha256sum -c only proves each
+# tarball matches what this run just wrote, not that it is for the right CPU.
 .PHONY: release
 release: release-amd64 release-arm64 release-armv7 release-native-bundle
 	cd $(DIST) && sha256sum showmesh-fpp-plugin_$(DIST_VERSION)_linux_*.tar.gz $(NATIVE_BUNDLE) > showmesh-fpp-plugin_$(DIST_VERSION)_SHA256SUMS
 	cd $(DIST) && sha256sum -c showmesh-fpp-plugin_$(DIST_VERSION)_SHA256SUMS
+	scripts/verify-artifact-arch.sh "$(DIST)" "$(DIST_VERSION)"
 	$(MAKE) release-manifest
 	@echo "release: built and self-verified $(DIST)/showmesh-fpp-plugin_$(DIST_VERSION)_SHA256SUMS"
 
@@ -176,18 +207,32 @@ release: release-amd64 release-arm64 release-armv7 release-native-bundle
 # installer verifies against a hash committed beside the install script
 # rather than one fetched from the same mutable location as the artifact.
 # It carries no timestamp, so two builds of one commit produce the same
-# manifest.
+# manifest. Written to a temp file and renamed into place only once the
+# writer succeeds, so a failed run cannot leave a truncated manifest
+# sitting at the path callers trust.
 .PHONY: release-manifest
 release-manifest:
-	@scripts/write-release-manifest.sh "$(DIST)" "$(DIST_VERSION)" "$(COMMIT)" > $(DIST)/release-manifest.json
+	@tmp="$(DIST)/.release-manifest.json.tmp"; \
+	if ! scripts/write-release-manifest.sh "$(DIST)" "$(DIST_VERSION)" "$(COMMIT)" > "$$tmp"; then \
+		rm -f "$$tmp"; \
+		exit 1; \
+	fi; \
+	mv "$$tmp" $(DIST)/release-manifest.json
 	@scripts/verify-release-manifest.sh "$(DIST)" "$(DIST_VERSION)"
 
 # The stronger claim `release`'s own sha256sum -c cannot make: two
-# independent builds of the same commit produce byte-identical TARBALLS,
-# not merely a manifest matching this run's own output. One platform is
-# enough to prove the mechanism; the other two share the build shape.
+# independent builds of the same commit, both under the pinned release
+# toolchain $(GO_RELEASE_TOOLCHAIN), produce byte-identical TARBALLS, not
+# merely a manifest matching this run's own output. One platform is enough
+# to prove the mechanism; the other two share the build shape.
+#
+# What this does NOT prove: both builds run in this one invocation's
+# shell, on this one machine, sharing one PATH and one filesystem. It
+# cannot catch a difference that only shows up across machines or Go
+# toolchain versions; that class of non-reproducibility is what pinning
+# GO_RELEASE_TOOLCHAIN above is for, not what this target checks.
 .PHONY: verify-reproducible
-verify-reproducible:
+verify-reproducible: check-clean-tree
 	rm -rf $(DIST)/.reproducible-a $(DIST)/.reproducible-b
 	$(call build_and_package,amd64,,amd64,$(DIST)/.reproducible-a)
 	$(call build_and_package,amd64,,amd64,$(DIST)/.reproducible-b)

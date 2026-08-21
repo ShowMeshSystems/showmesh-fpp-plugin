@@ -24,6 +24,18 @@ version matches what a real host would decide. FPP 10's command headers
 name their HTTP types through a Drogon-free forward-declaration header, so
 that adapter needs only jsoncpp.
 
+## Pinned third-party dependencies
+
+| Dependency | Tag | Commit |
+|---|---|---|
+| `libhttpserver` | `0.19.0` | `60be2d347fb3c757b2e77efc997120e47ed8fb7f` |
+
+Source: <https://github.com/etr/libhttpserver>
+
+The `HTTP_RESPONSE_CONST` decision the FPP 9 adapter derives from depends
+on the installed `libhttpserver` version, so its tag is pinned to a
+recorded commit the same way the FPP checkouts are.
+
 ## What the compile actually proves
 
 That each adapter's translation unit agrees with that major's headers, and
