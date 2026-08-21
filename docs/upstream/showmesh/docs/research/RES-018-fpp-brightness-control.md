@@ -54,7 +54,14 @@ The approved target is three repositories with one-way release dependencies:
 | `fpp-showmesh` | Thin FPP Plugin Manager repository: `pluginInfo.json`, command descriptions, lifecycle scripts, version pins, and committed artifact hashes. |
 | `showmesh-fpp-plugin` | Apache-2.0 FPP runtime source: the Go macro helper, C++ brightness engine, native playlist observer, version adapters, tests, and release artifacts. |
 
-Current reality is intentionally different while extraction is pending: the Go helper remains under `showmesh/cmd/showmesh-fpp-plugin`, `fpp-showmesh` exists only as a local sibling used for packaging work, and `showmesh-fpp-plugin` has not been created. No document should describe the target split as already implemented.
+All three repositories now exist under `ShowMeshSystems`, but only `showmesh` holds runtime code, so the split is created rather than implemented. **No document may describe the target split as implemented.**
+
+Current reality as of 2026-08-20:
+
+- **`showmesh-fpp-plugin` is created and private**, bootstrapped at commit `a94de7f`. It holds its Apache-2.0 license, a README, a canonical `CLAUDE.md` execution contract with an `AGENTS.md` pointing every other agent at it, and provenance-stamped snapshots of the eleven governing records under `docs/upstream/showmesh/`, pinned to `showmesh` commit `883e94a`. **It contains no runtime code**: the Go helper has not been extracted, the `internal/version` dependency has not been replaced, the `CoordinatorClient` seam does not exist, the C++ component has not been started, and no cross-build has been produced.
+- **The Go helper still remains under `showmesh/cmd/showmesh-fpp-plugin`** and is still the only implementation. Extraction is the remaining half of the bootstrap and was deliberately deferred so it happens from inside the new repository rather than across two checkouts.
+- **`fpp-showmesh` exists as a private repository** rather than only a local sibling. Its locked-artifact packaging has not been rebuilt.
+- Nothing in any of the three has been installed on a real FPP host, and no release, public or private, has been published.
 
 ## 4. Install and release contract
 

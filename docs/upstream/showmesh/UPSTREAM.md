@@ -8,10 +8,10 @@ repository's implementation. They are evidence, not working documents.
 | Field | Value |
 |---|---|
 | Source repository | https://github.com/ShowMeshSystems/showmesh |
-| Source commit | `883e94aa93af9ba8a2216d16d1afba9de821a75d` |
+| Source commit | `50e42fa2f91225b585dda6bc3a43f9f97d29c77f` |
 | Commit date | 2026-08-20 |
-| Snapshot date | 2026-08-20 |
-| Snapshot taken by | Repository bootstrap (SM-148) |
+| Snapshot date | 2026-08-21 |
+| Snapshot taken by | Repository bootstrap, refreshed during the Go helper extraction |
 
 ## Why copies rather than links
 

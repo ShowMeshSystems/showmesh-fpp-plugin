@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # Both the minimum Go version go.mod claims and the current toolchain,
+      # so the two never silently diverge. Literal versions, not
+      # go-version-file, precisely so this matrix does not collapse to one
+      # entry; update by hand when go.mod's `go` directive changes.
+      matrix:
+        go-version: ["1.25.0", "1.26.0"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Check formatting
+        run: make fmt-check
+
+      - name: Vet
+        run: make vet
+
+      - name: Test
+        run: go test -race ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Lint
+        run: make lint
+
+  release-artifacts:
+    # FPP hosts carry no Go toolchain, so this binary ships as a prebuilt,
+    # sha256-verified static binary. This job is that pipeline: three
+    # CGO_ENABLED=0 cross-compiles covering the fleet's real targets
+    # (amd64, a Raspberry Pi on arm64, and a BeagleBone needing
+    # GOARCH=arm GOARM=7), the pinned SHA256SUMS manifest, and its
+    # verification, on every run rather than as a one-time trusted claim.
+    #
+    # This job deliberately creates no release, uploads no artifact, and
+    # pushes nothing. Candidate artifacts stay private until the first
+    # real-host install gate passes and the owner approves publication.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # A clearly-non-release version: the pinned tag format is
+      # fpp-plugin-v<VERSION> and this is not that. It exists only so the
+      # artifact filenames and manifest are exercised end to end.
+      - name: Build and self-verify the release artifacts
+        run: make release VERSION=0.0.0-ci.${{ github.sha }}
+
+      - name: Verify the release build is reproducible
+        run: make verify-reproducible VERSION=0.0.0-ci.${{ github.sha }}
+
+      - name: Confirm every artifact is a static Linux binary for its named architecture
+        run: |
+          set -eux
+          cd dist
+          check_arch() {
+            rm -rf check && mkdir check
+            tar -xzf "showmesh-fpp-plugin_0.0.0-ci.${{ github.sha }}_linux_$1.tar.gz" -C check
+            described=$(file check/showmesh-fpp-plugin)
+            echo "$described"
+            echo "$described" | grep -q 'statically linked'
+            echo "$described" | grep -q "$2"
+          }
+          check_arch amd64 'x86-64'
+          check_arch arm64 'ARM aarch64'
+          check_arch armv7 'ARM, EABI5'
