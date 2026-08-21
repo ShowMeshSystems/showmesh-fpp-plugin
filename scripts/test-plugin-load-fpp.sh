@@ -102,9 +102,16 @@ fi
 # and a ref literally named by the pinned tag: EXTRA_INSTALL_FLAG=--skip-clone
 # is required to keep the pinned tree, and both src/fppversion.sh and
 # SD/FPP_Install.sh's --skip-clone path shell out to git. A remote git-URL
-# context supplies neither. See scratchpad FINDINGS for the observed failures.
+# context supplies neither, and both failures were observed directly: a
+# working tree exported with no .git, and "pathspec '10.0-beta5' did not
+# match any file(s) known to git" for a checkout fetched by bare commit SHA.
+#
+# Keyed by BENCH_ID as well as major: two concurrent runs of the same major
+# would otherwise both rm -rf/fetch the one shared ${BENCH_FPP_MAJOR}
+# checkout dir and race. The cost is that every run re-fetches its own
+# shallow, single-tag copy instead of reusing one shared per-major checkout.
 if [ "$BENCH_USE_PREBUILT" != "1" ] && ! docker image inspect "$FPP_IMAGE" >/dev/null 2>&1; then
-    checkout_dir="$BENCH_DIR/.fpp-src/${BENCH_FPP_MAJOR}"
+    checkout_dir="$BENCH_DIR/.fpp-src/${BENCH_FPP_MAJOR}-${BENCH_ID}"
     if [ ! -d "$checkout_dir/.git" ] || [ "$(git -C "$checkout_dir" rev-parse HEAD 2>/dev/null)" != "$FPP_COMMIT" ]; then
         echo "test-plugin-load-fpp: preparing a local, commit-pinned $BENCH_FPP_MAJOR checkout at $checkout_dir"
         rm -rf "$checkout_dir"
@@ -127,7 +134,7 @@ if [ "$BENCH_USE_PREBUILT" != "1" ] && ! docker image inspect "$FPP_IMAGE" >/dev
     FPP_BUILD_CONTEXT="$checkout_dir"
 else
     # No build will happen, but compose still needs a value to interpolate.
-    FPP_BUILD_CONTEXT="$BENCH_DIR/.fpp-src/${BENCH_FPP_MAJOR}"
+    FPP_BUILD_CONTEXT="$BENCH_DIR/.fpp-src/${BENCH_FPP_MAJOR}-${BENCH_ID}"
 fi
 
 export FPP_IMAGE FPP_TAG FPP_COMMIT FPP_BUILD_CONTEXT BENCH_ID BENCH_HTTP_PORT
@@ -600,15 +607,26 @@ set_static_test_pattern() {
 
 CAPTURE_SEQ=0
 CAPTURE_LOG=""
+# 15 chars exactly: /proc/[pid]/comm is truncated to 15 chars on Linux.
+# Verified empirically that `sh -c "exec -a NAME python3 ..."` does NOT
+# change comm (comm is set from the executed file's own path, not argv[0],
+# so it still reads "python3"); a symlink named CAPTURE_PROC_NAME pointing at
+# the real python3 binary, executed directly, does change comm, confirmed by
+# reading /proc/[pid]/comm and by pgrep -x matching it.
+CAPTURE_PROC_NAME="showmesh-ddpcap"
+CAPTURE_BIN="/tmp/${CAPTURE_PROC_NAME}"
 
 # `docker exec -d` returns 0 whether or not the listener survived, so the
 # listener's bind must be confirmed out of band and the previous listener must
-# be gone before the next one binds the same port.
+# be gone before the next one binds the same port. Matched by the comm name
+# of the CAPTURE_BIN symlink below, not the bare "python3" comm, so an
+# unrelated python3 process in the container (fppd helper, etc) is never
+# touched.
 stop_capture() {
-    docker exec "$CONTAINER" pkill -x python3 >/dev/null 2>&1 || true
+    docker exec "$CONTAINER" pkill -x "$CAPTURE_PROC_NAME" >/dev/null 2>&1 || true
     local i=0
     while [ "$i" -lt 30 ]; do
-        if ! docker exec "$CONTAINER" pgrep -x python3 >/dev/null 2>&1; then
+        if ! docker exec "$CONTAINER" pgrep -x "$CAPTURE_PROC_NAME" >/dev/null 2>&1; then
             return 0
         fi
         i=$((i + 1))
@@ -627,8 +645,9 @@ start_capture() {
     fi
     CAPTURE_SEQ=$((CAPTURE_SEQ + 1))
     CAPTURE_LOG="/tmp/showmesh-ddp-capture.${CAPTURE_SEQ}.log"
-    docker exec "$CONTAINER" rm -f "$CAPTURE_LOG" "${CAPTURE_LOG}.ready" "${CAPTURE_LOG}.done"
-    docker exec -d "$CONTAINER" python3 -c "
+    local capture_script="/tmp/showmesh-ddp-capture.${CAPTURE_SEQ}.py"
+    docker exec "$CONTAINER" rm -f "$CAPTURE_LOG" "${CAPTURE_LOG}.ready" "${CAPTURE_LOG}.done" "$capture_script"
+    docker exec -i "$CONTAINER" sh -c "cat > $capture_script" <<PYEOF
 import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(('0.0.0.0', ${DDP_PORT}))
@@ -646,7 +665,12 @@ while time.time() < end:
 f.close()
 s.close()
 open('${CAPTURE_LOG}.done', 'w').close()
-"
+PYEOF
+    # A symlink named CAPTURE_PROC_NAME to the real python3, executed
+    # directly, reports that name as its own comm, so stop_capture can target
+    # only this listener and never a co-resident python3 process.
+    docker exec "$CONTAINER" sh -c "ln -sf \"\$(command -v python3)\" '$CAPTURE_BIN'"
+    docker exec -d "$CONTAINER" "$CAPTURE_BIN" "$capture_script"
     local i=0
     while [ "$i" -lt 60 ]; do
         if docker exec "$CONTAINER" test -f "${CAPTURE_LOG}.ready"; then

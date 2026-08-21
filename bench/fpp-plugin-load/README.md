@@ -141,6 +141,11 @@ network name, and the named media volume; `--port` parameterizes the
 published host port. Every one of those carries the id, so two runs with
 different ids share nothing.
 
+The local, commit-pinned FPP source checkout under `.fpp-src/` is also keyed
+by `BENCH_ID` (as well as by FPP major), not shared across ids: two concurrent
+runs of the same major each get their own checkout directory, so neither
+races the other's `rm -rf` and `git fetch`.
+
 This exists because a shared singleton bench `fppd` with global state is a
 known failure mode: `/home/fpp/media` is `fppd`'s own state, holding settings,
 the installed plugin, and `fppd.log`, and leaking it between runs makes
@@ -319,10 +324,13 @@ Docker initialises submodules recursively for such a context and that failed:
 fatal: No url found for submodule path 'external/rpi_ws281x' in .gitmodules
 ```
 
-So the script prepares a **local, commit-pinned checkout** per major under
-`.fpp-src/` (git-ignored, fetched on demand and verified against the pinned
-commit) and uses that as the build context. The detail behind these failures
-lives in the issue tracker and the bench's own working notes, not here.
+So the script prepares a **local, commit-pinned checkout** per major and per
+`BENCH_ID` under `.fpp-src/` (git-ignored, fetched on demand and verified
+against the pinned commit) and uses that as the build context. Keying by
+`BENCH_ID` as well as major means two concurrent runs of the same major never
+share, and race on, one checkout directory; the cost is that each run fetches
+its own shallow, single-tag copy instead of reusing one shared per-major
+checkout.
 
 ## The prebuilt image override
 
