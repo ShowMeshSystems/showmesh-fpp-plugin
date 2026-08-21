@@ -178,11 +178,11 @@ performs its own install:
 **This is bench-owned and is not the real installer.** It proves nothing
 about how the plugin would arrive on, or be activated on, a real host.
 
-Nothing under `native/` is modified. FPP 10's required `-fno-gnu-unique` is
-passed in from the bench rather than added to `native/adapters/Makefile`; the
-FPP 10 compile line carries the flag and the FPP 9 line does not. That the
-adapter makefile does not set it is a real defect recorded for the packaging
-work, not something this bench fixes.
+Nothing under `native/` is modified by a bench run. The bench passes FPP 10's
+`-fno-gnu-unique` on its own compile line, which is now redundant but harmless:
+`native/adapters/Makefile` sets that flag for the FPP 10 link itself, so a real
+host compiling through the product makefile gets it too. It is applied to
+FPP 10 only, because only the FPP 10 adapter declares an unload contract.
 
 Two settings the bench writes are bench-owned accommodations and not product
 settings: `LogLevel_Plugin = debug`, and `DisableFakeNetworkBridges = 1`,
@@ -242,33 +242,33 @@ Observed on the final version of the script:
 | `A3_invoke_and_ranges` | An in-range invoke returns 200; out-of-range `targetPercent`, non-integer `targetPercent`, and out-of-range `fadeSeconds` each return 500 carrying the ShowMesh runtime's own refusal text. | PASS | PASS |
 | `A4_channel_output_scaled` | Real channel output on the wire, downstream of `modifyChannelData`: a `0xff` source byte stays `0xff` at ceiling 100 and becomes `0x80` at ceiling 50, computed from the plugin's own integer formula rather than hardcoded. | PASS | PASS |
 | `A5_fade_monotonic_exact_and_immediate` | Over a fade: enough frames sampled to be a measurement, strictly decreasing overall, non-increasing frame to frame, landing on the exact 75 percent value `0xbf`, and `fadeSeconds` 0 stepping straight to the target with no intermediate value. Observed 129 frames on FPP 9 and 133 on FPP 10. | PASS | PASS |
-| `A6_clean_teardown` | `fppd` exits after the stop signal with the plugin still resident and writes no crash signature to the log tail taken after that signal; on FPP 10, additionally that a runtime unload returns `loaded:false` **and** withdraws the plugin's registered command, and that a second shutdown with the plugin unloaded is also clean. | **FAIL** | PASS |
+| `A6_clean_teardown` | `fppd` exits after the stop signal with the plugin still resident and writes no crash signature to the log tail taken after that signal; on FPP 10, additionally that a runtime unload returns `loaded:false` **and** withdraws the plugin's registered command, and that a second shutdown with the plugin unloaded is also clean. | PASS | PASS |
 | `A7_no_second_multisync_listener` | Exactly one UDP 32320 socket exists, held by `fppd`, both before and after a restart. | PASS | PASS |
 | `A8_restart_survival` | The command is registered again after a container recreate, and that restart's own log tail carries the load line with no load-failure line. | PASS | PASS |
 
-**The FPP 9 run exits 1. The FPP 10 run exits 0, with all eight assertions
-passing.**
+**Both runs exit 0, with all eight assertions passing on both majors.**
 
-### A6 on FPP 9 is a real product defect, deliberately left failing
+### A6 on FPP 9 caught a real product defect, since fixed
 
-`fppd` on FPP 9 catches the stop signal cleanly, logs its shutdown, and then
-segfaults during plugin teardown:
+This assertion failed on FPP 9 when the bench first ran, and the failure was a
+genuine defect rather than a bench problem. `fppd` caught the stop signal
+cleanly, logged its shutdown, and then segfaulted during plugin teardown:
 
 ```
-Crash handler called in thread 50:  signal=11 (SIGSEGV: Segmentation fault)
+Crash handler called in thread 51:  signal=11 (SIGSEGV: Segmentation fault)
 ```
 
-With the declaration file removed, in the same container and across the same
-restart, shutdown is clean and no crash line appears, which isolates the
-crash to the plugin's FPP 9 teardown path. FPP 9 has no shutdown hook; the
-destructor is the only teardown point, and the adapter's existing `try/catch`
-around settings-listener withdrawal cannot cover a SIGSEGV, which is not a
-caught C++ exception.
+The crash handler's backtrace put the fault inside the FPP 9 adapter's
+destructor, reached from `PluginManager::Cleanup()`. FPP 9 deletes every
+registered command immediately before it destroys plugins, so the destructor
+was reaching through an already-freed command to unregister it and then
+deleting it a second time. Reproduced with the pre-fix adapter both under
+emulation and natively, so it was not an emulation artifact. The adapter now
+withdraws the command by name and never touches the freed pointer, and A6
+passes on both majors.
 
-**This is a product defect, not a bench problem.** The adapter was not
-changed and the assertion was not weakened; the run exits nonzero because of
-it. The same result reproduced identically across three separate FPP 9 runs.
-Fixing it belongs to the adapter work, not to this bench.
+The bench was not changed to accommodate any of this. The assertion is the
+same one that failed, and it stayed failing until the product was fixed.
 
 ### Every assertion was proved capable of failing
 

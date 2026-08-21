@@ -34,9 +34,12 @@ INCLUDES := -I$(CORE_DIR)/include -Ishared -isystem $(FPP_SRC) $(JSONCPP_INCLUDE
 # permanently marks the first object defining an STB_GNU_UNIQUE symbol
 # NODELETE, so dlclose() would succeed and unmap nothing, silently. GCC emits
 # that binding for a static local in an inline function, which this tree has
-# in CLocaleGuard. Appended separately from CXXFLAGS so a caller overriding
-# CXXFLAGS cannot drop it. clang does not accept the flag and does not emit
-# the binding, so it is gcc-only. verify-fpp10 asserts the result.
+# in CLocaleGuard, reached through the core sources both adapters link. The
+# FPP 9 link deliberately does not carry the flag: FPP 9 has no unload path at
+# all, so an STB_GNU_UNIQUE binding there is harmless. Appended separately from
+# CXXFLAGS so a caller overriding CXXFLAGS cannot drop it. clang does not accept
+# the flag and does not emit the binding, so it is gcc-only. verify-fpp10
+# asserts the result.
 ifeq '$(findstring clang,$(shell $(CXX) --version 2>/dev/null))' ''
 FPP10_UNLOAD_FLAGS := -fno-gnu-unique
 else
