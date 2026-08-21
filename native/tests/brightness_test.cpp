@@ -1,5 +1,7 @@
 #include "showmesh/brightness.h"
 
+#include <algorithm>
+#include <string>
 #include <vector>
 
 #include "check.h"
@@ -316,4 +318,101 @@ TEST(APersistedPayloadMissingAFieldIsRejectedRatherThanDefaulted) {
 
     CHECK(!showmesh::decodeBrightnessState("not json").ok);
     CHECK(!showmesh::decodeBrightnessState("[1,2,3]").ok);
+}
+
+TEST(ExclusionsSplitApplyRangesCorrectlyAtEveryEdge) {
+    struct Case {
+        const char* name;
+        RangeConfig config;
+        std::vector<int> scaledChannels;  // one-based
+    };
+
+    RangeConfig wholeRangeExcluded;
+    wholeRangeExcluded.apply.push_back(ChannelRange{1, 8});
+    wholeRangeExcluded.exclude.push_back(ChannelRange{1, 8});
+
+    RangeConfig leadingExclusion;
+    leadingExclusion.apply.push_back(ChannelRange{1, 8});
+    leadingExclusion.exclude.push_back(ChannelRange{1, 3});
+
+    RangeConfig trailingExclusion;
+    trailingExclusion.apply.push_back(ChannelRange{1, 8});
+    trailingExclusion.exclude.push_back(ChannelRange{6, 3});
+
+    RangeConfig twoHoles;
+    twoHoles.apply.push_back(ChannelRange{1, 10});
+    twoHoles.exclude.push_back(ChannelRange{3, 2});
+    twoHoles.exclude.push_back(ChannelRange{7, 1});
+
+    RangeConfig exclusionOutside;
+    exclusionOutside.apply.push_back(ChannelRange{5, 4});
+    exclusionOutside.exclude.push_back(ChannelRange{20, 4});
+
+    const std::vector<Case> cases = {
+        {"the exclusion covers the whole range", wholeRangeExcluded, {}},
+        {"the exclusion is at the range start", leadingExclusion, {4, 5, 6, 7, 8}},
+        {"the exclusion is at the range end", trailingExclusion, {1, 2, 3, 4, 5}},
+        {"two exclusions punch two holes", twoHoles, {1, 2, 5, 6, 8, 9, 10}},
+        {"the exclusion misses the range entirely", exclusionOutside, {5, 6, 7, 8}},
+    };
+
+    for (const Case& c : cases) {
+        BrightnessEngine engine;
+        CHECK(engine.configureRanges(c.config, 32).ok);
+        CHECK(engine.setCeiling(50, 0, kT0).ok);
+        std::vector<std::uint8_t> data = frame(32, 200);
+        engine.applyToFrame(data.data(), data.size(), kT0);
+
+        for (std::size_t i = 0; i < data.size(); ++i) {
+            const int oneBased = static_cast<int>(i) + 1;
+            const bool expectScaled =
+                std::find(c.scaledChannels.begin(), c.scaledChannels.end(), oneBased) != c.scaledChannels.end();
+            const int want = expectScaled ? 100 : 200;
+            if (static_cast<int>(data[i]) != want) {
+                ::showmesh_test::reportFailure(__FILE__, __LINE__,
+                                               std::string(c.name) + ": channel " + std::to_string(oneBased) +
+                                                   " = " + std::to_string(static_cast<int>(data[i])) + ", want " +
+                                                   std::to_string(want));
+            }
+        }
+    }
+}
+
+// FPP hands the plugin its entire channel buffer, which is megabytes. Only
+// the configured channels may be read or written, or the per-frame cost is
+// set by the buffer rather than by the configuration.
+TEST(OnlyConfiguredChannelsAreTouchedInAFullSizeBuffer) {
+    constexpr std::size_t kBufferChannels = 8192 * 1024;
+    BrightnessEngine engine;
+    RangeConfig config;
+    config.apply.push_back(ChannelRange{1025, 16});
+    CHECK(engine.configureRanges(config, static_cast<std::uint32_t>(kBufferChannels)).ok);
+    CHECK(engine.setCeiling(50, 0, kT0).ok);
+
+    std::vector<std::uint8_t> data(kBufferChannels, 200);
+    engine.applyToFrame(data.data(), data.size(), kT0);
+
+    for (std::size_t i = 1024; i < 1040; ++i) {
+        CHECK_EQ(static_cast<int>(data[i]), 100);
+    }
+    CHECK_EQ(static_cast<int>(data[1023]), 200);
+    CHECK_EQ(static_cast<int>(data[1040]), 200);
+    CHECK_EQ(static_cast<int>(data[0]), 200);
+    CHECK_EQ(static_cast<int>(data[kBufferChannels - 1]), 200);
+}
+
+// A configured range that runs past the frame the adapter actually handed
+// over must clip, not read past the end.
+TEST(ARangeBeyondTheFrameIsClipped) {
+    BrightnessEngine engine;
+    RangeConfig config;
+    config.apply.push_back(ChannelRange{1, 64});
+    CHECK(engine.configureRanges(config, 1024).ok);
+    CHECK(engine.setCeiling(50, 0, kT0).ok);
+
+    std::vector<std::uint8_t> data = frame(8, 200);
+    engine.applyToFrame(data.data(), data.size(), kT0);
+    for (std::uint8_t v : data) {
+        CHECK_EQ(static_cast<int>(v), 100);
+    }
 }

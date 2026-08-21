@@ -138,11 +138,16 @@ class BrightnessEngine {
 
  private:
     void bumpRevision() { ++revision_; }
-    bool channelIsScaled(std::uint32_t oneBasedChannel) const;
+    void recomputeScaledSpans();
 
     FadingValue ceiling_{100.0};
     FadingValue gain_{100.0};
     RangeConfig ranges_;
+    // The apply ranges with the exclusions removed, sorted and merged.
+    // FPP hands the plugin its whole channel buffer, which is megabytes, so
+    // a per-channel range test would cost the frame budget on every frame
+    // regardless of how few channels are actually configured.
+    std::vector<ChannelRange> scaledSpans_;
     std::uint32_t totalChannels_ = 0;
     std::uint64_t revision_ = 0;
     double lastAppliedCeiling_ = 100.0;

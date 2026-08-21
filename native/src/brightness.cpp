@@ -65,6 +65,7 @@ ValidationResult BrightnessEngine::configureRanges(const RangeConfig& config, st
     if (!result.ok) return result;
     ranges_ = config;
     totalChannels_ = totalChannels;
+    recomputeScaledSpans();
     return ValidationResult{};
 }
 
@@ -90,21 +91,37 @@ int BrightnessEngine::effectivePercentAt(TimeMillis now) const {
     return static_cast<int>(rounded);
 }
 
-bool BrightnessEngine::channelIsScaled(std::uint32_t oneBasedChannel) const {
-    bool included = ranges_.apply.empty();
-    for (const ChannelRange& r : ranges_.apply) {
-        if (oneBasedChannel >= r.startChannel && oneBasedChannel < r.endExclusive()) {
-            included = true;
-            break;
+void BrightnessEngine::recomputeScaledSpans() {
+    scaledSpans_.clear();
+    std::vector<ChannelRange> spans = ranges_.apply;
+    if (spans.empty()) {
+        // No configured apply range means the whole universe, expressed as
+        // one span so the frame loop shape is the same either way.
+        spans.push_back(ChannelRange{1, totalChannels_ != 0 ? totalChannels_ : 0xFFFFFFFFu - 1});
+    }
+    std::sort(spans.begin(), spans.end(),
+              [](const ChannelRange& a, const ChannelRange& b) { return a.startChannel < b.startChannel; });
+
+    std::vector<ChannelRange> excludes = ranges_.exclude;
+    std::sort(excludes.begin(), excludes.end(),
+              [](const ChannelRange& a, const ChannelRange& b) { return a.startChannel < b.startChannel; });
+
+    for (const ChannelRange& span : spans) {
+        std::uint32_t cursor = span.startChannel;
+        const std::uint32_t end = span.endExclusive();
+        for (const ChannelRange& ex : excludes) {
+            if (ex.endExclusive() <= cursor) continue;
+            if (ex.startChannel >= end) break;
+            if (ex.startChannel > cursor) {
+                scaledSpans_.push_back(ChannelRange{cursor, ex.startChannel - cursor});
+            }
+            cursor = std::max(cursor, ex.endExclusive());
+            if (cursor >= end) break;
+        }
+        if (cursor < end) {
+            scaledSpans_.push_back(ChannelRange{cursor, end - cursor});
         }
     }
-    if (!included) return false;
-    for (const ChannelRange& r : ranges_.exclude) {
-        if (oneBasedChannel >= r.startChannel && oneBasedChannel < r.endExclusive()) {
-            return false;
-        }
-    }
-    return true;
 }
 
 void BrightnessEngine::applyToFrame(std::uint8_t* channelData, std::size_t channelCount, TimeMillis now) {
@@ -115,11 +132,18 @@ void BrightnessEngine::applyToFrame(std::uint8_t* channelData, std::size_t chann
     const int percent = effectivePercentAt(now);
     if (percent == kMaxPercent) return;
 
-    for (std::size_t i = 0; i < channelCount; ++i) {
-        const std::uint32_t oneBased = static_cast<std::uint32_t>(i) + 1;
-        if (!channelIsScaled(oneBased)) continue;
-        const unsigned value = channelData[i];
-        channelData[i] = static_cast<std::uint8_t>((value * static_cast<unsigned>(percent) + 50u) / 100u);
+    if (scaledSpans_.empty()) recomputeScaledSpans();
+
+    const unsigned scale = static_cast<unsigned>(percent);
+    for (const ChannelRange& span : scaledSpans_) {
+        if (span.startChannel == 0) continue;
+        const std::size_t begin = span.startChannel - 1;
+        if (begin >= channelCount) continue;
+        std::size_t end = begin + span.channelCount;
+        if (end > channelCount) end = channelCount;
+        for (std::size_t i = begin; i < end; ++i) {
+            channelData[i] = static_cast<std::uint8_t>((channelData[i] * scale + 50u) / 100u);
+        }
     }
 }
 
