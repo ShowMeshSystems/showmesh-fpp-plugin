@@ -1,0 +1,30 @@
+# Bench scaffolding, not the product. Override for a developer with access
+# to a private, prebuilt FPP fixture image, selected only by passing
+# --prebuilt (or setting BENCH_USE_PREBUILT=1) to
+# scripts/test-plugin-load-fpp.sh, which then adds this file after
+# docker-compose.yml on the command line so this service definition wins.
+#
+# FPP 9 ONLY. There is no FPP 10 fixture image at all as of this bench's
+# writing, so --major fpp10 with --prebuilt is refused by the script before
+# it ever reaches this file; FPP 10 is source-build only.
+#
+# The image this points at (the GHCR fixture referenced by the related CI
+# work) was confirmed UNREACHABLE from this development machine:
+# `docker manifest inspect` returned `denied`. That is an access problem
+# with this machine's credentials, not evidence the fixture itself is
+# broken; a developer or CI runner with GHCR access may still use this
+# path. Set FPP_PREBUILT_IMAGE in .env to the exact digest reference before
+# passing --prebuilt.
+#
+# This override intentionally does not disable docker-compose.yml's build:
+# block by itself: YAML map merging is not reliable enough across Compose
+# versions to guarantee that silently. Instead, scripts/test-plugin-load-fpp.sh
+# runs `docker compose ... pull fpp` BEFORE `up` whenever --prebuilt is
+# selected, and hard-fails the whole run if that pull does not succeed,
+# specifically so a failed pull can never silently fall through to a source
+# build and be mistaken for having exercised the fixture path.
+
+services:
+  fpp:
+    image: ${FPP_PREBUILT_IMAGE:?set FPP_PREBUILT_IMAGE in .env to the pinned GHCR digest reference before using --prebuilt}
+    pull_policy: always

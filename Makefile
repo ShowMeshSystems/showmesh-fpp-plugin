@@ -66,6 +66,21 @@ native-test:
 .PHONY: check
 check: fmt-check vet lint test native-test
 
+# Bench scaffolding, not the product: stands up a containerized fppd (FPP 9
+# or FPP 10; pass MAJOR=fpp10) and runs bench/fpp-plugin-load's assertions
+# against it. Requires Docker; not part of `make check` because it needs a
+# real container runtime and a multi-minute image build on a fresh machine.
+# Override BENCH_ID and BENCH_HTTP_PORT to run more than one at a time.
+# LEAVES THE CONTAINER RUNNING; tear it down with
+# `scripts/test-plugin-load-fpp.sh --id <id> --down`.
+# See bench/fpp-plugin-load/README.md.
+.PHONY: test-plugin-load-fpp
+test-plugin-load-fpp:
+	scripts/test-plugin-load-fpp.sh \
+		--major $(or $(MAJOR),fpp9) \
+		--id $(or $(BENCH_ID),local) \
+		--port $(or $(BENCH_HTTP_PORT),8190)
+
 .PHONY: clean
 clean:
 	rm -rf $(BIN_DIR) $(DIST)

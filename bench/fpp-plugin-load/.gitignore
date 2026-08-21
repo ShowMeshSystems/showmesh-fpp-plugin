@@ -1,0 +1,9 @@
+# Bench scaffolding, not the product.
+.env
+.env.*
+!.env.example
+
+# The local, commit-pinned FPP 9 / FPP 10 checkouts
+# scripts/test-plugin-load-fpp.sh prepares as build contexts. Not committed:
+# each is fetched fresh, and verified against its pinned commit, on demand.
+.fpp-src/
