@@ -51,12 +51,22 @@ lint:
 		go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run ./...; \
 	fi
 
+.PHONY: native
+native:
+	$(MAKE) -C native all
+
+.PHONY: native-test
+native-test:
+	$(MAKE) -C native check-host-neutral
+	$(MAKE) -C native test
+
 .PHONY: check
-check: fmt-check vet lint test
+check: fmt-check vet lint test native-test
 
 .PHONY: clean
 clean:
 	rm -rf $(BIN_DIR) $(DIST)
+	$(MAKE) -C native clean
 
 # ---------------------------------------------------------------------------
 # Release artifacts

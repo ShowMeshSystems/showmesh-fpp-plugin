@@ -2,9 +2,12 @@
 
 The ShowMesh runtime that lives on an FPP host.
 
-**Status: the Go macro helper is extracted and builds here independently. The
-C++ component has not been written.** Nothing here has been installed on a real
-FPP host, and no release, public or private, has been published.
+**Status: the Go macro helper is extracted and builds here independently, and
+the host-neutral C++ core exists with its own tests. The FPP 9 and FPP 10
+adapters have not been written, and the identity publisher stops short of the
+coordinator wire contract, which another repository owns.** Nothing here has
+been installed on a real FPP host, and no release, public or private, has been
+published.
 
 ## What this plugin does and why it exists
 
@@ -115,6 +118,71 @@ release pipeline, its reproducibility check, and a per-architecture assertion
 that every artifact really is a static Linux binary for the architecture its
 filename names. CI publishes nothing and uploads no workflow artifact.
 
+## The host-neutral C++ core
+
+`native/` holds the part of the resident component that has no FPP in it: the
+brightness engine, the playlist-identity derivation, and the bounded callback
+handoff. It includes no FPP header and links no third-party library, so it
+builds and its tests run on any machine with a C++17 compiler, long before an
+FPP host is involved. A make target asserts the no-FPP-header rule rather than
+trusting it.
+
+```sh
+make native         # build the static core library
+make native-test    # the no-FPP-header check, then the test binary
+make -C native test CXXFLAGS="-std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined"
+make -C native test CXXFLAGS="-std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread"
+```
+
+The test harness is a hundred lines in `native/tests/check.h`, for the same
+reason there are no library dependencies: this source is compiled on an FPP
+host with whatever toolchain that host has, and nothing may need fetching.
+
+**Brightness.** Two independently owned values, each with its own fade:
+
+```text
+effective output = round(ceiling * transition_gain / 100)
+```
+
+The ceiling is what FPP's scheduler and operator commands write; the transition
+gain is the coordinator's alone and is deliberately not reachable from any FPP
+action. Both default to 100, both fade linearly per frame, and they compose on
+every frame, so a ceiling change during a gain fade takes effect at once and a
+later gain of 100 reveals the current ceiling rather than a cached earlier one.
+A fade started while another is running begins at the current interpolated
+value, so replacement introduces no jump. Channels outside the configured apply
+ranges, and channels inside an exclusion, are never written.
+
+Full state, including any active fade, is what nodes exchange and what is
+persisted: never a relative adjustment, so a duplicated or delayed payload is
+harmless and a stale or unreadable one is rejected rather than guessed at.
+After a restart the engine resumes a fade whose recorded timing it can place,
+and otherwise settles on the darker of the last applied value and the target.
+It never comes back brighter than what it was already applying.
+
+**Playlist identity.** The canonical playlist hash is SHA-256 over the RFC 8785
+canonicalization of the complete definition FPP returned, with no field
+removed. Both the canonicalizer and the hash are implemented here; the number
+formatting was differentially tested against a JavaScript engine, since RFC 8785
+adopts ECMAScript's number-to-string rules wholesale.
+
+The entry key hashes a canonical JSON object of the instance UUID, playlist
+name, playlist hash, section, and position, rather than a delimited string, so
+a name containing a separator character cannot collide with a different entry.
+It is stable across restarts for an unchanged definition and changes when the
+definition does. Duplicate filenames at different positions stay distinct.
+Missing evidence produces an explicit unavailable reason and never falls back
+to filename identity.
+
+**The callback boundary.** `CallbackEvidence` is a fixed-size, allocation-free
+struct, and `CallbackHandoff` is a bounded queue with a mutex and nothing else.
+Copy the evidence and return: no network request, retry sleep, definition
+fetch, hash, or filesystem write belongs on FPP's callback thread, which is a
+running show's thread. When the queue is full the oldest pending observation is
+dropped so the newest state survives, and the drop is counted. That count is
+the gap evidence: current-state convergence is the invariant, and a coalesced
+delivery must never read as a complete event history.
+
 ## Coordinator seam
 
 Command logic talks to the coordinator only through `CoordinatorClient`, a
@@ -179,6 +247,13 @@ installation enters a commit, a test fixture, or an example in this repository.
 Everything in this repository is developed against bench instances. A unit test,
 a container, and a fake are not a real-host result, and no comment, log line, or
 string here may claim otherwise.
+
+The coordinator ingestion contract for playlist-entry observations is owned by
+the coordinator repository and is not frozen yet. The identity core here derives
+the canonical hash and the entry key, and stops before serializing anything to
+that endpoint: a parallel wire shape invented here and reconciled later would be
+worse than not having one. The entry-key derivation itself is checked against
+that contract's fixtures when they exist.
 
 Specifically unproven, and each requires a real FPP host:
 
