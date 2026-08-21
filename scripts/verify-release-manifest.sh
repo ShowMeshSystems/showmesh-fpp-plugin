@@ -25,10 +25,13 @@ size_of() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1"; }
 # nor a bare CI runner is guaranteed to have one. A truncated write (the
 # writer failing partway through) leaves unbalanced braces or brackets, or
 # a file that does not end with '}', which this catches without one.
-open_braces=$(grep -o '{' "$manifest" | wc -l | tr -d ' ')
-close_braces=$(grep -o '}' "$manifest" | wc -l | tr -d ' ')
-open_brackets=$(grep -o '\[' "$manifest" | wc -l | tr -d ' ')
-close_brackets=$(grep -o ']' "$manifest" | wc -l | tr -d ' ')
+# awk's gsub count, not `grep -o | wc -l`: under pipefail, a grep that
+# matches nothing exits 1 and would trip `set -e` here even though zero
+# is a legitimate count.
+open_braces=$(awk '{c+=gsub(/{/,"")} END{print c+0}' "$manifest")
+close_braces=$(awk '{c+=gsub(/}/,"")} END{print c+0}' "$manifest")
+open_brackets=$(awk '{c+=gsub(/\[/,"")} END{print c+0}' "$manifest")
+close_brackets=$(awk '{c+=gsub(/]/,"")} END{print c+0}' "$manifest")
 last_line=$(tail -n 1 "$manifest")
 if [ "$open_braces" != "$close_braces" ] || [ "$open_brackets" != "$close_brackets" ] || [ "$last_line" != "}" ]; then
     echo "verify-release-manifest: $manifest is not well-formed JSON (unbalanced braces or brackets, or does not end with '}')" >&2
@@ -36,8 +39,10 @@ if [ "$open_braces" != "$close_braces" ] || [ "$open_brackets" != "$close_bracke
 fi
 
 # The manifest is written one field per line, so this reads it without a
-# JSON parser, which an FPP host and a bare CI runner both may lack.
-filenames=$(grep '"filename"' "$manifest" | sed 's/.*: "//; s/".*//')
+# JSON parser, which an FPP host and a bare CI runner both may lack. grep
+# is wrapped so a manifest with zero matches (exit 1) falls through to the
+# empty-filenames check below instead of tripping `set -e` under pipefail.
+filenames=$( (grep '"filename"' "$manifest" || true) | sed 's/.*: "//; s/".*//')
 [ -n "$filenames" ] || { echo "verify-release-manifest: the manifest names no artifacts" >&2; exit 1; }
 
 # The set of artifacts a release always produces. Trusting whatever the
