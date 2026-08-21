@@ -2,11 +2,9 @@
 
 The ShowMesh runtime that lives on an FPP host.
 
-**Status: bootstrapped, no runtime code yet.** This repository currently holds
-its license, its agent instructions, and a pinned snapshot of the ShowMesh
-records that govern it. The Go helper has not been extracted from the ShowMesh
-monorepo and the C++ component has not been written. Nothing here has been
-installed on a real FPP host, and no release has been published.
+**Status: the Go macro helper is extracted and builds here independently. The
+C++ component has not been written.** Nothing here has been installed on a real
+FPP host, and no release, public or private, has been published.
 
 ## What this plugin does and why it exists
 
@@ -76,12 +74,58 @@ compatibility matrix and rebuilt against its own installed headers.
 
 ## Build, test, and lint
 
-Not yet applicable. The Go helper still lives in the ShowMesh monorepo under
-`cmd/showmesh-fpp-plugin` and has not been extracted. Once extraction lands,
-this section states the exact local commands for building the helper, running
-its tests independently of the monorepo, linting, and cross-building the three
-release architectures. It will not be written before those commands actually
-run.
+The Go helper builds from the standard library alone: no module dependencies, no
+cgo, no monorepo checkout. A test asserts that, so adding a dependency is a
+deliberate change rather than a side effect.
+
+```sh
+make build          # host binary into ./bin
+make test           # go test ./...
+make test-race      # the same suite under -race
+make vet            # go vet ./...
+make fmt-check      # fails on anything gofmt would rewrite
+make lint           # golangci-lint, downloaded on demand if not installed
+make check          # fmt-check, vet, lint, test
+```
+
+Cross-build the three release architectures, write the pinned checksum manifest,
+and verify it against the tarballs just produced:
+
+```sh
+make release VERSION=0.0.0-local
+```
+
+That writes `dist/showmesh-fpp-plugin_<VERSION>_linux_{amd64,arm64,armv7}.tar.gz`
+and `dist/showmesh-fpp-plugin_<VERSION>_SHA256SUMS`. Each binary is
+`CGO_ENABLED=0`, `-trimpath`, statically linked, and named `showmesh-fpp-plugin`
+at mode 0755 inside its archive.
+
+```sh
+make verify-reproducible VERSION=0.0.0-local
+```
+
+builds and packages one architecture twice, independently, and fails unless the
+two tarballs are byte-identical. This needs GNU tar (`gtar` on macOS via
+`brew install gnu-tar`); without it the target says it could not confirm
+reproducibility rather than reporting a comparison it never made.
+
+CI runs the same targets: formatting, vet, and the race suite on both the
+minimum Go version `go.mod` claims and the current toolchain; lint; then the
+release pipeline, its reproducibility check, and a per-architecture assertion
+that every artifact really is a static Linux binary for the architecture its
+filename names. CI publishes nothing and uploads no workflow artifact.
+
+## Coordinator seam
+
+Command logic talks to the coordinator only through `CoordinatorClient`, a
+two-call interface: submit a macro run, and read a macro definition for the
+local cache. The handwritten HTTP client sits behind it unchanged. Local
+persistence, cached macro data, status rendering, refusal-versus-outage
+classification, and failure-buffer policy stay plugin-owned above the seam.
+
+Buffered prior failures are not a separate call. They ride in the run request,
+so the local buffer clears only after a 2xx response and a failed report is
+never silently discarded. Both directions of that rule are tested.
 
 ## Artifact and packaging flow
 

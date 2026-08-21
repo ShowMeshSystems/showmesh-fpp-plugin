@@ -1,0 +1,48 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - revive
+    - misspell
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+    misspell:
+      # "Mosquitto" (the MQTT broker this project uses, per ADR-008) is not
+      # a misspelling of "mosquito"; test/integration and its harness
+      # reference it by name repeatedly.
+      ignore-rules:
+        - mosquitto
+  exclusions:
+    generated: lax
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/showmeshsystems/showmesh
+
+# The defaults cap reporting at 3 issues sharing the same message and 50
+# per linter, so a run reporting a small number could be hiding an order
+# of magnitude more — discovered during Step 3's wiring pass, which found
+# `make lint` reporting "0 issues" was still genuinely zero (nothing
+# historical was wrong), but the count is not trustworthy the moment it is
+# non-zero, and this project uses it as a gate. Set both to 0 (unlimited)
+# so every issue is always reported.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
