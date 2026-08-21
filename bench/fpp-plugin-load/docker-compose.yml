@@ -1,0 +1,69 @@
+# Bench scaffolding, not the product. See README.md for what this bench does
+# and does not establish.
+#
+# Every run is isolated by BENCH_ID: the compose project name, container
+# name, network and named media volume all carry it. Always invoke through
+# scripts/test-plugin-load-fpp.sh; a bare `docker compose up` here has no
+# project name and no BENCH_ID and would collide across runs.
+#
+# FPP_IMAGE/FPP_TAG/FPP_COMMIT/FPP_BUILD_CONTEXT are set by that script from
+# --major; .env.example lists them for setting by hand. An already-present
+# FPP_IMAGE is used as-is and not rebuilt.
+#
+# FPP_BUILD_CONTEXT must be a LOCAL commit-pinned checkout with a real .git
+# directory, not a remote git-URL context, because EXTRA_INSTALL_FLAG
+# --skip-clone needs git present in the tree it keeps.
+#
+# docker-compose.prebuilt.yml overrides this file's image for a developer with
+# access to a private prebuilt fixture.
+
+services:
+  fpp:
+    image: ${FPP_IMAGE}
+    build:
+      context: ${FPP_BUILD_CONTEXT}
+      dockerfile: Docker/Dockerfile
+      args:
+        FPPBRANCH: ${FPP_TAG}
+        EXTRA_INSTALL_FLAG: --skip-clone
+    container_name: showmesh-fppbench-${BENCH_ID:-local}-fpp
+    hostname: showmesh-fppbench-fpp
+    # Matches the run command FalconChristmas/fpp's own dockerBuild.sh
+    # documents: the channel output thread requests real-time scheduling
+    # priority for frame timing. Not load-bearing for this bench's
+    # assertions, which touch no real pixel output, but kept for parity
+    # with how the product's real host runs fppd.
+    cap_add:
+      - SYS_NICE
+    networks:
+      - bench
+    volumes:
+      # A named, per-BENCH_ID volume, not a bind mount: /home/fpp/media is
+      # fppd's own state (settings, plugins, logs) and must not leak
+      # between runs with different --id, the isolation failure this
+      # bench's spec exists to avoid repeating.
+      - media:/home/fpp/media
+      # The repository's native/ tree, read-only. The bench copies this to
+      # a writable path inside the container before compiling, rather than
+      # compiling in place, so nothing this bench does can ever write back
+      # into the read-only source tree it mounts here.
+      - ../../native:/opt/showmesh-native-src:ro
+      # The committed callbacks declaration file, read-only. Installed by
+      # copy into the plugin directory during the bench's install step so
+      # its mode bits and content are exactly what was committed, never a
+      # bind-mounted file whose mode depends on the host filesystem.
+      - ./plugin:/opt/showmesh-plugin-src:ro
+    ports:
+      - "${BENCH_HTTP_PORT:-8190}:80"
+    # No restart policy: a crash during a run must surface as a failed
+    # assertion, not be silently masked by Docker restarting the container
+    # out from under the script mid-check.
+    restart: "no"
+
+networks:
+  bench:
+    name: showmesh-fppbench-${BENCH_ID:-local}-net
+
+volumes:
+  media:
+    name: showmesh-fppbench-${BENCH_ID:-local}-media

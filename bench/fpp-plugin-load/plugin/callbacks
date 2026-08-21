@@ -1,0 +1,22 @@
+#!/bin/sh
+# Bench scaffolding, not the product. This is the plugin declaration file
+# fppd execs as `eventScript <this file> --list` to learn what kind of
+# plugin this directory holds (see the source-verified brief this bench was
+# built from). It must print exactly one token: `c++:<filename>`, with no
+# leading or trailing spaces on the token itself, no trailing comma, and no
+# `media`, `playlist`, or `lifecycle` token anywhere in the output, or fppd
+# treats this as a script plugin and never calls dlopen at all. A trailing
+# newline is fine; fppd trims only the ends of what it reads.
+#
+# The installed shared object's name depends on which FPP major the bench
+# installed for (libshowmesh-fpp9.so vs libshowmesh-fpp10.so), and the
+# bench's own install step (scripts/test-plugin-load-fpp.sh) puts exactly
+# one of the two next to this file. Checking which one is actually present
+# lets one committed callbacks file serve both majors without the bench
+# having to template or regenerate it per run.
+dir=$(dirname "$0")
+if [ -f "$dir/libshowmesh-fpp10.so" ]; then
+    printf 'c++:libshowmesh-fpp10.so'
+elif [ -f "$dir/libshowmesh-fpp9.so" ]; then
+    printf 'c++:libshowmesh-fpp9.so'
+fi
