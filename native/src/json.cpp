@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "showmesh/locale_guard.h"
+
 namespace showmesh {
 namespace json {
 namespace {
@@ -96,6 +98,11 @@ class Parser {
     explicit Parser(const std::string& text) : text_(text) {}
 
     ParseResult run() {
+        // strtod, called by parseNumber below, honors LC_NUMERIC; without
+        // this guard a comma-decimal locale set elsewhere in the process
+        // would silently misparse every fractional number in this text.
+        const CLocaleGuard localeGuard;
+        if (!localeGuard.ok()) return failAt("could not establish the C numeric locale");
         skipWhitespace();
         Value v;
         if (!parseValue(&v)) return fail();
@@ -463,6 +470,11 @@ Value Value::makeObject(std::vector<Member> members) {
 // exponent rules: plain digits within 10^-6 up to 10^21, exponential
 // outside that window.
 bool formatNumber(double value, std::string* out) {
+    // snprintf's "%e" and the strtod round-trip below both honor
+    // LC_NUMERIC; without this guard a comma-decimal locale would emit
+    // "1,5" instead of "1.5", which is not valid JSON.
+    const CLocaleGuard localeGuard;
+    if (!localeGuard.ok()) return false;
     if (!std::isfinite(value)) return false;
     if (value == 0.0) {
         *out = "0";  // negative zero is also "0"

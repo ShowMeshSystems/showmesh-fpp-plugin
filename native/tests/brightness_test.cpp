@@ -1,6 +1,8 @@
 #include "showmesh/brightness.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -181,37 +183,158 @@ TEST(AnEmptyApplyListScalesTheWholeUniverse) {
 
 TEST(StaleDuplicateAndUnsupportedFullStatePayloadsAreRejected) {
     BrightnessEngine engine;
-    CHECK(engine.setCeiling(80, 0, kT0).ok);  // revision 1
+    CHECK(engine.setCeiling(80, 0, kT0).ok);  // stateChangedAtMillis == kT0
 
     BrightnessState newer = engine.captureState(kT0);
-    newer.revision = 5;
+    newer.stateChangedAtMillis = kT0 + 1000;
     newer.ceilingTarget = 40;
     newer.ceilingStart = 40;
-    CHECK(engine.adoptState(newer) == StateAdoption::kAdopted);
+    CHECK(engine.adoptState(newer, kT0) == StateAdoption::kAdopted);
     CHECK_NEAR(engine.ceilingAt(kT0), 40.0, 1e-9);
 
     // The same payload again carries nothing new.
-    CHECK(engine.adoptState(newer) == StateAdoption::kRejectedStaleRevision);
+    CHECK(engine.adoptState(newer, kT0) == StateAdoption::kRejectedStaleRevision);
     CHECK_NEAR(engine.ceilingAt(kT0), 40.0, 1e-9);
 
     BrightnessState older = newer;
-    older.revision = 4;
+    older.stateChangedAtMillis = kT0 + 500;
     older.ceilingTarget = 100;
     older.ceilingStart = 100;
-    CHECK(engine.adoptState(older) == StateAdoption::kRejectedStaleRevision);
+    CHECK(engine.adoptState(older, kT0) == StateAdoption::kRejectedStaleRevision);
     CHECK_NEAR(engine.ceilingAt(kT0), 40.0, 1e-9);
 
     BrightnessState future = newer;
-    future.revision = 9;
+    future.stateChangedAtMillis = kT0 + 2000;
     future.schemaVersion = showmesh::kBrightnessStateSchemaVersion + 1;
     future.ceilingTarget = 100;
     future.ceilingStart = 100;
-    CHECK(engine.adoptState(future) == StateAdoption::kRejectedUnsupportedVersion);
+    CHECK(engine.adoptState(future, kT0) == StateAdoption::kRejectedUnsupportedVersion);
     CHECK_NEAR(engine.ceilingAt(kT0), 40.0, 1e-9);
 }
 
+// MultiSync orders full state by (stateChangedAtMillis, instanceId), never
+// by the sender's local revision counter, so two nodes converge on the
+// same state regardless of which one adopts first.
+TEST(TwoEnginesWithEqualTimestampsConvergeRegardlessOfAdoptionOrder) {
+    BrightnessEngine a;
+    a.setInstanceId("node-a");
+    CHECK(a.setCeiling(40, 0, kT0).ok);
+
+    BrightnessEngine b;
+    b.setInstanceId("node-b");
+    CHECK(b.setCeiling(70, 0, kT0).ok);
+
+    const BrightnessState stateA = a.captureState(kT0);
+    const BrightnessState stateB = b.captureState(kT0);
+
+    // a adopts b's state, b adopts a's state: both timestamps are equal,
+    // so the tiebreak is instanceId, and "node-b" > "node-a" wins on both
+    // sides regardless of adoption order.
+    const StateAdoption aResult = a.adoptState(stateB, kT0);
+    const StateAdoption bResult = b.adoptState(stateA, kT0);
+    CHECK(aResult == StateAdoption::kAdopted);
+    CHECK(bResult == StateAdoption::kRejectedStaleRevision);
+    CHECK_NEAR(a.ceilingAt(kT0), 70.0, 1e-9);
+    CHECK_NEAR(b.ceilingAt(kT0), 70.0, 1e-9);
+
+    // Now adopt in the opposite order starting from two fresh engines:
+    // the outcome does not depend on which engine goes first.
+    BrightnessEngine c;
+    c.setInstanceId("node-a");
+    CHECK(c.setCeiling(40, 0, kT0).ok);
+    BrightnessEngine d;
+    d.setInstanceId("node-b");
+    CHECK(d.setCeiling(70, 0, kT0).ok);
+    const BrightnessState stateC = c.captureState(kT0);
+    const BrightnessState stateD = d.captureState(kT0);
+    CHECK(d.adoptState(stateC, kT0) == StateAdoption::kRejectedStaleRevision);
+    CHECK(c.adoptState(stateD, kT0) == StateAdoption::kAdopted);
+    CHECK_NEAR(c.ceilingAt(kT0), 70.0, 1e-9);
+    CHECK_NEAR(d.ceilingAt(kT0), 70.0, 1e-9);
+}
+
+TEST(AGenuinelyOlderStateIsRefusedByTimestamp) {
+    BrightnessEngine engine;
+    engine.setInstanceId("node-a");
+    CHECK(engine.setCeiling(50, 0, kT0 + 10'000).ok);
+
+    BrightnessState olderFromOtherNode = engine.captureState(kT0 + 10'000);
+    olderFromOtherNode.instanceId = "node-z";  // would win a tiebreak
+    olderFromOtherNode.stateChangedAtMillis = kT0;  // but it is strictly older
+    olderFromOtherNode.ceilingTarget = 5;
+    olderFromOtherNode.ceilingStart = 5;
+
+    CHECK(engine.adoptState(olderFromOtherNode, kT0) == StateAdoption::kRejectedStaleRevision);
+    CHECK_NEAR(engine.ceilingAt(kT0 + 10'000), 50.0, 1e-9);
+}
+
+// finding 2: an adopted fade window with an implausible magnitude must
+// never overflow the composition on a later frame.
+TEST(AnImplausibleFadeWindowIsRejectedBeforeAdoption) {
+    BrightnessEngine engine;
+    BrightnessState state = engine.captureState(kT0);
+    state.stateChangedAtMillis = kT0 + 1000;
+    state.ceilingTarget = 0;
+    state.ceilingFadeStartMillis = INT64_MIN;
+    state.ceilingFadeEndMillis = INT64_MAX;
+    CHECK(engine.adoptState(state, kT0) == StateAdoption::kRejectedInvalidFadeWindow);
+    // Nothing was adopted: the ceiling is still the untouched default.
+    CHECK_NEAR(engine.ceilingAt(kT0), 100.0, 1e-9);
+
+    // An inverted-but-plausible-magnitude window is refused the same way.
+    BrightnessState inverted = engine.captureState(kT0);
+    inverted.stateChangedAtMillis = kT0 + 1000;
+    inverted.ceilingFadeStartMillis = kT0 + 5000;
+    inverted.ceilingFadeEndMillis = kT0;
+    CHECK(engine.adoptState(inverted, kT0) == StateAdoption::kRejectedInvalidFadeWindow);
+
+    // A window longer than the registered action's own 86400-second bound
+    // is refused too.
+    BrightnessState tooLong = engine.captureState(kT0);
+    tooLong.stateChangedAtMillis = kT0 + 1000;
+    tooLong.ceilingFadeStartMillis = kT0;
+    tooLong.ceilingFadeEndMillis = kT0 + (showmesh::kMaxFadeSeconds + 1) * 1000;
+    CHECK(engine.adoptState(tooLong, kT0) == StateAdoption::kRejectedInvalidFadeWindow);
+
+    // A plausible window is still adopted normally.
+    BrightnessState ok = engine.captureState(kT0);
+    ok.stateChangedAtMillis = kT0 + 1000;
+    ok.ceilingFadeStartMillis = kT0;
+    ok.ceilingFadeEndMillis = kT0 + 10'000;
+    ok.ceilingTarget = 10;
+    CHECK(engine.adoptState(ok, kT0) == StateAdoption::kAdopted);
+}
+
+// finding 5: an inverted persisted window must settle at the darker
+// value, never at the target, which is what RES-018 section 1 requires.
+TEST(AnInvertedPersistedFadeWindowSettlesDarkerNotAtTheTarget) {
+    BrightnessState persisted;
+    persisted.revision = 1;
+    persisted.ceilingTarget = 90;
+    persisted.ceilingStart = 90;
+    // Inverted: end before start.
+    persisted.ceilingFadeStartMillis = kT0 + 10'000;
+    persisted.ceilingFadeEndMillis = kT0;
+    persisted.lastAppliedCeiling = 5;
+    persisted.persistedAtMillis = kT0;
+
+    BrightnessEngine engine;
+    CHECK(engine.restoreFromPersisted(persisted, kT0 + 50'000) == StateAdoption::kAdopted);
+    // The darker of lastAppliedCeiling (5) and target (90) is 5, never 90.
+    CHECK_NEAR(engine.ceilingAt(kT0 + 50'000), 5.0, 1e-9);
+    CHECK(!engine.fadingAt(kT0 + 50'000));
+}
+
+// finding: a byte-identical replayed or retransmitted payload must be
+// inert regardless of whose instanceId sorts lower. leader and joiner use
+// distinct, real instance ids on purpose: with both empty (or equal) the
+// tier-two instanceId comparison ties trivially and cannot exercise the
+// bug where a joiner whose id sorts below the sender kept re-adopting the
+// same payload forever, bumping revision() and triggering a rebroadcast
+// on every duplicate delivery.
 TEST(ALateJoinerConvergesOnTheCurrentFadePositionAndTarget) {
     BrightnessEngine leader;
+    leader.setInstanceId("node-leader");
     CHECK(leader.setCeiling(100, 0, kT0).ok);
     CHECK(leader.setCeiling(20, 100, kT0).ok);
 
@@ -219,11 +342,17 @@ TEST(ALateJoinerConvergesOnTheCurrentFadePositionAndTarget) {
     BrightnessState published = leader.captureState(mid);
 
     BrightnessEngine joiner;
-    CHECK(joiner.adoptState(published) == StateAdoption::kAdopted);
+    joiner.setInstanceId("node-joiner");  // sorts below "node-leader"
+    CHECK(joiner.adoptState(published, kT0) == StateAdoption::kAdopted);
     CHECK_NEAR(joiner.ceilingAt(mid), leader.ceilingAt(mid), 1e-9);
     CHECK_NEAR(joiner.ceilingAt(kT0 + 100'000), 20.0, 1e-9);
-    // Adopting full state twice is indistinguishable from adopting it once.
-    CHECK(joiner.adoptState(published) == StateAdoption::kRejectedStaleRevision);
+    const std::uint64_t revisionAfterFirstAdoption = joiner.revision();
+    // Adopting full state twice, or replaying/retransmitting the exact
+    // same payload, is indistinguishable from adopting it once: no
+    // further revision bump, so no further rebroadcast.
+    CHECK(joiner.adoptState(published, kT0) == StateAdoption::kRejectedStaleRevision);
+    CHECK(joiner.adoptState(published, kT0) == StateAdoption::kRejectedStaleRevision);
+    CHECK_EQ(joiner.revision(), revisionAfterFirstAdoption);
     CHECK_NEAR(joiner.ceilingAt(kT0 + 100'000), 20.0, 1e-9);
 }
 
@@ -320,6 +449,40 @@ TEST(APersistedPayloadMissingAFieldIsRejectedRatherThanDefaulted) {
     CHECK(!showmesh::decodeBrightnessState("[1,2,3]").ok);
 }
 
+// finding 3: a representable but absurd revision (1e19) or an outright
+// unrepresentable one (1e300) must fail the decode, not wedge the node by
+// being adopted as newer-than-everything forever.
+TEST(APersistedPayloadWithAnAbsurdRevisionIsRejected) {
+    BrightnessEngine engine;
+    const std::string encoded = showmesh::encodeBrightnessState(engine.captureState(kT0));
+    const std::string needle = "\"revision\":0";
+    const std::size_t pos = encoded.find(needle);
+    CHECK(pos != std::string::npos);
+
+    std::string tampered = encoded;
+    tampered.replace(pos, needle.size(), "\"revision\":1e19");
+    CHECK(!showmesh::decodeBrightnessState(tampered).ok);
+
+    tampered = encoded;
+    tampered.replace(pos, needle.size(), "\"revision\":1e300");
+    CHECK(!showmesh::decodeBrightnessState(tampered).ok);
+}
+
+// finding 3: a field cast to TimeMillis must be range-checked against
+// int64, not merely finite; 1e300 is finite but its cast is undefined
+// behavior.
+TEST(APersistedPayloadWithAnUnrepresentableTimeIsRejected) {
+    BrightnessEngine engine;
+    const std::string encoded = showmesh::encodeBrightnessState(engine.captureState(kT0));
+    const std::string needle = "\"persistedAtMillis\":" + std::to_string(kT0);
+    const std::size_t pos = encoded.find(needle);
+    CHECK(pos != std::string::npos);
+
+    std::string tampered = encoded;
+    tampered.replace(pos, needle.size(), "\"persistedAtMillis\":1e300");
+    CHECK(!showmesh::decodeBrightnessState(tampered).ok);
+}
+
 TEST(ExclusionsSplitApplyRangesCorrectlyAtEveryEdge) {
     struct Case {
         const char* name;
@@ -403,6 +566,202 @@ TEST(OnlyConfiguredChannelsAreTouchedInAFullSizeBuffer) {
 
 // A configured range that runs past the frame the adapter actually handed
 // over must clip, not read past the end.
+// finding 3: instanceId_ is this node's own persistent identity. Adopting
+// a peer's full state must never overwrite it, or the node permanently
+// impersonates the peer, including into the next captured (and
+// persisted) state.
+TEST(AdoptingPeerStateNeverStealsThisNodesInstanceId) {
+    BrightnessEngine engine;
+    engine.setInstanceId("node-a");
+    CHECK(engine.setCeiling(80, 0, kT0).ok);
+
+    BrightnessState peer = engine.captureState(kT0);
+    peer.instanceId = "node-b";
+    peer.stateChangedAtMillis = kT0 + 1000;
+    peer.ceilingTarget = 30;
+    peer.ceilingStart = 30;
+
+    CHECK(engine.adoptState(peer, kT0) == StateAdoption::kAdopted);
+    CHECK_NEAR(engine.ceilingAt(kT0), 30.0, 1e-9);
+    CHECK_EQ(engine.instanceId(), std::string("node-a"));
+    // The stolen id would also ride into the next captured (and
+    // therefore persisted) state; confirm that never happens either.
+    CHECK_EQ(engine.captureState(kT0 + 1000).instanceId, std::string("node-a"));
+}
+
+// finding 4: stateChangedAtMillis is the ordering key, bounded only to
+// +/-4e18 by the codec's own int64-safety check, with no epoch band
+// applied. A hostile value here must be rejected before it can wedge this
+// node against every future legitimate peer state.
+TEST(AnImplausibleStateChangedAtMillisIsRejectedRatherThanWedgingTheNode) {
+    BrightnessEngine engine;
+    BrightnessState hostile = engine.captureState(kT0);
+    hostile.stateChangedAtMillis = static_cast<TimeMillis>(4e18);
+    hostile.ceilingTarget = 1;
+    hostile.ceilingStart = 1;
+    CHECK(engine.adoptState(hostile, kT0) == StateAdoption::kRejectedImplausibleTimestamp);
+    CHECK_NEAR(engine.ceilingAt(kT0), 100.0, 1e-9);
+
+    // A legitimate, later state must still be adoptable: the node is not
+    // wedged.
+    BrightnessState legitimate = engine.captureState(kT0);
+    legitimate.stateChangedAtMillis = kT0 + 1000;
+    legitimate.ceilingTarget = 42;
+    legitimate.ceilingStart = 42;
+    CHECK(engine.adoptState(legitimate, kT0) == StateAdoption::kAdopted);
+    CHECK_NEAR(engine.ceilingAt(kT0), 42.0, 1e-9);
+}
+
+// finding 4: a fractional millisecond cannot come from a real clock read.
+// readMillis truncating 1.5 to 1 would silently accept a malformed value.
+TEST(APersistedPayloadWithAFractionalTimeIsRejected) {
+    BrightnessEngine engine;
+    const std::string encoded = showmesh::encodeBrightnessState(engine.captureState(kT0));
+    const std::string needle = "\"persistedAtMillis\":" + std::to_string(kT0);
+    const std::size_t pos = encoded.find(needle);
+    CHECK(pos != std::string::npos);
+
+    std::string tampered = encoded;
+    tampered.replace(pos, needle.size(), "\"persistedAtMillis\":" + std::to_string(kT0) + ".5");
+    CHECK(!showmesh::decodeBrightnessState(tampered).ok);
+}
+
+// finding 5a: a local change at the exact same millisecond as a state
+// this node already adopted must still order strictly after it, or the
+// local command is lost the moment this node's instanceId sorts lower
+// than the peer it is about to publish to.
+TEST(ALocalChangeOutrunsAPeerStateCapturedAtTheSameMillisecond) {
+    BrightnessEngine a;
+    a.setInstanceId("node-a");  // sorts lower than "node-b"
+    BrightnessEngine b;
+    b.setInstanceId("node-b");
+
+    CHECK(b.setCeiling(70, 0, kT0).ok);
+    const BrightnessState fromB = b.captureState(kT0);
+    CHECK(a.adoptState(fromB, kT0) == StateAdoption::kAdopted);
+
+    // node-a's own local change, at the exact same millisecond kT0.
+    CHECK(a.setCeiling(15, 0, kT0).ok);
+    const BrightnessState fromA = a.captureState(kT0);
+    CHECK(fromA.stateChangedAtMillis > fromB.stateChangedAtMillis);
+
+    // node-b must adopt node-a's change. Without the max(now,+1) rule
+    // this ties on stateChangedAtMillis and loses the instanceId tiebreak
+    // ("node-a" < "node-b"), discarding the local command.
+    CHECK(b.adoptState(fromA, kT0) == StateAdoption::kAdopted);
+    CHECK_NEAR(b.ceilingAt(kT0), 15.0, 1e-9);
+}
+
+// finding 5a: a host whose clock is corrected backwards by NTP must still
+// have its own commands outrank what they replace.
+TEST(AClockCorrectedBackwardsStillOutranksWhatItReplaced) {
+    BrightnessEngine engine;
+    engine.setInstanceId("node-a");
+    CHECK(engine.setCeiling(50, 0, kT0 + 100'000).ok);  // clock jumped forward
+    CHECK(engine.setCeiling(90, 0, kT0).ok);             // NTP corrects it back
+    const BrightnessState published = engine.captureState(kT0);
+    CHECK(published.stateChangedAtMillis > kT0 + 100'000);
+    CHECK_NEAR(engine.ceilingAt(kT0), 90.0, 1e-9);
+
+    BrightnessEngine peer;
+    peer.setInstanceId("node-b");
+    BrightnessState jumped;
+    jumped.stateChangedAtMillis = kT0 + 100'000;
+    jumped.instanceId = "node-a";
+    jumped.ceilingTarget = 50;
+    jumped.ceilingStart = 50;
+    CHECK(peer.adoptState(jumped, kT0) == StateAdoption::kAdopted);
+    // The corrected state must still be adopted even though its wall
+    // clock is earlier than the jumped one the peer already holds.
+    CHECK(peer.adoptState(published, kT0) == StateAdoption::kAdopted);
+    CHECK_NEAR(peer.ceilingAt(kT0), 90.0, 1e-9);
+}
+
+// finding 5b: two nodes with an empty instanceId and an equal timestamp
+// must not both reject each other. That deadlock was verified at 20
+// percent and 70 percent; the content hash tiebreak is what gives them a
+// total order instead. This exercises the tiebreak with genuinely
+// different ceiling targets, which already differ before the hash is
+// even computed; it does not exercise the lastApplied-exclusion fix
+// (ConvergedNodesWithDivergentPerNodeRenderHistoryStayConverged below
+// does, and is the only test in this file that is load-bearing for it).
+TEST(EqualTimestampsAndEmptyInstanceIdsStillConvergeInsteadOfDeadlocking) {
+    BrightnessEngine a;
+    CHECK(a.setCeiling(20, 0, kT0).ok);
+    BrightnessEngine b;
+    CHECK(b.setCeiling(70, 0, kT0).ok);
+
+    const BrightnessState stateA = a.captureState(kT0);
+    const BrightnessState stateB = b.captureState(kT0);
+    CHECK_EQ(stateA.stateChangedAtMillis, stateB.stateChangedAtMillis);
+    CHECK(stateA.instanceId.empty());
+    CHECK(stateB.instanceId.empty());
+
+    const StateAdoption aResult = a.adoptState(stateB, kT0);
+    const StateAdoption bResult = b.adoptState(stateA, kT0);
+    CHECK(!(aResult == StateAdoption::kRejectedStaleRevision && bResult == StateAdoption::kRejectedStaleRevision));
+    CHECK_NEAR(a.ceilingAt(kT0), b.ceilingAt(kT0), 1e-9);
+}
+
+// Same tiebreak as above with three hosts instead of two; also not
+// load-bearing for the lastApplied-exclusion fix, for the same reason.
+TEST(ThreeOrMoreHostsWithEqualTimestampsAndEmptyIdsConverge) {
+    BrightnessEngine a;
+    BrightnessEngine b;
+    BrightnessEngine c;
+    CHECK(a.setCeiling(10, 0, kT0).ok);
+    CHECK(b.setCeiling(50, 0, kT0).ok);
+    CHECK(c.setCeiling(90, 0, kT0).ok);
+
+    const BrightnessState sa = a.captureState(kT0);
+    const BrightnessState sb = b.captureState(kT0);
+    const BrightnessState sc = c.captureState(kT0);
+
+    a.adoptState(sb, kT0);
+    a.adoptState(sc, kT0);
+    b.adoptState(sa, kT0);
+    b.adoptState(sc, kT0);
+    c.adoptState(sa, kT0);
+    c.adoptState(sb, kT0);
+
+    CHECK_NEAR(a.ceilingAt(kT0), b.ceilingAt(kT0), 1e-9);
+    CHECK_NEAR(b.ceilingAt(kT0), c.ceilingAt(kT0), 1e-9);
+}
+
+// finding 6: restoreFromPersisted must apply the same fadeWindowIsPlausible
+// check adoptState does. An implausible-magnitude window (not literally
+// inverted: end is after start, just absurdly far after it) must settle
+// darker, never resume a 285-million-year fade.
+TEST(RestoreFromPersistedNeverResumesAnImplausibleFadeWindow) {
+    BrightnessState persisted;
+    persisted.ceilingStart = 5;
+    persisted.ceilingTarget = 100;
+    persisted.ceilingFadeStartMillis = kT0;
+    persisted.ceilingFadeEndMillis = static_cast<TimeMillis>(4e18);
+    persisted.lastAppliedCeiling = 5;
+    persisted.persistedAtMillis = kT0;
+
+    BrightnessEngine engine;
+    CHECK(engine.restoreFromPersisted(persisted, kT0 + 50'000) == StateAdoption::kAdopted);
+    CHECK_NEAR(engine.ceilingAt(kT0 + 50'000), 5.0, 1e-9);
+    CHECK(!engine.fadingAt(kT0 + 50'000));
+}
+
+// finding 6 / finding 4: a corrupted persisted stateChangedAtMillis is the
+// same wedge risk as a hostile MultiSync frame, just arriving from disk.
+TEST(RestoreFromPersistedRejectsAnImplausibleStateChangedAtMillis) {
+    BrightnessState persisted;
+    persisted.stateChangedAtMillis = static_cast<TimeMillis>(4e18);
+    persisted.ceilingTarget = 90;
+    persisted.ceilingStart = 90;
+    persisted.lastAppliedCeiling = 5;
+
+    BrightnessEngine engine;
+    CHECK(engine.restoreFromPersisted(persisted, kT0) == StateAdoption::kRejectedImplausibleTimestamp);
+    // Darker of lastAppliedCeiling (5) and target (90) is 5.
+    CHECK_NEAR(engine.ceilingAt(kT0), 5.0, 1e-9);
+}
+
 TEST(ARangeBeyondTheFrameIsClipped) {
     BrightnessEngine engine;
     RangeConfig config;
@@ -415,4 +774,106 @@ TEST(ARangeBeyondTheFrameIsClipped) {
     for (std::uint8_t v : data) {
         CHECK_EQ(static_cast<int>(v), 100);
     }
+}
+
+// finding 4b: one unauthenticated datagram carrying stateChangedAtMillis
+// at the very top of the absolute epoch band is still adopted once
+// (nothing about it is malformed), so it must not be allowed to outrank
+// every legitimate future peer state for the rest of the process's life.
+// The receiver's own clock, not the sender's, is what makes this
+// rejectable: kLatestPlausibleEpochMillis alone cannot catch it, since
+// the value sits inside that band by construction.
+TEST(AWedgeValueAtTheTopOfTheEpochBandCannotDominateTheMeshPermanently) {
+    BrightnessEngine engine;
+    BrightnessState wedge = engine.captureState(kT0);
+    wedge.stateChangedAtMillis = showmesh::kLatestPlausibleEpochMillis;
+    wedge.ceilingTarget = 1;
+    wedge.ceilingStart = 1;
+    CHECK(engine.adoptState(wedge, kT0) == StateAdoption::kRejectedImplausibleTimestamp);
+    CHECK_NEAR(engine.ceilingAt(kT0), 100.0, 1e-9);
+
+    // A legitimate peer state, only moments ahead of this node's own
+    // clock, is still adoptable: the node is not wedged.
+    BrightnessState legitimate = engine.captureState(kT0);
+    legitimate.stateChangedAtMillis = kT0 + 1000;
+    legitimate.ceilingTarget = 42;
+    legitimate.ceilingStart = 42;
+    CHECK(engine.adoptState(legitimate, kT0) == StateAdoption::kAdopted);
+    CHECK_NEAR(engine.ceilingAt(kT0), 42.0, 1e-9);
+
+    // The victim's own later local command is not rejected by a peer
+    // either, since the victim itself never adopted the wedge value.
+    CHECK(engine.setCeiling(77, 0, kT0 + 2000).ok);
+    BrightnessEngine peer;
+    CHECK(peer.adoptState(engine.captureState(kT0 + 2000), kT0 + 2000) == StateAdoption::kAdopted);
+    CHECK_NEAR(peer.ceilingAt(kT0 + 2000), 77.0, 1e-9);
+}
+
+// finding 4b: a state legitimately close behind the epoch band's top edge
+// must still be adoptable when the receiver's own clock is close to it
+// too; only the gap between the incoming timestamp and the receiver's own
+// now is what makes a value implausible, not the absolute value alone.
+TEST(AStateNearTheTopOfTheEpochBandIsAdoptedWhenTheReceiversClockIsAlsoNearIt) {
+    const TimeMillis nearTop = showmesh::kLatestPlausibleEpochMillis - 500;
+    BrightnessEngine engine;
+    BrightnessState state = engine.captureState(nearTop);
+    state.stateChangedAtMillis = nearTop;
+    state.ceilingTarget = 33;
+    state.ceilingStart = 33;
+    CHECK(engine.adoptState(state, nearTop) == StateAdoption::kAdopted);
+    CHECK_NEAR(engine.ceilingAt(nearTop), 33.0, 1e-9);
+}
+
+// A receiver clock near TimeMillis's maximum must not make the
+// now + kMaxOrderingKeyAheadOfNowMillis bound overflow. UBSan traps the
+// addition form of this check; the state here is ordinary and must still
+// be adopted once the comparison is done as a subtraction instead.
+TEST(AReceiverClockNearTheMaximumTimeMillisDoesNotOverflowTheOrderingBound) {
+    const TimeMillis hugeNow = std::numeric_limits<TimeMillis>::max() - 10;
+    BrightnessEngine engine;
+    BrightnessState state = engine.captureState(kT0);
+    state.stateChangedAtMillis = kT0 + 1000;
+    state.ceilingTarget = 55;
+    state.ceilingStart = 55;
+    CHECK(engine.adoptState(state, hugeNow) == StateAdoption::kAdopted);
+    CHECK_NEAR(engine.ceilingAt(kT0), 55.0, 1e-9);
+}
+
+// finding 1: lastAppliedCeiling and lastAppliedGain are per-node render
+// history, rewritten by applyToFrame on every output frame and never
+// adopted from a peer. Three nodes that converge on identical shared
+// state (same ceiling/gain targets and fade window) but have each
+// applied frames at different simulated times, giving each a different
+// lastApplied pair, must stay settled: none may treat a peer's copy of
+// the same shared state as newer just because its private render history
+// differs. Before the fix, including those two fields in the ordering
+// hash gave three different per-node hashes for "the same" state, so at
+// least one of these six adoptions was wrongly accepted.
+TEST(ConvergedNodesWithDivergentPerNodeRenderHistoryStayConverged) {
+    BrightnessEngine a;
+    BrightnessEngine b;
+    BrightnessEngine c;
+    CHECK(a.setCeiling(80, 100, kT0).ok);
+    CHECK(b.setCeiling(80, 100, kT0).ok);
+    CHECK(c.setCeiling(80, 100, kT0).ok);
+
+    std::vector<std::uint8_t> data = frame(4, 255);
+    a.applyToFrame(data.data(), data.size(), kT0 + 10'000);
+    b.applyToFrame(data.data(), data.size(), kT0 + 50'000);
+    c.applyToFrame(data.data(), data.size(), kT0 + 99'000);
+
+    const BrightnessState sa = a.captureState(kT0);
+    const BrightnessState sb = b.captureState(kT0);
+    const BrightnessState sc = c.captureState(kT0);
+    // The private fields really did diverge; otherwise this test would
+    // not exercise the bug at all.
+    CHECK(sa.lastAppliedCeiling != sb.lastAppliedCeiling);
+    CHECK(sb.lastAppliedCeiling != sc.lastAppliedCeiling);
+
+    CHECK(a.adoptState(sb, kT0) == StateAdoption::kRejectedStaleRevision);
+    CHECK(a.adoptState(sc, kT0) == StateAdoption::kRejectedStaleRevision);
+    CHECK(b.adoptState(sa, kT0) == StateAdoption::kRejectedStaleRevision);
+    CHECK(b.adoptState(sc, kT0) == StateAdoption::kRejectedStaleRevision);
+    CHECK(c.adoptState(sa, kT0) == StateAdoption::kRejectedStaleRevision);
+    CHECK(c.adoptState(sb, kT0) == StateAdoption::kRejectedStaleRevision);
 }

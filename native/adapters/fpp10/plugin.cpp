@@ -18,6 +18,7 @@
 
 #include "brightness_command.h"
 #include "callback_fields.h"
+#include "channel_ranges.h"
 #include "fpp_definition_source.h"
 #include "showmesh/runtime.h"
 
@@ -35,7 +36,18 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         : FPPPlugin(showmesh::kPluginName), runtime_(&definitions_, nullptr, nowMillis) {
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
+        showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
+        // start() before registering the settings listener: start() spawns
+        // the worker thread and can throw, and a throwing constructor never
+        // runs this object's destructor, so a listener registered first
+        // would leave the global settings registry holding a callback that
+        // captures a freed this.
         runtime_.start();
+        registerSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName,
+                                  [this](const std::string&) {
+                                      showmesh::adapter::configureChannelRanges(&*runtime_.brightness(),
+                                                                                FPPD_MAX_CHANNELS);
+                                  });
     }
 
     ~ShowMeshFpp10Plugin() override { quiesce(); }
@@ -68,6 +80,13 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
 
  private:
     void quiesce() {
+        // Withdrawn before anything else: settings.h's listener registry is
+        // a global that outlives this object, and shutdown() runs while the
+        // library is still mapped, unlike the dlclose() that may follow it.
+        // Safe to call twice: unregisterSettingsListener() is a no-op if the
+        // id is already gone, and quiesce() runs once from shutdown() and
+        // again from the destructor FPP invokes after it.
+        unregisterSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName);
         runtime_.stop();
         if (command_ != nullptr) {
             CommandManager::INSTANCE.removeCommand(command_);
@@ -77,7 +96,7 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
     }
 
     void publishFullStateIfChanged() {
-        const std::uint64_t revision = runtime_.brightness().revision();
+        const std::uint64_t revision = runtime_.brightness()->revision();
         if (revision == publishedRevision_) return;
         publishedRevision_ = revision;
         std::string payload = runtime_.encodeFullState();
@@ -95,9 +114,10 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
 
 }  // namespace
 
-// This plugin stops and joins its worker in shutdown(), withdraws and
-// deletes the command it registered, registers no HTTP route, and hands
-// nothing to a drogon event loop, so it is safe to unmap.
+// This plugin stops and joins its worker in shutdown(), withdraws its
+// settings listener and the command it registered, registers no HTTP
+// route, and hands nothing to a drogon event loop, so it is safe to
+// unmap.
 FPP_PLUGIN_SUPPORTS_UNLOAD()
 
 extern "C" {

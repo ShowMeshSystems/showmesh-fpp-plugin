@@ -24,6 +24,11 @@ enum class IdentityUnavailable {
     kMissingDefinition,
     kUnsupportedDefinitionShape,
     kNegativePosition,
+    // A field that determines identity (playlist name or section) was
+    // truncated on the callback thread: the copy is bounded evidence of a
+    // longer value, never the value itself, so building identity from it
+    // would be confidently wrong rather than merely missing.
+    kTruncatedIdentityField,
 };
 
 const char* identityUnavailableReason(IdentityUnavailable reason);
@@ -77,6 +82,13 @@ struct PlaylistEntryObservation {
     std::string entryKey;
     std::string sequenceFilename;
     std::string mediaFilename;
+    // True when the copy on the callback thread lost bytes off the end of
+    // the source field. These are corroborating evidence, not identity, so
+    // truncation here does not gate the observation the way a truncated
+    // playlist name or section does; it is carried so the record says a
+    // filename was cut rather than reporting it as complete.
+    bool sequenceFilenameTruncated = false;
+    bool mediaFilenameTruncated = false;
     PlaylistAction action = PlaylistAction::kUnknown;
     std::uint64_t sequence = 0;
     TimeMillis observedAtMillis = 0;

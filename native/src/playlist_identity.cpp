@@ -34,6 +34,8 @@ const char* identityUnavailableReason(IdentityUnavailable reason) {
         case IdentityUnavailable::kMissingDefinition: return "the playlist definition is not available";
         case IdentityUnavailable::kUnsupportedDefinitionShape: return "the playlist definition is not usable JSON";
         case IdentityUnavailable::kNegativePosition: return "the item position is negative";
+        case IdentityUnavailable::kTruncatedIdentityField:
+            return "a field needed for identity was truncated before it could be compared";
     }
     return "";
 }

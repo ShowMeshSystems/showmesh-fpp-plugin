@@ -23,6 +23,7 @@
 
 #include "brightness_command.h"
 #include "callback_fields.h"
+#include "channel_ranges.h"
 #include "fpp_definition_source.h"
 #include "showmesh/runtime.h"
 
@@ -40,10 +41,34 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         : FPPPlugin(showmesh::kPluginName), runtime_(&definitions_, nullptr, nowMillis) {
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
+        showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
+        // start() before registering the settings listener: start() spawns
+        // the worker thread and can throw, and a throwing constructor never
+        // runs this object's destructor, so a listener registered first
+        // would leave the global settings registry holding a callback that
+        // captures a freed this.
         runtime_.start();
+        registerSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName,
+                                  [this](const std::string&) {
+                                      showmesh::adapter::configureChannelRanges(&*runtime_.brightness(),
+                                                                                FPPD_MAX_CHANNELS);
+                                  });
     }
 
     ~ShowMeshFpp9Plugin() override {
+        // PluginManager::INSTANCE is itself a static, and its destructor
+        // calls Cleanup(), which deletes this. If fppd exits by a path that
+        // skips the explicit Cleanup() call in fppd.cpp, that delete happens
+        // during static destruction instead, at which point settings.cpp's
+        // own SettingsConfig static may already be destroyed: locking its
+        // destroyed mutex throws out of this noexcept destructor and calls
+        // std::terminate. Nothing this destructor can check tells it which
+        // case it is in, so the settings-registry call is guarded rather
+        // than assumed safe.
+        try {
+            unregisterSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName);
+        } catch (...) {
+        }
         runtime_.stop();
         if (command_ != nullptr) {
             // removeCommand only unregisters; a Command subclass declared
@@ -78,7 +103,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
 
  private:
     void publishFullStateIfChanged() {
-        const std::uint64_t revision = runtime_.brightness().revision();
+        const std::uint64_t revision = runtime_.brightness()->revision();
         if (revision == publishedRevision_) return;
         publishedRevision_ = revision;
         std::string payload = runtime_.encodeFullState();

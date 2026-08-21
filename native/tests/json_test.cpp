@@ -1,8 +1,13 @@
 #include "showmesh/json.h"
 
+#include <clocale>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include "check.h"
+#include "showmesh/brightness.h"
+#include "showmesh/brightness_codec.h"
 
 using showmesh::json::canonicalize;
 using showmesh::json::CanonicalResult;
@@ -90,4 +95,58 @@ TEST(CanonicalizationIsIdempotent) {
 
 TEST(MemberOrderDoesNotChangeTheCanonicalForm) {
     CHECK_EQ(canonicalText("{\"a\":1,\"b\":2,\"c\":3}"), canonicalText("{\"c\":3,\"b\":2,\"a\":1}"));
+}
+
+// finding 4: strtod and snprintf("%e") honor LC_NUMERIC, and fppd is a
+// large process where any component may call setlocale. Under a
+// comma-decimal locale, canonicalization, number formatting, and the
+// brightness state codec must all still use "." rather than silently
+// discarding the fractional part or emitting invalid JSON.
+TEST(NumberHandlingIsUnaffectedByAThreadWideCommaDecimalLocale) {
+    // A skip here reads as a pass, which is how this test rode green
+    // through CI while CLocaleGuard was fully neutered. CI installs a
+    // comma-decimal locale and sets SHOWMESH_REQUIRE_LOCALE_TEST, which
+    // makes an absent locale a failure there. It stays a loud skip
+    // elsewhere because this suite also ships in the source bundle and is
+    // run on FPP hosts, which carry only C and POSIX and must not fail a
+    // post-compile validation over a locale they were never going to have.
+    const char* installed = nullptr;
+    for (const char* candidate : {"de_DE.UTF-8", "de_DE", "de_DE.ISO8859-1"}) {
+        if (std::setlocale(LC_NUMERIC, candidate) != nullptr) {
+            installed = candidate;
+            break;
+        }
+    }
+    if (installed == nullptr) {
+        const char* required = std::getenv("SHOWMESH_REQUIRE_LOCALE_TEST");
+        if (required != nullptr && required[0] != '\0' && required[0] != '0') {
+            ::showmesh_test::reportFailure(
+                __FILE__, __LINE__,
+                "no comma-decimal locale (tried de_DE.UTF-8, de_DE, de_DE.ISO8859-1) is installed, and "
+                "SHOWMESH_REQUIRE_LOCALE_TEST demands one");
+            return;
+        }
+        std::fprintf(stderr,
+                     "SKIP NumberHandlingIsUnaffectedByAThreadWideCommaDecimalLocale: no comma-decimal "
+                     "locale installed here, and SHOWMESH_REQUIRE_LOCALE_TEST is not set\n");
+        return;
+    }
+
+    CHECK_EQ(canonicalText("{\"a\":1.5}"), "{\"a\":1.5}");
+    CHECK_EQ(formatted(1.5), "1.5");
+
+    showmesh::BrightnessState state;
+    state.ceilingTarget = 62.5;
+    state.ceilingStart = 12.25;
+    state.instanceId = "locale-test";
+    const std::string encoded = showmesh::encodeBrightnessState(state);
+    CHECK(encoded.find("62.5") != std::string::npos);
+    CHECK(encoded.find("62,5") == std::string::npos);
+
+    showmesh::BrightnessStateDecode decoded = showmesh::decodeBrightnessState(encoded);
+    CHECK(decoded.ok);
+    CHECK_NEAR(decoded.state.ceilingTarget, 62.5, 1e-9);
+    CHECK_EQ(showmesh::encodeBrightnessState(decoded.state), encoded);
+
+    std::setlocale(LC_NUMERIC, "C");
 }
