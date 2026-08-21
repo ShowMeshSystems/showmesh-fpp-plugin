@@ -54,6 +54,44 @@ jobs:
       - name: Lint
         run: make lint
 
+  native-core:
+    # The host-neutral core carries no FPP headers and no third-party
+    # libraries, so it builds anywhere a C++17 compiler does. Both
+    # compilers run because the FPP fleet spans distributions with
+    # different defaults, and a warning that is an error on one of them is
+    # the cheapest place to find that out.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install clang
+        if: matrix.compiler == 'clang++'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
+
+      - name: Assert the core reaches for no FPP header
+        run: make -C native check-host-neutral
+
+      - name: Build and test
+        run: make -C native test CXX=${{ matrix.compiler }}
+
+      - name: Build and test under the address and undefined-behavior sanitizers
+        run: |
+          make -C native clean
+          make -C native test CXX=${{ matrix.compiler }} \
+            CXXFLAGS="-std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined -fno-omit-frame-pointer"
+
+      # The callback handoff is the one place two threads meet, so the
+      # thread sanitizer is the check that actually constrains it.
+      - name: Build and test under the thread sanitizer
+        run: |
+          make -C native clean
+          make -C native test CXX=${{ matrix.compiler }} \
+            CXXFLAGS="-std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread"
+
   release-artifacts:
     # FPP hosts carry no Go toolchain, so this binary ships as a prebuilt,
     # sha256-verified static binary. This job is that pipeline: three

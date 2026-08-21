@@ -2,6 +2,7 @@
 /bin/
 /dist/
 /build/
+/native/build/
 *.o
 *.a
 *.so

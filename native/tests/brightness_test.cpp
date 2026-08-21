@@ -1,0 +1,319 @@
+#include "showmesh/brightness.h"
+
+#include <vector>
+
+#include "check.h"
+#include "showmesh/brightness_codec.h"
+
+using showmesh::BrightnessEngine;
+using showmesh::BrightnessState;
+using showmesh::ChannelRange;
+using showmesh::RangeConfig;
+using showmesh::StateAdoption;
+using showmesh::TimeMillis;
+
+namespace {
+
+constexpr TimeMillis kT0 = 1'800'000'000'000;
+
+std::vector<std::uint8_t> frame(std::size_t n, std::uint8_t value) { return std::vector<std::uint8_t>(n, value); }
+
+}  // namespace
+
+TEST(ZeroSecondsAppliesImmediately) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(75, 0, kT0).ok);
+    CHECK_EQ(engine.effectivePercentAt(kT0), 75);
+    CHECK(!engine.fadingAt(kT0));
+}
+
+TEST(FadeIsMonotonicAndReachesExactlyTheTargetAtTheDeadline) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(100, 0, kT0).ok);
+    CHECK(engine.setCeiling(75, 10, kT0).ok);
+
+    double previous = 101.0;
+    for (int second = 0; second <= 10; ++second) {
+        const double v = engine.ceilingAt(kT0 + second * 1000);
+        CHECK(v <= previous);
+        previous = v;
+    }
+    CHECK_NEAR(engine.ceilingAt(kT0 + 5000), 87.5, 1e-9);
+    CHECK_NEAR(engine.ceilingAt(kT0 + 10000), 75.0, 1e-9);
+    CHECK_EQ(engine.effectivePercentAt(kT0 + 10000), 75);
+    // Past the deadline the value holds at the target rather than
+    // continuing to extrapolate.
+    CHECK_NEAR(engine.ceilingAt(kT0 + 60000), 75.0, 1e-9);
+}
+
+TEST(ReplacingAFadeStartsAtTheCurrentInterpolatedValue) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(100, 0, kT0).ok);
+    CHECK(engine.setCeiling(0, 100, kT0).ok);
+
+    const TimeMillis mid = kT0 + 50'000;
+    const double atReplacement = engine.ceilingAt(mid);
+    CHECK_NEAR(atReplacement, 50.0, 1e-9);
+
+    CHECK(engine.setCeiling(80, 10, mid).ok);
+    // No discontinuity: the instant the new fade starts, the value is
+    // still exactly what it was.
+    CHECK_NEAR(engine.ceilingAt(mid), atReplacement, 1e-9);
+    CHECK_NEAR(engine.ceilingAt(mid + 5000), 65.0, 1e-9);
+    CHECK_NEAR(engine.ceilingAt(mid + 10000), 80.0, 1e-9);
+}
+
+TEST(CeilingAndGainComposeAndAreIndependentlyWritable) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(60, 0, kT0).ok);
+    CHECK(engine.setGain(50, 0, kT0).ok);
+    CHECK_EQ(engine.effectivePercentAt(kT0), 30);
+
+    CHECK(engine.setGain(100, 0, kT0).ok);
+    CHECK_EQ(engine.effectivePercentAt(kT0), 60);
+    CHECK_NEAR(engine.ceilingAt(kT0), 60.0, 1e-9);
+}
+
+// The decisive composition case: a ceiling change during a gain fade takes
+// effect immediately, and a later gain of 100 reveals the current ceiling
+// rather than a cached earlier one.
+TEST(GainReturningToFullRevealsTheCurrentCeilingNotACachedOne) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(60, 0, kT0).ok);
+    CHECK(engine.setGain(0, 20, kT0).ok);
+
+    const TimeMillis mid = kT0 + 10'000;
+    CHECK(engine.setCeiling(40, 10, mid).ok);
+
+    const TimeMillis after = mid + 10'000;
+    CHECK_NEAR(engine.ceilingAt(after), 40.0, 1e-9);
+
+    CHECK(engine.setGain(100, 0, after).ok);
+    CHECK_EQ(engine.effectivePercentAt(after), 40);
+}
+
+TEST(ConcurrentCeilingAndGainFadesComposeOnEveryFrame) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(100, 0, kT0).ok);
+    CHECK(engine.setCeiling(50, 10, kT0).ok);
+    CHECK(engine.setGain(50, 10, kT0).ok);
+
+    // Halfway through both: ceiling 75, gain 75, composed 56.25 -> 56.
+    CHECK_NEAR(engine.ceilingAt(kT0 + 5000), 75.0, 1e-9);
+    CHECK_NEAR(engine.gainAt(kT0 + 5000), 75.0, 1e-9);
+    CHECK_EQ(engine.effectivePercentAt(kT0 + 5000), 56);
+    CHECK_EQ(engine.effectivePercentAt(kT0 + 10000), 25);
+}
+
+TEST(ActionInputOutsideTheDeclaredBoundsIsRejectedNotClamped) {
+    BrightnessEngine engine;
+    CHECK(!engine.setCeiling(-1, 0, kT0).ok);
+    CHECK(!engine.setCeiling(101, 0, kT0).ok);
+    CHECK(!engine.setCeiling(50, -1, kT0).ok);
+    CHECK(!engine.setCeiling(50, 86401, kT0).ok);
+    CHECK(engine.setCeiling(50, 86400, kT0).ok);
+    // A rejected action changes nothing: the accepted day-long fade is
+    // still the one running.
+    CHECK(!engine.setCeiling(150, 0, kT0).ok);
+    CHECK_NEAR(engine.ceilingAt(kT0 + 86400 * 1000), 50.0, 1e-9);
+    CHECK_NEAR(engine.ceilingAt(kT0), 100.0, 1e-9);
+}
+
+TEST(OverlappingAndOutOfBoundsRangesAreRejected) {
+    BrightnessEngine engine;
+    RangeConfig overlapping;
+    overlapping.apply.push_back(ChannelRange{1, 10});
+    overlapping.apply.push_back(ChannelRange{5, 10});
+    CHECK(!engine.configureRanges(overlapping, 64).ok);
+
+    RangeConfig past;
+    past.apply.push_back(ChannelRange{60, 10});
+    CHECK(!engine.configureRanges(past, 64).ok);
+
+    RangeConfig empty;
+    empty.apply.push_back(ChannelRange{1, 0});
+    CHECK(!engine.configureRanges(empty, 64).ok);
+
+    RangeConfig valid;
+    valid.apply.push_back(ChannelRange{1, 16});
+    valid.apply.push_back(ChannelRange{17, 16});
+    valid.exclude.push_back(ChannelRange{5, 4});
+    CHECK(engine.configureRanges(valid, 64).ok);
+}
+
+TEST(ChannelsOutsideTheConfiguredRangesAreByteIdenticalAcrossAFade) {
+    BrightnessEngine engine;
+    RangeConfig config;
+    config.apply.push_back(ChannelRange{1, 16});
+    config.exclude.push_back(ChannelRange{5, 4});  // channels 5,6,7,8
+    CHECK(engine.configureRanges(config, 32).ok);
+    CHECK(engine.setCeiling(100, 0, kT0).ok);
+    CHECK(engine.setCeiling(50, 10, kT0).ok);
+
+    for (int second = 0; second <= 10; ++second) {
+        std::vector<std::uint8_t> data = frame(32, 200);
+        engine.applyToFrame(data.data(), data.size(), kT0 + second * 1000);
+        for (std::size_t i = 4; i < 8; ++i) {
+            CHECK_EQ(static_cast<int>(data[i]), 200);  // excluded
+        }
+        for (std::size_t i = 16; i < 32; ++i) {
+            CHECK_EQ(static_cast<int>(data[i]), 200);  // outside every apply range
+        }
+    }
+
+    std::vector<std::uint8_t> data = frame(32, 200);
+    engine.applyToFrame(data.data(), data.size(), kT0 + 10'000);
+    CHECK_EQ(static_cast<int>(data[0]), 100);
+    CHECK_EQ(static_cast<int>(data[15]), 100);
+}
+
+TEST(AnEmptyApplyListScalesTheWholeUniverse) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(50, 0, kT0).ok);
+    std::vector<std::uint8_t> data = frame(8, 200);
+    engine.applyToFrame(data.data(), data.size(), kT0);
+    for (std::uint8_t v : data) {
+        CHECK_EQ(static_cast<int>(v), 100);
+    }
+}
+
+TEST(StaleDuplicateAndUnsupportedFullStatePayloadsAreRejected) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(80, 0, kT0).ok);  // revision 1
+
+    BrightnessState newer = engine.captureState(kT0);
+    newer.revision = 5;
+    newer.ceilingTarget = 40;
+    newer.ceilingStart = 40;
+    CHECK(engine.adoptState(newer) == StateAdoption::kAdopted);
+    CHECK_NEAR(engine.ceilingAt(kT0), 40.0, 1e-9);
+
+    // The same payload again carries nothing new.
+    CHECK(engine.adoptState(newer) == StateAdoption::kRejectedStaleRevision);
+    CHECK_NEAR(engine.ceilingAt(kT0), 40.0, 1e-9);
+
+    BrightnessState older = newer;
+    older.revision = 4;
+    older.ceilingTarget = 100;
+    older.ceilingStart = 100;
+    CHECK(engine.adoptState(older) == StateAdoption::kRejectedStaleRevision);
+    CHECK_NEAR(engine.ceilingAt(kT0), 40.0, 1e-9);
+
+    BrightnessState future = newer;
+    future.revision = 9;
+    future.schemaVersion = showmesh::kBrightnessStateSchemaVersion + 1;
+    future.ceilingTarget = 100;
+    future.ceilingStart = 100;
+    CHECK(engine.adoptState(future) == StateAdoption::kRejectedUnsupportedVersion);
+    CHECK_NEAR(engine.ceilingAt(kT0), 40.0, 1e-9);
+}
+
+TEST(ALateJoinerConvergesOnTheCurrentFadePositionAndTarget) {
+    BrightnessEngine leader;
+    CHECK(leader.setCeiling(100, 0, kT0).ok);
+    CHECK(leader.setCeiling(20, 100, kT0).ok);
+
+    const TimeMillis mid = kT0 + 50'000;
+    BrightnessState published = leader.captureState(mid);
+
+    BrightnessEngine joiner;
+    CHECK(joiner.adoptState(published) == StateAdoption::kAdopted);
+    CHECK_NEAR(joiner.ceilingAt(mid), leader.ceilingAt(mid), 1e-9);
+    CHECK_NEAR(joiner.ceilingAt(kT0 + 100'000), 20.0, 1e-9);
+    // Adopting full state twice is indistinguishable from adopting it once.
+    CHECK(joiner.adoptState(published) == StateAdoption::kRejectedStaleRevision);
+    CHECK_NEAR(joiner.ceilingAt(kT0 + 100'000), 20.0, 1e-9);
+}
+
+TEST(RestartResumesATrustworthyFadeFromItsCurrentPosition) {
+    BrightnessEngine before;
+    CHECK(before.setCeiling(100, 0, kT0).ok);
+    CHECK(before.setCeiling(20, 100, kT0).ok);
+    std::vector<std::uint8_t> data = frame(4, 255);
+    before.applyToFrame(data.data(), data.size(), kT0 + 10'000);
+    const BrightnessState persisted = before.captureState(kT0 + 10'000);
+
+    BrightnessEngine after;
+    CHECK(after.restoreFromPersisted(persisted, kT0 + 50'000) == StateAdoption::kAdopted);
+    CHECK_NEAR(after.ceilingAt(kT0 + 50'000), before.ceilingAt(kT0 + 50'000), 1e-9);
+    CHECK_NEAR(after.ceilingAt(kT0 + 100'000), 20.0, 1e-9);
+}
+
+TEST(RestartWithUntrustworthyTimingChoosesTheDarkerValue) {
+    BrightnessEngine before;
+    CHECK(before.setCeiling(100, 0, kT0).ok);
+    CHECK(before.setCeiling(20, 100, kT0).ok);
+    std::vector<std::uint8_t> data = frame(4, 255);
+    before.applyToFrame(data.data(), data.size(), kT0 + 10'000);
+    const BrightnessState persisted = before.captureState(kT0 + 10'000);
+    CHECK_NEAR(persisted.lastAppliedCeiling, 92.0, 1e-9);
+
+    // A clock that moved backwards across the restart cannot place the
+    // recorded window, so the darker of the last applied value and the
+    // target is used rather than a resumed fade or a jump to full.
+    BrightnessEngine after;
+    CHECK(after.restoreFromPersisted(persisted, kT0 - 60'000) == StateAdoption::kAdopted);
+    CHECK_NEAR(after.ceilingAt(kT0 - 60'000), 20.0, 1e-9);
+    CHECK(!after.fadingAt(kT0 - 60'000));
+}
+
+TEST(RestartNeverFailsBrighterThanWhatWasApplied) {
+    BrightnessState persisted;
+    persisted.revision = 3;
+    persisted.ceilingStart = 30;
+    persisted.ceilingTarget = 90;   // was fading up
+    persisted.ceilingFadeStartMillis = kT0;
+    persisted.ceilingFadeEndMillis = kT0 + 100'000;
+    persisted.lastAppliedCeiling = 30;
+    persisted.persistedAtMillis = kT0 + 1'000;
+
+    // Trustworthy timing resumes the fade at its real position, which is
+    // still below the target.
+    BrightnessEngine resumed;
+    CHECK(resumed.restoreFromPersisted(persisted, kT0 + 50'000) == StateAdoption::kAdopted);
+    CHECK_NEAR(resumed.ceilingAt(kT0 + 50'000), 60.0, 1e-9);
+
+    // Untrustworthy timing settles at the darker of the two, never at 90.
+    BrightnessEngine settled;
+    CHECK(settled.restoreFromPersisted(persisted, kT0 - 1) == StateAdoption::kAdopted);
+    CHECK_NEAR(settled.ceilingAt(kT0 - 1), 30.0, 1e-9);
+
+    // An unreadable schema version is refused and still settles darker.
+    BrightnessState unsupported = persisted;
+    unsupported.schemaVersion = 99;
+    BrightnessEngine refused;
+    CHECK(refused.restoreFromPersisted(unsupported, kT0 + 50'000) == StateAdoption::kRejectedUnsupportedVersion);
+    CHECK_NEAR(refused.ceilingAt(kT0 + 50'000), 30.0, 1e-9);
+}
+
+TEST(PersistedStateRoundTripsThroughItsEncoding) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(100, 0, kT0).ok);
+    CHECK(engine.setCeiling(35, 120, kT0).ok);
+    CHECK(engine.setGain(60, 30, kT0).ok);
+    std::vector<std::uint8_t> data = frame(4, 255);
+    engine.applyToFrame(data.data(), data.size(), kT0 + 5'000);
+
+    const BrightnessState original = engine.captureState(kT0 + 5'000);
+    const std::string encoded = showmesh::encodeBrightnessState(original);
+    CHECK(!encoded.empty());
+
+    showmesh::BrightnessStateDecode decoded = showmesh::decodeBrightnessState(encoded);
+    CHECK(decoded.ok);
+    CHECK_EQ(showmesh::encodeBrightnessState(decoded.state), encoded);
+
+    BrightnessEngine restored;
+    CHECK(restored.restoreFromPersisted(decoded.state, kT0 + 60'000) == StateAdoption::kAdopted);
+    CHECK_NEAR(restored.ceilingAt(kT0 + 60'000), engine.ceilingAt(kT0 + 60'000), 1e-9);
+    CHECK_NEAR(restored.gainAt(kT0 + 60'000), engine.gainAt(kT0 + 60'000), 1e-9);
+}
+
+TEST(APersistedPayloadMissingAFieldIsRejectedRatherThanDefaulted) {
+    showmesh::BrightnessStateDecode decoded =
+        showmesh::decodeBrightnessState("{\"schemaVersion\":1,\"revision\":2}");
+    CHECK(!decoded.ok);
+    CHECK(!decoded.error.empty());
+
+    CHECK(!showmesh::decodeBrightnessState("not json").ok);
+    CHECK(!showmesh::decodeBrightnessState("[1,2,3]").ok);
+}
