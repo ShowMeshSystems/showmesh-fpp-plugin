@@ -37,6 +37,11 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
         showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
+        registerSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName,
+                                  [this](const std::string&) {
+                                      showmesh::adapter::configureChannelRanges(&*runtime_.brightness(),
+                                                                                FPPD_MAX_CHANNELS);
+                                  });
         runtime_.start();
     }
 
@@ -68,18 +73,15 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
 
     void multiSyncData(const uint8_t* data, int len) override { runtime_.adoptEncodedFullState(data, len); }
 
-    // Refreshes the configured ranges when the operator edits the
-    // ShowMeshChannelRanges setting itself. This does not cover FPP
-    // recomputing its own output ranges on an output-config reload with
-    // the setting untouched: no FPPPlugin virtual fires for that, see the
-    // comment on configureChannelRanges().
-    void settingChanged(const std::string& key, const std::string&) override {
-        if (key != showmesh::adapter::kChannelRangesSettingName) return;
-        showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
-    }
-
  private:
     void quiesce() {
+        // Withdrawn before anything else: settings.h's listener registry is
+        // a global that outlives this object, and shutdown() runs while the
+        // library is still mapped, unlike the dlclose() that may follow it.
+        // Safe to call twice: unregisterSettingsListener() is a no-op if the
+        // id is already gone, and quiesce() runs once from shutdown() and
+        // again from the destructor FPP invokes after it.
+        unregisterSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName);
         runtime_.stop();
         if (command_ != nullptr) {
             CommandManager::INSTANCE.removeCommand(command_);
@@ -107,9 +109,10 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
 
 }  // namespace
 
-// This plugin stops and joins its worker in shutdown(), withdraws and
-// deletes the command it registered, registers no HTTP route, and hands
-// nothing to a drogon event loop, so it is safe to unmap.
+// This plugin stops and joins its worker in shutdown(), withdraws its
+// settings listener and the command it registered, registers no HTTP
+// route, and hands nothing to a drogon event loop, so it is safe to
+// unmap.
 FPP_PLUGIN_SUPPORTS_UNLOAD()
 
 extern "C" {

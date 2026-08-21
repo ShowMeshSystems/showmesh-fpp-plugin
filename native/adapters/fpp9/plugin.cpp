@@ -42,10 +42,19 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
         showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
+        registerSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName,
+                                  [this](const std::string&) {
+                                      showmesh::adapter::configureChannelRanges(&*runtime_.brightness(),
+                                                                                FPPD_MAX_CHANNELS);
+                                  });
         runtime_.start();
     }
 
     ~ShowMeshFpp9Plugin() override {
+        // Withdrawn before anything else: the callback above captures this,
+        // and settings.h's listener registry is a global that outlives this
+        // object.
+        unregisterSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName);
         runtime_.stop();
         if (command_ != nullptr) {
             // removeCommand only unregisters; a Command subclass declared
@@ -77,16 +86,6 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // Complete versioned state from another node, never a relative
     // adjustment, so a duplicate or delayed payload cannot apply twice.
     void multiSyncData(const uint8_t* data, int len) override { runtime_.adoptEncodedFullState(data, len); }
-
-    // Refreshes the configured ranges when the operator edits the
-    // ShowMeshChannelRanges setting itself. This does not cover FPP
-    // recomputing its own output ranges on an output-config reload with
-    // the setting untouched: no FPPPlugin virtual fires for that, see the
-    // comment on configureChannelRanges().
-    void settingChanged(const std::string& key, const std::string&) override {
-        if (key != showmesh::adapter::kChannelRangesSettingName) return;
-        showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
-    }
 
  private:
     void publishFullStateIfChanged() {

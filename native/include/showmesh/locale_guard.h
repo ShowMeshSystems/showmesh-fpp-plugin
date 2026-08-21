@@ -18,17 +18,9 @@ namespace showmesh {
 // ambient, or crash a running show over it.
 class CLocaleGuard {
  public:
-    CLocaleGuard() {
-        locale_t loc = cLocale();
-        if (loc == static_cast<locale_t>(0)) {
-            ok_ = false;
-            return;
-        }
-        previous_ = uselocale(loc);
-        ok_ = true;
-    }
+    CLocaleGuard() : CLocaleGuard(cLocale(), &uselocale) {}
     ~CLocaleGuard() {
-        if (ok_) uselocale(previous_);
+        if (ok_) switchFn_(previous_);
     }
     CLocaleGuard(const CLocaleGuard&) = delete;
     CLocaleGuard& operator=(const CLocaleGuard&) = delete;
@@ -36,6 +28,23 @@ class CLocaleGuard {
     bool ok() const { return ok_; }
 
  private:
+    // Lets locale_guard_test.cpp construct a guard against an injected
+    // switch function that reports failure, which the real uselocale(3)
+    // cannot be made to do portably without invoking undefined behavior.
+    friend struct CLocaleGuardTestHook;
+
+    CLocaleGuard(locale_t loc, locale_t (*switchFn)(locale_t)) : switchFn_(switchFn) {
+        if (loc == static_cast<locale_t>(0)) {
+            ok_ = false;
+            return;
+        }
+        // uselocale returns (locale_t)0 on failure and never returns it on
+        // success (LC_GLOBAL_LOCALE and any real locale_t are non-null), so
+        // this is the only correct success signal.
+        previous_ = switchFn(loc);
+        ok_ = (previous_ != static_cast<locale_t>(0));
+    }
+
     static locale_t cLocale() {
         // Created once and reused for the process's lifetime; uselocale
         // only swaps the calling thread's active locale, it does not
@@ -44,6 +53,7 @@ class CLocaleGuard {
         return loc;
     }
 
+    locale_t (*switchFn_)(locale_t) = &uselocale;
     locale_t previous_ = static_cast<locale_t>(0);
     bool ok_ = false;
 };

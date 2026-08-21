@@ -63,7 +63,11 @@ bool timestampIsPlausible(TimeMillis t) {
 // persistedAtMillis are deliberately excluded: they are either
 // bookkeeping or already compared by the first two tiers, and including
 // persistedAtMillis in particular would make the hash differ on every
-// write of otherwise-identical content.
+// write of otherwise-identical content. lastAppliedCeiling and
+// lastAppliedGain are also excluded: applyToFrame rewrites both on every
+// output frame and adoptState never adopts them, so they are private
+// per-node render history, not shared state, and including them means no
+// two nodes' hashes of "the same" state ever settle on one value.
 std::string orderingContentHash(const BrightnessState& state) {
     std::vector<json::Value::Member> members;
     members.emplace_back("ceilingStart", json::Value::makeNumber(state.ceilingStart));
@@ -74,8 +78,6 @@ std::string orderingContentHash(const BrightnessState& state) {
     members.emplace_back("gainTarget", json::Value::makeNumber(state.gainTarget));
     members.emplace_back("gainFadeStartMillis", json::Value::makeNumber(static_cast<double>(state.gainFadeStartMillis)));
     members.emplace_back("gainFadeEndMillis", json::Value::makeNumber(static_cast<double>(state.gainFadeEndMillis)));
-    members.emplace_back("lastAppliedCeiling", json::Value::makeNumber(state.lastAppliedCeiling));
-    members.emplace_back("lastAppliedGain", json::Value::makeNumber(state.lastAppliedGain));
     json::CanonicalResult canonical = json::canonicalize(json::Value::makeObject(std::move(members)));
     return sha256Hex(canonical.ok ? canonical.text : std::string());
 }
@@ -96,6 +98,21 @@ ValidationResult validateActionInput(int targetPercent, std::int64_t fadeSeconds
         return ValidationResult::failure("fade seconds must be between 0 and 86400, got " + std::to_string(fadeSeconds));
     }
     return ValidationResult{};
+}
+
+// A local change always orders strictly after whatever it replaces:
+// max(now, stateChangedAtMillis_ + 1) rather than plain now, so a local
+// command landing in the same millisecond as an already-adopted peer
+// state is never lost to it, and a host whose clock is stepped backwards
+// by NTP still outranks what it is replacing. The stored ordering key is
+// recorded here too, from the state actually being published (own
+// instanceId_, hash of the value fields excluding private render
+// history), rather than recomputed on every future comparison.
+void BrightnessEngine::bumpRevision(TimeMillis now) {
+    ++revision_;
+    stateChangedAtMillis_ = std::max(now, stateChangedAtMillis_ + 1);
+    orderingInstanceId_ = instanceId_;
+    orderingHash_ = orderingContentHash(captureState(now));
 }
 
 ValidationResult BrightnessEngine::configureRanges(const RangeConfig& config, std::uint32_t totalChannels) {
@@ -223,11 +240,21 @@ bool fadeWindowIsPlausible(TimeMillis start, TimeMillis end) {
 
 }  // namespace
 
-StateAdoption BrightnessEngine::adoptState(const BrightnessState& state) {
+StateAdoption BrightnessEngine::adoptState(const BrightnessState& state, TimeMillis now) {
     if (state.schemaVersion != kBrightnessStateSchemaVersion) {
         return StateAdoption::kRejectedUnsupportedVersion;
     }
     if (!timestampIsPlausible(state.stateChangedAtMillis)) {
+        return StateAdoption::kRejectedImplausibleTimestamp;
+    }
+    // A value inside the absolute epoch band can still be implausibly far
+    // ahead of this node's own clock: one unauthenticated datagram parked
+    // near the top of that band would otherwise be adopted once and then
+    // outrank every legitimate peer state, and this node's own later
+    // commands, for the rest of the process's life. now is the receiver's
+    // own clock, not the sender's, which is why this check lives here
+    // rather than in the sender-agnostic timestampIsPlausible above.
+    if (state.stateChangedAtMillis > now + kMaxOrderingKeyAheadOfNowMillis) {
         return StateAdoption::kRejectedImplausibleTimestamp;
     }
     if (!fadeWindowIsPlausible(state.ceilingFadeStartMillis, state.ceilingFadeEndMillis) ||
@@ -241,15 +268,21 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state) {
     // adopts first. The hash tier matters because two nodes with an empty
     // instanceId and an equal timestamp would otherwise tie and each
     // reject the other's state forever.
+    //
+    // The current side of the comparison is the stored ordering key, not
+    // a value recomputed from this node's live state: recomputing it from
+    // instanceId_ and a fresh captureState() is what let per-node private
+    // fields (and the sender's own instanceId, once adoption stopped
+    // taking it) leak into the comparison, so a byte-identical replayed
+    // payload never settled to equal and kept re-adopting itself.
+    const std::string incomingHash = orderingContentHash(state);
     bool newer;
     if (state.stateChangedAtMillis != stateChangedAtMillis_) {
         newer = state.stateChangedAtMillis > stateChangedAtMillis_;
-    } else if (state.instanceId != instanceId_) {
-        newer = state.instanceId > instanceId_;
+    } else if (state.instanceId != orderingInstanceId_) {
+        newer = state.instanceId > orderingInstanceId_;
     } else {
-        const std::string incomingHash = orderingContentHash(state);
-        const std::string currentHash = orderingContentHash(captureState(0));
-        newer = incomingHash > currentHash;
+        newer = incomingHash > orderingHash_;
     }
     if (!newer) {
         return StateAdoption::kRejectedStaleRevision;
@@ -259,6 +292,12 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state) {
     gain_.restore(clampPercent(state.gainStart), clampPercent(state.gainTarget), state.gainFadeStartMillis,
                   state.gainFadeEndMillis);
     stateChangedAtMillis_ = state.stateChangedAtMillis;
+    // The stored ordering key becomes exactly the key received, not one
+    // recomputed from this node's own state after adopting: see the
+    // comment above and BrightnessEngine::bumpRevision for the local-
+    // change side of the same rule.
+    orderingInstanceId_ = state.instanceId;
+    orderingHash_ = incomingHash;
     // instanceId_ is this node's own persistent identity, never assigned
     // from an adopted payload: doing so would make this node permanently
     // impersonate the peer it just adopted from, including across a
@@ -331,6 +370,11 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
     revision_ = state.revision;
     stateChangedAtMillis_ = state.stateChangedAtMillis;
     instanceId_ = state.instanceId;
+    // This is the node's own prior state, resumed after a restart, so the
+    // stored ordering key's instanceId matches instanceId_ here, unlike
+    // adoptState where the two deliberately diverge.
+    orderingInstanceId_ = state.instanceId;
+    orderingHash_ = orderingContentHash(state);
     lastAppliedCeiling_ = clampPercent(state.lastAppliedCeiling);
     lastAppliedGain_ = clampPercent(state.lastAppliedGain);
 

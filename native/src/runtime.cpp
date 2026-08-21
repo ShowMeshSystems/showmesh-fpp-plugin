@@ -4,10 +4,10 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
-#include <limits>
 #include <string>
 
 #include "showmesh/brightness_codec.h"
+#include "showmesh/saturating_add.h"
 
 namespace showmesh {
 
@@ -137,22 +137,8 @@ StateAdoption ShowMeshRuntime::adoptEncodedFullState(const std::uint8_t* data, i
         decodeBrightnessState(std::string(reinterpret_cast<const char*>(data), static_cast<std::size_t>(length)));
     if (!decoded.ok) return StateAdoption::kRejectedUnsupportedVersion;
     std::lock_guard<std::mutex> lock(engineMutex_);
-    return engine_.adoptState(decoded.state);
+    return engine_.adoptState(decoded.state, clock_());
 }
-
-namespace {
-
-// unacknowledgedCoalesced_ carries gap evidence forward across every
-// observation nothing has accepted yet, potentially for as long as a sink
-// stays unreachable. Saturating rather than wrapping keeps a pathological
-// run reporting "at least this many dropped" instead of wrapping back
-// through zero and understating the gap.
-std::uint32_t saturatingAdd(std::uint32_t a, std::uint32_t b) {
-    const std::uint32_t sum = a + b;
-    return sum < a ? std::numeric_limits<std::uint32_t>::max() : sum;
-}
-
-}  // namespace
 
 bool ShowMeshRuntime::drainOnce() {
     CallbackEvidence evidence;

@@ -23,7 +23,7 @@ namespace showmesh {
 namespace adapter {
 
 // The plugin setting name, shared between the lookup below and each
-// adapter's settingChanged() override so the two cannot name it
+// adapter's registerSettingsListener() call so the two cannot name it
 // differently and silently stop agreeing.
 inline constexpr const char* kChannelRangesSettingName = "ShowMeshChannelRanges";
 
@@ -34,21 +34,21 @@ inline constexpr const char* kChannelRangesSettingName = "ShowMeshChannelRanges"
 // (the channel spans FPP's output configuration actually uses), then the
 // full buffer only if neither is available. A setting that parses to a
 // non-empty list but fails engine validation (overlap, a range past
-// totalChannels, or similar) is rejected outright and reported rather
-// than silently falling back to GetOutputRanges(), so the operator sees
-// why their setting was not applied.
+// totalChannels, or similar) is logged and then falls back to
+// GetOutputRanges(), the same as an empty or unparsed setting would.
 //
 // Called once at plugin construction and again whenever the
-// "ShowMeshChannelRanges" setting itself changes (each adapter's
-// settingChanged() calls this). There is no broader hook in either
-// pinned Plugin.h for an output-config reload that leaves the setting
-// untouched: FPPPlugin's virtuals are multiSyncData, settingChanged, the
-// ChannelOutputPlugin/PlaylistEventPlugin/ChannelDataPlugin/
-// APIProviderPlugin surfaces, and (FPP 10 only) shutdown, none of which
-// fire on a channel-output reconfiguration. A channel added to the
-// output config after startup, with no setting change, is not picked up
-// until the plugin restarts; this is a known limitation, not a silent
-// gap.
+// "ShowMeshChannelRanges" setting changes, via registerSettingsListener()
+// (settings.h), which each adapter wires up in its constructor and tears
+// down before its library can be unmapped. This is FPP's global settings
+// store, not the per-plugin config file FPPPlugins::Plugin(name, true)
+// watches; that two-argument constructor and its settingChanged()
+// override are a different, unrelated mechanism and are not used here.
+// A channel added to the output config after startup, with no
+// ShowMeshChannelRanges change, is not picked up until the plugin
+// restarts: no FPPPlugin virtual fires for an output-config reload that
+// leaves the setting untouched, so this is a known limitation, not a
+// silent gap.
 inline void configureChannelRanges(BrightnessEngine* engine, std::uint32_t totalChannels) {
     RangeConfig config;
     const std::string setting = getSetting(kChannelRangesSettingName);

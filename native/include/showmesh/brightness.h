@@ -26,6 +26,13 @@ constexpr std::int64_t kMaxFadeSeconds = 86400;
 constexpr TimeMillis kEarliestPlausibleEpochMillis = 946684800000;  // 2000-01-01T00:00:00Z
 constexpr TimeMillis kLatestPlausibleEpochMillis = 4102444800000;   // 2100-01-01T00:00:00Z
 
+// An incoming ordering key's stateChangedAtMillis is also rejected when it
+// is this far ahead of the receiver's own clock, on top of the absolute
+// epoch band above. One day comfortably exceeds any realistic clock skew
+// between show hosts (NTP-unsynced or not) while still refusing a hostile
+// value parked near the top of the epoch band, which sits decades ahead.
+constexpr TimeMillis kMaxOrderingKeyAheadOfNowMillis = 86400000;
+
 // A half-open channel span, one-based to match how FPP addresses channels
 // in its own configuration.
 struct ChannelRange {
@@ -128,7 +135,14 @@ class BrightnessEngine {
     // compared in adoptState(). Set once by the adapter; empty when the
     // host has no identity yet. Never overwritten by adoptState: it is
     // this node's own identity, not a peer's.
-    void setInstanceId(std::string id) { instanceId_ = std::move(id); }
+    // Also updates the stored ordering key's instanceId component so a
+    // node that has never bumped its own revision still advertises its
+    // real identity in the tier-two comparison, rather than the empty
+    // string the engine constructed with.
+    void setInstanceId(std::string id) {
+        instanceId_ = std::move(id);
+        orderingInstanceId_ = instanceId_;
+    }
     // Returned by value for the same reason as ranges().
     std::string instanceId() const { return instanceId_; }
 
@@ -157,9 +171,11 @@ class BrightnessEngine {
 
     // Full-state exchange. captureState is what this node publishes and
     // persists; adoptState is what it does with another node's or a
-    // previous process's state.
+    // previous process's state. now is the receiver's own clock, used to
+    // reject a stateChangedAtMillis implausibly far ahead of it: see
+    // kMaxOrderingKeyAheadOfNowMillis.
     BrightnessState captureState(TimeMillis now) const;
-    StateAdoption adoptState(const BrightnessState& state);
+    StateAdoption adoptState(const BrightnessState& state, TimeMillis now);
 
     // Restores persisted state after a restart. When the persisted timing
     // cannot be trusted (a clock that moved backwards, an inverted or
@@ -177,10 +193,7 @@ class BrightnessEngine {
     // local command landing in the same millisecond as an already-adopted
     // peer state is never lost to it, and a host whose clock is stepped
     // backwards by NTP still outranks what it is replacing.
-    void bumpRevision(TimeMillis now) {
-        ++revision_;
-        stateChangedAtMillis_ = std::max(now, stateChangedAtMillis_ + 1);
-    }
+    void bumpRevision(TimeMillis now);
     void recomputeScaledSpans();
 
     FadingValue ceiling_{100.0};
@@ -197,6 +210,18 @@ class BrightnessEngine {
     std::string instanceId_;
     double lastAppliedCeiling_ = 100.0;
     double lastAppliedGain_ = 100.0;
+
+    // The MultiSync ordering key of the state this engine currently holds,
+    // stored rather than recomputed on every comparison: see
+    // BrightnessEngine::adoptState. On a local change it is (own
+    // instanceId_, hash of the state just published). On adoption it is
+    // the incoming key exactly as received, which is why
+    // orderingInstanceId_ can differ from instanceId_, this node's own
+    // persistent identity. stateChangedAtMillis_ above doubles as the
+    // key's timestamp component: it is already set identically on both
+    // paths.
+    std::string orderingInstanceId_;
+    std::string orderingHash_;
 };
 
 }  // namespace showmesh
