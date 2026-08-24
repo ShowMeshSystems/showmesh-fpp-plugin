@@ -16,6 +16,7 @@
 #include "showmesh/sequence_store.h"
 
 using showmesh::CommandOutcome;
+using showmesh::DefinitionPublisher;
 using showmesh::ObservationSink;
 using showmesh::PlaylistDefinitionSource;
 using showmesh::PlaylistEntryObservation;
@@ -40,11 +41,33 @@ class FakeDefinitions : public PlaylistDefinitionSource {
         return definition;
     }
     std::string instanceUuid() override { return uuid; }
+    std::vector<std::string> playlistNames() override { return names; }
 
     std::string definition = kDefinition;
     std::string uuid = kUuid;
     std::string lastRequested;
+    std::vector<std::string> names;
     int definitionCalls = 0;
+};
+
+class RecordingPublisher : public DefinitionPublisher {
+ public:
+    bool publishDefinition(const std::string& instanceUuid, const std::string& playlistName,
+                           const std::string& playlistHash, const std::string& canonicalDefinition,
+                           showmesh::TimeMillis capturedAtMillis) override {
+        published.push_back(Record{instanceUuid, playlistName, playlistHash, canonicalDefinition, capturedAtMillis});
+        return accept;
+    }
+
+    struct Record {
+        std::string instanceUuid;
+        std::string playlistName;
+        std::string playlistHash;
+        std::string canonicalDefinition;
+        showmesh::TimeMillis capturedAtMillis;
+    };
+    std::vector<Record> published;
+    bool accept = true;
 };
 
 class RecordingSink : public ObservationSink {
@@ -683,4 +706,103 @@ TEST(ARuntimeFlagsAllInvalidSequenceFilesAtStartupButNotAGenuineFirstRun) {
     restarted.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "");
     CHECK(restarted.drainOnce());
     CHECK_EQ(secondSink.published[0].sequence, static_cast<std::uint64_t>(1));
+TEST(TheWorkerPublishesEveryDefinitionOnTheHostAtStartEvenWithNothingPlaying) {
+    FakeDefinitions definitions;
+    definitions.names = {"Halloween Main", "Christmas Main"};
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    // No callback has fired: the coordinator would otherwise hold nothing
+    // until FPP played something, and authoring happens with FPP idle.
+    CHECK(runtime.sweepDefinitions());
+    CHECK_EQ(publisher.published.size(), std::size_t{2});
+    CHECK_EQ(publisher.published[0].playlistName, std::string("Halloween Main"));
+    CHECK_EQ(publisher.published[1].playlistName, std::string("Christmas Main"));
+    CHECK_EQ(publisher.published[0].instanceUuid, std::string(kUuid));
+    CHECK_EQ(publisher.published[0].playlistHash.size(), std::size_t{64});
+    // The complete definition the plugin hashed travels with the hash.
+    CHECK(!publisher.published[0].canonicalDefinition.empty());
+    CHECK(sink.published.empty());
+}
+
+TEST(ARescanIsBoundedToOncePerMinute) {
+    FakeDefinitions definitions;
+    definitions.names = {"Halloween Main"};
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    const TimeMillis start = gNow;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    CHECK(runtime.maybeSweepDefinitions());
+    CHECK_EQ(publisher.published.size(), std::size_t{1});
+
+    gNow = start + 59'999;
+    CHECK(!runtime.maybeSweepDefinitions());
+    CHECK_EQ(publisher.published.size(), std::size_t{1});
+
+    gNow = start + 60'000;
+    CHECK(runtime.maybeSweepDefinitions());
+    CHECK_EQ(publisher.published.size(), std::size_t{2});
+    gNow = start;
+}
+
+TEST(ASweepWithNoInstanceUuidDoesNotStartTheRescanClock) {
+    FakeDefinitions definitions;
+    definitions.names = {"Halloween Main"};
+    definitions.uuid.clear();
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    CHECK(!runtime.maybeSweepDefinitions());
+    CHECK(publisher.published.empty());
+
+    // The UUID appearing later must not have to wait out a minute that
+    // never actually contained a sweep.
+    definitions.uuid = kUuid;
+    CHECK(runtime.maybeSweepDefinitions());
+    CHECK_EQ(publisher.published.size(), std::size_t{1});
+}
+
+TEST(ResolvingAnEntryIdentityAlsoPublishesTheDefinitionBehindItsHash) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 2, "a.fseq", "");
+    CHECK(runtime.drainOnce());
+
+    CHECK_EQ(sink.published.size(), std::size_t{1});
+    CHECK_EQ(publisher.published.size(), std::size_t{1});
+    // The same hash the observation cites, so the definition can never be
+    // filed under one the observation will not match.
+    CHECK_EQ(publisher.published[0].playlistHash, sink.published[0].identity.playlistHash);
+}
+
+TEST(AnUnavailableObservationPublishesNoDefinitionBecauseThereIsNoHash) {
+    FakeDefinitions definitions;
+    definitions.definition.clear();
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 2, "a.fseq", "");
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.unavailable.size(), std::size_t{1});
+    CHECK(publisher.published.empty());
+}
+
+TEST(ADefinitionTheCoordinatorRefusedDoesNotWithholdTheObservation) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    publisher.accept = false;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 2, "a.fseq", "");
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.published.size(), std::size_t{1});
+    CHECK_EQ(runtime.publishedCount(), std::uint64_t{1});
 }

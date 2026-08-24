@@ -1,0 +1,99 @@
+#pragma once
+
+#include <curl/curl.h>
+
+#include <string>
+
+#include "showmesh/http_transport.h"
+
+// The concrete outbound client. It lives beside the adapters rather than
+// in the host-neutral core for one reason: the coordinator URL may be
+// https, and a TLS-capable client means a third-party library, which the
+// core deliberately links none of. libcurl is not a new dependency on an
+// FPP host; fppd links it already.
+//
+// Everything here runs on the resident worker thread.
+
+namespace showmesh {
+namespace adapter {
+
+class CurlHttpTransport : public HttpTransport {
+ public:
+    CurlHttpTransport() {
+        // fppd initializes libcurl for its own use, and a second init is
+        // documented as safe and reference counted. The matching
+        // curl_global_cleanup() is deliberately absent: it is not
+        // reference counted in the same way, and calling it here would
+        // tear libcurl down underneath fppd.
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+    }
+
+    HttpResponse post(const HttpRequest& request) override {
+        HttpResponse response;
+
+        CURL* handle = curl_easy_init();
+        if (handle == nullptr) {
+            response.error = "libcurl could not create a request handle";
+            return response;
+        }
+
+        // Built here and freed below rather than retained, so the
+        // credential does not sit in a long-lived header list.
+        curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, ("Content-Type: " + request.contentType).c_str());
+        std::string authorization = "Authorization: Bearer " + request.bearerToken;
+        headers = curl_slist_append(headers, authorization.c_str());
+        authorization.assign(authorization.size(), '\0');
+
+        std::string body;
+        curl_easy_setopt(handle, CURLOPT_URL, request.url.c_str());
+        curl_easy_setopt(handle, CURLOPT_POST, 1L);
+        curl_easy_setopt(handle, CURLOPT_POSTFIELDS, request.body.c_str());
+        curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, static_cast<long>(request.body.size()));
+        curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, static_cast<long>(request.timeoutMillis));
+        curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(request.timeoutMillis));
+        // The worker owns its own timeouts and retry; libcurl following a
+        // redirect would replay the credential at whatever host answered.
+        curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0L);
+        // fppd is multi threaded and libcurl's DNS timeout uses signals
+        // unless this is set, which is not safe off the main thread.
+        curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, &appendBody);
+        curl_easy_setopt(handle, CURLOPT_WRITEDATA, &body);
+
+        const CURLcode code = curl_easy_perform(handle);
+        if (code == CURLE_OK) {
+            long status = 0;
+            curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &status);
+            response.transportOk = true;
+            response.statusCode = static_cast<int>(status);
+            response.body = std::move(body);
+        } else {
+            // curl's own text, which describes the transport and never
+            // reflects a request header back.
+            response.error = curl_easy_strerror(code);
+        }
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(handle);
+        return response;
+    }
+
+ private:
+    static std::size_t appendBody(char* data, std::size_t size, std::size_t count, void* userdata) {
+        const std::size_t bytes = size * count;
+        std::string* out = static_cast<std::string*>(userdata);
+        // The coordinator's refusal bodies are small; a response that is
+        // not is truncated rather than buffered without bound on a host
+        // running a show.
+        constexpr std::size_t kMaxResponseBytes = 8192;
+        if (out->size() < kMaxResponseBytes) {
+            out->append(data, bytes > kMaxResponseBytes - out->size() ? kMaxResponseBytes - out->size() : bytes);
+        }
+        return bytes;
+    }
+};
+
+}  // namespace adapter
+}  // namespace showmesh

@@ -2,10 +2,11 @@
 
 The ShowMesh runtime that lives on an FPP host.
 
-**Status: the Go macro helper, the host-neutral C++ core, and both FPP
-adapters exist and are built and tested in CI. The identity publisher stops
-short of the coordinator wire contract, which another repository owns.**
-Nothing here has been installed on a real FPP host, and no release, public or
+**Status: the Go macro helper, the host-neutral C++ core, both FPP adapters,
+and the outbound coordinator client exist and are built and tested in CI. The
+client implements the frozen wire contract the coordinator repository owns, and
+has run against fakes only.** Nothing here has been installed on a real FPP
+host, no observation has reached a real coordinator, and no release, public or
 private, has been published.
 
 ## What this plugin does and why it exists
@@ -242,6 +243,43 @@ new `SequenceState` already starts at, so there is nothing further to rewind.
 currently returns, enforcing the same never-goes-backward rule on disk that
 `SequenceState::restore()` already enforces in memory.
 
+**The sending half.** `CoordinatorClient` (`showmesh/coordinator_client.h`) is
+the `ObservationSink` and `DefinitionPublisher` both adapters install. It posts
+a resolved observation to `/api/v1/integrations/fpp/playlist-entry-observations`
+and the complete definition behind its hash to
+`/api/v1/integrations/fpp/playlist-definitions`, both authenticated as a bearer
+token and both guarded coordinator-side by `fpp:observe`. Everything it does
+runs on the resident worker thread.
+
+The base URL comes from `<state-dir>/config.json`, the same file and key the Go
+helper reads. The credential comes from the fixed `/etc/showmesh-fpp-plugin`
+directory and is refused unless the file's mode is exactly 0600. It is never
+logged, never written anywhere, and never reaches the local status record.
+
+Delivery is bounded in both directions: at most five attempts with a doubling
+backoff capped at 30 seconds, and only for a failure that could still succeed
+(no response at all, a 429, or a 5xx). A 400, 401, 403, 409, or 413 is terminal,
+because repeating bytes the coordinator understood and refused only spends the
+show LAN and its audit log. A refused observation acknowledges nothing, so its
+gap evidence rides forward on the next one. Counts for each of those cases, the
+last outcome, and the last error land in `<state-dir>/observation-status.json`,
+so an operator can tell a wrong credential from a missing scope from an
+unreachable coordinator without the coordinator's help.
+
+Definitions are content addressed, so the plugin tracks the hashes it has
+already posted in memory only and a restart simply re-posts. It sweeps every
+playlist definition on the host when the worker starts, which is what lets an
+operator author against a playlist in the afternoon while FPP is idle and has
+played nothing, and re-scans no more often than every 60 seconds after that.
+Resolving an entry identity also publishes the definition behind that hash,
+before the observation citing it.
+
+The concrete HTTP client is not in the host-neutral core. `HttpTransport`
+(`showmesh/http_transport.h`) is an interface the tests fake; the libcurl
+implementation lives in `native/adapters/shared/curl_http_transport.h`, beside
+the adapters, because an https coordinator means a TLS-capable library and the
+core links none.
+
 `ShowMeshRuntime::flushSequenceState()` persists the current value on demand,
 independent of the per-observation write above. It is not called from either
 adapter today; it exists as the seam a future explicit shutdown callback can
@@ -350,12 +388,14 @@ Everything in this repository is developed against bench instances. A unit test,
 a container, and a fake are not a real-host result, and no comment, log line, or
 string here may claim otherwise.
 
-The coordinator ingestion contract for playlist-entry observations is owned by
-the coordinator repository and is not frozen yet. The identity core here derives
-the canonical hash and the entry key, and stops before serializing anything to
-that endpoint: a parallel wire shape invented here and reconciled later would be
-worse than not having one. The entry-key derivation itself is checked against
-that contract's fixtures when they exist.
+The coordinator ingestion contract for playlist-entry observations and playlist
+definitions is owned by the coordinator repository and is mirrored under
+[`docs/upstream/showmesh/docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md`](docs/upstream/showmesh/docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md).
+The sending half described above implements that mirrored contract byte for
+byte; a disagreement is a blocker raised against both repositories, never a
+parallel wire shape invented on one side. It has run against fakes and unit
+tests only. Neither route has been exercised against a real coordinator, and no
+observation has left a real FPP host.
 
 Specifically unproven, and each requires a real FPP host:
 

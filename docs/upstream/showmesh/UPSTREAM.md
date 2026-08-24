@@ -13,6 +13,15 @@ repository's implementation. They are evidence, not working documents.
 | Snapshot date | 2026-08-21 |
 | Snapshot taken by | Repository bootstrap, refreshed during the Go helper extraction |
 
+### Records pinned to a different upstream commit
+
+One record is not yet on upstream `main` and is pinned to the commit that
+carries it. The table above still governs every other file here.
+
+| Upstream path | Pinned commit | Commit date | Note |
+|---|---|---|---|
+| `docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md` | `0f39b1762fe7d80a18d0112826dc0ca117bde2ea` | 2026-08-23 | On the upstream branch that carries the 2026-08-23 owner-ruled correction to sections 2.2, 2.3, and 3.1, open as a pull request. Re-pin to the merge commit when it lands on `main`. |
+
 ## Why copies rather than links
 
 A link follows `main` and drifts. These records carry frozen decisions that this
@@ -54,4 +63,5 @@ inside the documents remain intelligible.
 | `docs/decisions/ADR-043-show-scoped-cues-and-playlist-authority.md` | Show-scoped Cues and explicit playlist authority; the model the identity publisher feeds. |
 | `docs/architecture/RESTING-MODE.md` | The night-session lifecycle this plugin's brightness and observation work serves. |
 | `docs/build/STEP-9-SPEC.md` | The macro execution surface the Go helper calls. |
+| `docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md` | The frozen wire contracts this repository implements byte for byte: playlist-entry observation ingestion, the brightness transition gain, and playlist definition publication. |
 | `docs/build/TRACK-H-cues-and-playlists.md` | The consumer of the atomic playlist-entry identity event. |

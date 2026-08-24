@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "showmesh/brightness.h"
 #include "showmesh/callback_handoff.h"
@@ -31,6 +32,12 @@ extern const char* const kFadeSecondsArgument;
 // MultiSync payload carries.
 extern const char* const kPluginName;
 
+// The floor on how often the worker re-reads every playlist definition on
+// the host looking for one the coordinator does not hold. An operator who
+// edits a playlist and does not play it would otherwise leave the
+// coordinator on the previous revision until the next plugin restart.
+constexpr TimeMillis kDefinitionRescanIntervalMillis = 60000;
+
 // A playlist name arrives from FPP and is interpolated into a file path by
 // the adapters. Anything that could climb out of the playlist directory is
 // refused rather than sanitized, so a deformed name reads as an
@@ -44,13 +51,9 @@ struct CommandOutcome {
 };
 
 // ObservationSink is where a resolved playlist-entry observation goes.
-//
-// The coordinator sink is deliberately absent: the ingestion payload,
-// endpoint, and scope are frozen by the coordinator's own contract, which
-// does not exist yet. A sink invented here would have to be reconciled
-// later against the real one, which is worse than not having it. The
-// worker builds the complete observation and hands it to whatever sink is
-// installed, so adding the real one is one class, not a rewrite.
+// CoordinatorClient (coordinator_client.h) is the shipped implementation;
+// the interface stays here so the runtime can be exercised without a
+// transport and so no HTTP surface reaches the callback boundary.
 class ObservationSink {
  public:
     virtual ~ObservationSink() = default;
@@ -75,6 +78,27 @@ class PlaylistDefinitionSource {
     virtual std::string definitionFor(const std::string& playlistName) = 0;
     // The persistent instance UUID, or an empty string when unavailable.
     virtual std::string instanceUuid() = 0;
+    // Every playlist definition on the host, by name. Empty by default so
+    // a source that cannot enumerate simply publishes nothing at worker
+    // start rather than failing; the FPP adapters list the playlist
+    // directory they already read one file at a time.
+    virtual std::vector<std::string> playlistNames() { return {}; }
+};
+
+// DefinitionPublisher carries the complete playlist definition the plugin
+// hashed, plus its hash, to the coordinator. It is separate from
+// ObservationSink because a definition is not an observation: it carries
+// no sequence, is ordered against nothing, and is content addressed, so a
+// failed publication can never wedge the observation path.
+class DefinitionPublisher {
+ public:
+    virtual ~DefinitionPublisher() = default;
+    // Returns true when the coordinator holds this hash, whether this
+    // call put it there or a previous one did. An implementation is
+    // expected to skip a hash it has already posted successfully.
+    virtual bool publishDefinition(const std::string& instanceUuid, const std::string& playlistName,
+                                   const std::string& playlistHash, const std::string& canonicalDefinition,
+                                   TimeMillis capturedAtMillis) = 0;
 };
 
 // Clock is injected so the whole runtime is testable without waiting.
@@ -121,7 +145,7 @@ class ShowMeshRuntime {
     // the sink. Passing nullptr keeps the previous behavior (always
     // starts at 0, nothing persisted), which existing tests rely on.
     ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
-                    SequenceFileStore* sequenceStore = nullptr);
+                    SequenceFileStore* sequenceStore = nullptr, DefinitionPublisher* definitions_publisher = nullptr);
     ~ShowMeshRuntime();
 
     // Guarded engine access. The returned accessor holds engineMutex_ for
@@ -158,6 +182,19 @@ class ShowMeshRuntime {
     // Drains one pending observation on the caller's thread. The worker
     // loop is this in a loop; tests call it directly.
     bool drainOnce();
+
+    // Publishes every playlist definition on the host, unconditionally.
+    // Runs on the worker thread; returns false when there is nothing to
+    // publish to or the instance UUID is not available yet, in which case
+    // the re-scan clock is not started and the next worker pass tries
+    // again.
+    bool sweepDefinitions();
+
+    // sweepDefinitions() the first time it is reached, and no more often
+    // than kDefinitionRescanIntervalMillis after that. The start-up sweep
+    // is what lets an operator author against a playlist while FPP is
+    // idle and has played nothing.
+    bool maybeSweepDefinitions();
 
     // Persists the current sequence value immediately, independent of
     // drainOnce()'s own per-observation persistence. Every accepted post
@@ -204,6 +241,7 @@ class ShowMeshRuntime {
     ObservationSink* sink_;
     Clock clock_;
     SequenceFileStore* sequenceStore_;
+    DefinitionPublisher* definitionPublisher_;
 
     std::mutex engineMutex_;
     BrightnessEngine engine_;
@@ -219,9 +257,18 @@ class ShowMeshRuntime {
     // true instead of the worker blocking for up to 250ms regardless.
     bool hasWork_ = false;
     std::atomic<bool> running_{false};
+    // True only while workerLoop() is on the stack. It is what lets a
+    // sweep abandon its remaining definitions when stop() is waiting to
+    // join, without making a direct sweepDefinitions() call from a test
+    // (where no worker is running) look like a stop request.
+    std::atomic<bool> workerActive_{false};
 
     // Test seam only; see setTestHookBeforeWait().
     std::function<void()> testHookBeforeWait_;
+
+    // Worker-thread only; see sweepDefinitions().
+    bool sweptOnce_ = false;
+    TimeMillis lastSweepMillis_ = 0;
 
     std::atomic<std::uint64_t> published_{0};
     std::atomic<std::uint64_t> unavailable_{0};

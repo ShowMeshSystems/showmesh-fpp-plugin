@@ -25,6 +25,8 @@ under [`docs/upstream/showmesh/`](docs/upstream/showmesh/UPSTREAM.md). Follow
 that directory's provenance and refresh rules.
 
 - Read RES-018 for changes to the plugin runtime or release shape.
+- Read `docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md` before touching the
+  observation or definition wire shape. It is frozen and byte exact.
 - Read ADR-043 and Track H for playlist-identity work.
 - Treat accepted decisions as frozen implementation inputs. New observed
   evidence may justify an upstream correction; it does not justify silently

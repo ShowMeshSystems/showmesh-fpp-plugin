@@ -58,8 +58,13 @@ bool playlistNameIsPathSafe(const std::string& name) {
 }
 
 ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
-                                 SequenceFileStore* sequenceStore)
-    : definitions_(definitions), sink_(sink), clock_(clock), sequenceStore_(sequenceStore), handoff_(16) {
+                                 SequenceFileStore* sequenceStore, DefinitionPublisher* definitionPublisher)
+    : definitions_(definitions),
+      sink_(sink),
+      clock_(clock),
+      sequenceStore_(sequenceStore),
+      definitionPublisher_(definitionPublisher),
+      handoff_(16) {
     if (definitions_ != nullptr) {
         std::lock_guard<std::mutex> lock(engineMutex_);
         engine_.setInstanceId(definitions_->instanceUuid());
@@ -216,6 +221,17 @@ bool ShowMeshRuntime::drainOnce() {
 
     observation.identity = resolution.identity;
     observation.entryKey = resolution.entryKey;
+    // Before the observation citing it, not after: an observation whose
+    // definition has not arrived is still accepted, but Track H holds the
+    // binding as having no definition until it does. The return value is
+    // deliberately not gated on: a definition the coordinator could not
+    // take is not a reason to withhold the observation, and the next
+    // sweep retries the definition anyway.
+    if (definitionPublisher_ != nullptr) {
+        definitionPublisher_->publishDefinition(resolution.identity.instanceUuid, resolution.identity.playlistName,
+                                                resolution.identity.playlistHash, resolution.canonicalDefinition,
+                                                evidence.observedAtMillis);
+    }
     const bool accepted = sink_ != nullptr && sink_->publish(observation);
     if (accepted) {
         ++published_;
@@ -235,16 +251,59 @@ bool ShowMeshRuntime::flushSequenceState() {
     return sequenceStore_->store(sequence_.current());
 }
 
+bool ShowMeshRuntime::sweepDefinitions() {
+    if (definitions_ == nullptr || definitionPublisher_ == nullptr) return false;
+    const std::string instanceUuid = definitions_->instanceUuid();
+    // Without an instance UUID a definition cannot be filed against an
+    // instance, and FPP reports one only once the host identity is
+    // established. Leaving sweptOnce_ unset means the next worker pass
+    // tries again rather than waiting out the re-scan interval.
+    if (instanceUuid.empty()) return false;
+
+    for (const std::string& playlistName : definitions_->playlistNames()) {
+        // stop() has to be able to join promptly: a sweep of many
+        // definitions against an unreachable coordinator spends its
+        // bounded backoff once per definition.
+        if (workerActive_.load() && !running_.load()) break;
+        if (!playlistNameIsPathSafe(playlistName)) continue;
+        const std::string definition = definitions_->definitionFor(playlistName);
+        // Section and position are not part of the playlist hash, so any
+        // valid pair resolves the same definition hash; the entry key
+        // this also produces is discarded.
+        IdentityResolution resolution =
+            resolveEntryIdentity(instanceUuid, playlistName, definition, std::string(), 0);
+        if (!resolution.ok) continue;
+        definitionPublisher_->publishDefinition(instanceUuid, playlistName, resolution.identity.playlistHash,
+                                                resolution.canonicalDefinition, clock_());
+    }
+
+    lastSweepMillis_ = clock_();
+    sweptOnce_ = true;
+    return true;
+}
+
+bool ShowMeshRuntime::maybeSweepDefinitions() {
+    if (sweptOnce_ && clock_() - lastSweepMillis_ < kDefinitionRescanIntervalMillis) return false;
+    return sweepDefinitions();
+}
+
 void ShowMeshRuntime::workerLoop() {
+    workerActive_.store(true);
     while (running_.load()) {
         while (drainOnce()) {
-            if (!running_.load()) return;
+            if (!running_.load()) {
+                workerActive_.store(false);
+                return;
+            }
         }
+        maybeSweepDefinitions();
+        if (!running_.load()) break;
         if (testHookBeforeWait_) testHookBeforeWait_();
         std::unique_lock<std::mutex> lock(wakeMutex_);
         wake_.wait_for(lock, std::chrono::milliseconds(250), [this] { return hasWork_ || !running_.load(); });
         hasWork_ = false;
     }
+    workerActive_.store(false);
 }
 
 void ShowMeshRuntime::start() {
