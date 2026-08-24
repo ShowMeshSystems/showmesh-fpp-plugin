@@ -12,6 +12,7 @@
 #include "showmesh/brightness.h"
 #include "showmesh/callback_handoff.h"
 #include "showmesh/playlist_identity.h"
+#include "showmesh/sequence_store.h"
 
 // The adapter-facing runtime. Everything here is shared by the FPP 9 and
 // FPP 10 adapters and knows nothing about either one's plugin lifecycle or
@@ -111,7 +112,16 @@ class EngineAccessor {
 // old, already-expired window.
 class ShowMeshRuntime {
  public:
-    ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock);
+    // sequenceStore is optional. When non-null, the constructor restores
+    // the in-memory sequence from sequenceStore->load() (so a restarted
+    // plugin resumes above the highest value it ever issued instead of
+    // wedging every observation behind the coordinator's monotonicity
+    // check), and every drained observation's freshly issued sequence
+    // number is persisted before the observation is handed to the sink.
+    // Passing nullptr keeps the previous behavior (always starts at 0,
+    // nothing persisted), which existing tests rely on.
+    ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
+                    SequenceFileStore* sequenceStore = nullptr);
     ~ShowMeshRuntime();
 
     // Guarded engine access. The returned accessor holds engineMutex_ for
@@ -149,6 +159,15 @@ class ShowMeshRuntime {
     // loop is this in a loop; tests call it directly.
     bool drainOnce();
 
+    // Persists the current sequence value immediately, independent of
+    // drainOnce()'s own per-observation persistence. Every accepted post
+    // already persists its own sequence number, so this is not needed for
+    // that path to be durable; it exists as the seam a future explicit
+    // shutdown callback can call for an extra, cheap guarantee before the
+    // process exits. A no-op returning true when no sequence store is
+    // configured.
+    bool flushSequenceState();
+
     const CallbackHandoff& handoff() const { return handoff_; }
     std::uint64_t publishedCount() const { return published_.load(); }
     std::uint64_t unavailableCount() const { return unavailable_.load(); }
@@ -170,6 +189,7 @@ class ShowMeshRuntime {
     PlaylistDefinitionSource* definitions_;
     ObservationSink* sink_;
     Clock clock_;
+    SequenceFileStore* sequenceStore_;
 
     std::mutex engineMutex_;
     BrightnessEngine engine_;

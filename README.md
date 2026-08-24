@@ -182,6 +182,50 @@ dropped so the newest state survives, and the drop is counted. That count is
 the gap evidence: current-state convergence is the invariant, and a coalesced
 delivery must never read as a complete event history.
 
+**Sequence persistence.** The per-instance monotonic sequence the worker
+stamps on every drained observation (`showmesh/playlist_identity.h`'s
+`SequenceState`) is persisted by `SequenceFileStore`
+(`showmesh/sequence_store.h`) so a restarted plugin resumes above the highest
+value it ever issued, never at 0. The coordinator refuses a repeated sequence,
+so resuming at 0 after every `fppd` restart, which FPP 10's runtime plugin
+load/unload made an ordinary operator action rather than a rare event, would
+wedge every later observation behind a 409 the plugin cannot recover from on
+its own.
+
+Each adapter constructs its store over `resolveSequenceStateDir()`, which
+follows the same precedence and the same two environment variables as the Go
+helper's own state directory
+(`cmd/showmesh-fpp-plugin/config.go`'s `resolveConfigDir`):
+`SHOWMESH_FPP_PLUGIN_CONFIG_DIR`, then `MEDIADIR` with `plugindata/fpp-showmesh`
+appended, then the pinned literal `/home/fpp/media/plugindata/fpp-showmesh`.
+This is deliberately not the credential's fixed `/etc/showmesh-fpp-plugin`
+directory: that path is reserved for the one secret file, and it is
+deliberately not inside this repository's own checkout either, since FPP 10's
+`upgrade_plugin` still runs `git clean -fd` there as an upgrade fallback and
+would delete anything untracked it found.
+
+Every drained observation writes: `SequenceFileStore::store()` is called once
+per accepted item from the callback handoff (identity-resolved or not, sink
+accepted or not), which is the FPP playlist-event rate under the handoff's own
+bounded coalescing, not a fixed tick; there is no per-output-frame write. Each
+write is two files (a primary and a rotated backup, the latter a metadata-only
+rename rather than a data copy) via a temp-file-then-`rename()` sequence with
+an `fsync`, so an unclean shutdown mid-write leaves either the file's previous
+complete contents or its new complete contents, never a torn one, and a
+checksum line catches corruption an atomic rename does not (a bit flip, a hand
+edit, a non-`rename()`-atomic filesystem). `load()` trusts only a file whose
+checksum still validates and returns the higher of the two; a missing,
+unreadable, or corrupt store on both sides returns 0, the same value a brand
+new `SequenceState` already starts at, so there is nothing further to rewind.
+`store()` itself also refuses to persist a value lower than what `load()`
+currently returns, enforcing the same never-goes-backward rule on disk that
+`SequenceState::restore()` already enforces in memory.
+
+`ShowMeshRuntime::flushSequenceState()` persists the current value on demand,
+independent of the per-observation write above. It is not called from either
+adapter today; it exists as the seam a future explicit shutdown callback can
+use for one extra, cheap guarantee before the process exits.
+
 ## The FPP adapters
 
 `native/adapters/` is the only code in this repository that includes an FPP
