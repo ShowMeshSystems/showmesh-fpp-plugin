@@ -58,4 +58,16 @@ bool writeFileAtomically(const std::string& path, const std::string& contents) {
     return true;
 }
 
+bool writeWithBackupRotation(const std::string& primaryPath, const std::string& backupPath,
+                              bool primaryIsCurrentlyValid, const std::string& newContents) {
+    // A rename failure here (for example, a permissions problem) is not
+    // fatal: the old primary is simply left in place to be overwritten by
+    // the write below, the same outcome as never having attempted
+    // rotation at all.
+    if (primaryIsCurrentlyValid) {
+        std::rename(primaryPath.c_str(), backupPath.c_str());
+    }
+    return writeFileAtomically(primaryPath, newContents);
+}
+
 }  // namespace showmesh

@@ -8,12 +8,16 @@ added and rebuilt against its own headers rather than assumed compatible.
 | Major | Tag | Commit | Plugin ABI version declared by the header |
 |---|---|---|---|
 | FPP 9 | `9.5.3` | `7979a4bb0bb9068fea71f3b447e273d5c0ea01e3` | not versioned |
-| FPP 10 | `10.0-beta5` | `741cfc4344bd0d1b913941d507c3a123a8c82e5a` | 6 |
+| FPP 10 | `10.0` | `370e62ed7e8c8318da6ee5b01312b8b75082d952` | 6 |
 
 Source: <https://github.com/FalconChristmas/fpp>
 
-Pinned 2026-08-21. `10.0-beta5` was the latest published FPP 10 beta at
-that time; `9.5.3` was the latest 9.x release.
+Re-pinned 2026-08-24: FPP 10 moved from the `10.0-beta5` pin to the `10.0`
+final release, which is what the fleet runs. `Plugin.h` and `Plugins.h`
+are byte-identical between the two commits, so this re-pin changed no ABI
+assumption the adapter depends on; it was still re-verified against the
+release's own headers rather than assumed compatible, per this file's own
+rule above. `9.5.3` remains the latest 9.x release.
 
 ## What each major needs to compile
 

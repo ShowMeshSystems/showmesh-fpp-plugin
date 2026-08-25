@@ -281,9 +281,28 @@ the adapters, because an https coordinator means a TLS-capable library and the
 core links none.
 
 `ShowMeshRuntime::flushSequenceState()` persists the current value on demand,
-independent of the per-observation write above. It is not called from either
-adapter today; it exists as the seam a future explicit shutdown callback can
-use for one extra, cheap guarantee before the process exits.
+independent of the per-observation write above. Both adapters call it at
+their own teardown point (the FPP 9 destructor; the FPP 10 adapter's
+`shutdown()`), as one extra, cheap guarantee beyond the per-observation write.
+
+**Brightness persistence.** `BrightnessEngine::captureState()`'s full state is
+persisted by `BrightnessFileStore` (`showmesh/brightness_store.h`), using the
+same durability mechanics as the sequence store above and the same directory
+(`resolveSequenceStateDir()`, different filenames) -- a primary and a rotated
+backup file, written via `writeWithBackupRotation` (`showmesh/atomic_write.h`,
+factored out of the sequence store's own `store()` so both share it), with a
+checksum line `load()` trusts before handing anything to the engine.
+
+The safety rule is not the sequence store's: nothing here enforces "never
+regresses." A fresh capture always describes whatever the engine's live state
+actually is, and `store()` writes it unconditionally. The guarantee that a
+restart never comes back brighter than what was already applied lives
+entirely in `BrightnessEngine::restoreFromPersisted()` (`showmesh/brightness.h`),
+which this store merely feeds: it resumes a fade only when the recorded
+timing can be trusted, and otherwise settles at the darker of the recorded
+target and the recorded last-applied value. `ShowMeshRuntime` restores from
+the store on construction and exposes `flushBrightnessState()` alongside
+`flushSequenceState()`; both adapters call it at the same teardown point.
 
 ## The FPP adapters
 

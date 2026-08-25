@@ -58,12 +58,14 @@ bool playlistNameIsPathSafe(const std::string& name) {
 }
 
 ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
-                                 SequenceFileStore* sequenceStore, DefinitionPublisher* definitionPublisher)
+                                 SequenceFileStore* sequenceStore, DefinitionPublisher* definitionPublisher,
+                                 BrightnessFileStore* brightnessStore)
     : definitions_(definitions),
       sink_(sink),
       clock_(clock),
       sequenceStore_(sequenceStore),
       definitionPublisher_(definitionPublisher),
+      brightnessStore_(brightnessStore),
       handoff_(16) {
     if (definitions_ != nullptr) {
         std::lock_guard<std::mutex> lock(engineMutex_);
@@ -78,6 +80,40 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
         const SequenceFileStore::LoadResult loaded = sequenceStore_->loadDetailed();
         sequence_.restore(loaded.value);
         sequenceFilesWereAllInvalidAtStartup_ = loaded.filesPresentButInvalid;
+    }
+    // Restored before start(): nothing else can have touched engine_ yet,
+    // so this needs no lock for correctness, but takes engineMutex_ anyway
+    // to match every other access to engine_ in this class and to keep
+    // TSan happy about the mutex's own initialization-order assumptions.
+    //
+    // Three outcomes, not two: a load that never found any record at all
+    // (loaded.ok=false, loaded.recordExpectedButUnreadable=false) is the
+    // very first run, where the engine's built-in defaults already ARE
+    // what a process with no persisted state starts at, so there is
+    // nothing to restore. Anything else -- a trusted primary
+    // (loaded.trustedAsCurrent), a backup recovered only because the
+    // primary was corrupt, or neither file parsing despite one existing
+    // -- means state was durably written here at some point. Only the
+    // trusted-primary case is handed to restoreFromPersisted; the other
+    // two hand the engine nothing it can vouch for, so it settles dark
+    // rather than risk the backup's superseded numbers or its own bright
+    // defaults being wrong in the brighter direction.
+    if (brightnessStore_ != nullptr) {
+        BrightnessStateLoad loaded = brightnessStore_->load();
+        if (loaded.ok && loaded.trustedAsCurrent) {
+            std::lock_guard<std::mutex> lock(engineMutex_);
+            engine_.restoreFromPersisted(loaded.state, clock_());
+        } else if (loaded.ok) {
+            // Primary unreadable; only the superseded backup parsed.
+            brightnessRestartTrust_ = BrightnessRestartTrust::kPrimaryUnreadableBackupRecovered;
+            std::lock_guard<std::mutex> lock(engineMutex_);
+            engine_.settleDarkAfterUntrustedRestart();
+        } else if (loaded.recordExpectedButUnreadable) {
+            // Neither file parsed, despite one existing.
+            brightnessRestartTrust_ = BrightnessRestartTrust::kNeitherRecordReadable;
+            std::lock_guard<std::mutex> lock(engineMutex_);
+            engine_.settleDarkAfterUntrustedRestart();
+        }
     }
 }
 
@@ -262,6 +298,54 @@ bool ShowMeshRuntime::flushSequenceState() {
     return sequenceStore_->store(sequence_.current());
 }
 
+bool ShowMeshRuntime::flushBrightnessState() {
+    if (brightnessStore_ == nullptr) return true;
+    BrightnessState state;
+    {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        // Nothing changed since the last successful flush: skip the
+        // write rather than rotate an identical record into the backup
+        // slot, which is also what stops an operator command's own
+        // synchronous flush and the next frame's dirty mark from writing
+        // the same state to disk twice.
+        if (brightnessEverFlushed_ && engine_.revision() == flushedBrightnessRevision_) return true;
+        state = engine_.captureState(clock_());
+    }
+    // The store's read, hash, write, two fsyncs, and rename all run here,
+    // with engineMutex_ already released: a slow write against a real SD
+    // card must never hold modifyChannelData (or another flush caller)
+    // waiting on the same mutex for its duration.
+    const bool ok = brightnessStore_->store(state);
+    if (ok) {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        flushedBrightnessRevision_ = state.revision;
+        brightnessEverFlushed_ = true;
+    }
+    return ok;
+}
+
+void ShowMeshRuntime::markBrightnessDirty() {
+    {
+        std::lock_guard<std::mutex> lock(wakeMutex_);
+        brightnessDirty_ = true;
+        hasWork_ = true;
+    }
+    wake_.notify_one();
+}
+
+bool ShowMeshRuntime::flushBrightnessIfDirty() {
+    bool dirty;
+    {
+        std::lock_guard<std::mutex> lock(wakeMutex_);
+        dirty = brightnessDirty_;
+        brightnessDirty_ = false;
+    }
+    if (!dirty) return true;
+    const bool ok = flushBrightnessState();
+    if (!ok && brightnessFlushFailureHandler_) brightnessFlushFailureHandler_();
+    return ok;
+}
+
 bool ShowMeshRuntime::sweepDefinitions() {
     if (definitions_ == nullptr || definitionPublisher_ == nullptr) return false;
     const std::string instanceUuid = definitions_->instanceUuid();
@@ -324,6 +408,9 @@ void ShowMeshRuntime::workerLoop() {
                 return;
             }
         }
+        // Off the frame thread and the command thread: see
+        // markBrightnessDirty() and flushBrightnessState().
+        flushBrightnessIfDirty();
         maybeSweepDefinitions();
         if (!running_.load()) break;
         if (testHookBeforeWait_) testHookBeforeWait_();

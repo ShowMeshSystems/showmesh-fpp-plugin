@@ -112,21 +112,13 @@ bool SequenceFileStore::store(std::uint64_t value) const {
     // in memory, at the on-disk boundary too.
     if (value < load()) return false;
 
-    // Rotate the current primary into the backup slot before it is
-    // overwritten, so a crash during the write below still leaves a
-    // valid, independently checksummed fallback. rename() is a metadata
-    // operation on the same filesystem: no data is copied, so this costs
-    // no extra flash write beyond the primary write itself. A rename
-    // failure (for example, a permissions problem) is not fatal here: the
-    // old primary is simply left in place to be overwritten by the write
-    // below, which is the same outcome as never having attempted
-    // rotation at all.
-    const ParsedRecord existingPrimary = parseRecord(primaryPath_);
-    if (existingPrimary.ok) {
-        std::rename(primaryPath_.c_str(), backupPath_.c_str());
-    }
-
-    return writeFileAtomically(primaryPath_, encodeRecord(value));
+    // Rotates the current primary into the backup slot (skipped when it
+    // does not currently hold a valid record, so an already-invalid
+    // primary never clobbers a still-valid backup) before durably writing
+    // the new value. See writeWithBackupRotation in atomic_write.h, shared
+    // with BrightnessFileStore.
+    const bool primaryCurrentlyValid = parseRecord(primaryPath_).ok;
+    return writeWithBackupRotation(primaryPath_, backupPath_, primaryCurrentlyValid, encodeRecord(value));
 }
 
 }  // namespace showmesh
