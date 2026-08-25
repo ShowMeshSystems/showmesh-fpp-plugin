@@ -137,8 +137,8 @@ jobs:
             ref: "9.5.3"
             commit: 7979a4bb0bb9068fea71f3b447e273d5c0ea01e3
           - major: fpp10
-            ref: "10.0-beta5"
-            commit: 741cfc4344bd0d1b913941d507c3a123a8c82e5a
+            ref: "10.0"
+            commit: 370e62ed7e8c8318da6ee5b01312b8b75082d952
     steps:
       - name: Install the toolchain
         run: |

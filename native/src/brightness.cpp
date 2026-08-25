@@ -395,6 +395,26 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
     } else if (fadeTimingIsTrustworthy(state.ceilingFadeStartMillis, state.ceilingFadeEndMillis, state.persistedAtMillis, now)) {
         ceiling_.restore(clampPercent(state.ceilingStart), clampPercent(state.ceilingTarget), state.ceilingFadeStartMillis,
                          state.ceilingFadeEndMillis);
+        // Trustworthy timing is not an exception to the acceptance
+        // property: an up-fade resumed exactly as recorded can land
+        // above lastAppliedCeiling at the restart moment itself, which is
+        // brighter than anything this host is known to have applied. The
+        // comparison is against lastAppliedCeiling itself here, not the
+        // darker-of-target-and-applied safeCeiling used by the settle
+        // paths above: a legitimately continuing down-fade is already
+        // below lastAppliedCeiling and must not be needlessly clipped to
+        // its own target early. Re-anchor the fade to start now, at
+        // lastAppliedCeiling, and continue toward the same recorded
+        // target and end time, rather than resuming from the recorded
+        // start.
+        const double appliedCeiling = clampPercent(state.lastAppliedCeiling);
+        if (ceiling_.valueAt(now) > appliedCeiling) {
+            if (now < state.ceilingFadeEndMillis) {
+                ceiling_.restore(appliedCeiling, clampPercent(state.ceilingTarget), now, state.ceilingFadeEndMillis);
+            } else {
+                ceiling_.settle(appliedCeiling);
+            }
+        }
     } else {
         ceiling_.settle(safeCeiling);
     }
@@ -407,11 +427,30 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
     } else if (fadeTimingIsTrustworthy(state.gainFadeStartMillis, state.gainFadeEndMillis, state.persistedAtMillis, now)) {
         gain_.restore(clampPercent(state.gainStart), clampPercent(state.gainTarget), state.gainFadeStartMillis,
                       state.gainFadeEndMillis);
+        // Same re-anchoring as the ceiling above, and for the same
+        // reason: trustworthy timing alone does not excuse resuming
+        // brighter than lastAppliedGain, compared directly rather than
+        // against the darker-of-target-and-applied safeGain.
+        const double appliedGain = clampPercent(state.lastAppliedGain);
+        if (gain_.valueAt(now) > appliedGain) {
+            if (now < state.gainFadeEndMillis) {
+                gain_.restore(appliedGain, clampPercent(state.gainTarget), now, state.gainFadeEndMillis);
+            } else {
+                gain_.settle(appliedGain);
+            }
+        }
     } else {
         gain_.settle(safeGain);
     }
 
     return StateAdoption::kAdopted;
+}
+
+void BrightnessEngine::settleDarkAfterUntrustedRestart() {
+    ceiling_.settle(kMinPercent);
+    gain_.settle(kMinPercent);
+    lastAppliedCeiling_ = kMinPercent;
+    lastAppliedGain_ = kMinPercent;
 }
 
 }  // namespace showmesh

@@ -185,6 +185,16 @@ class BrightnessEngine {
     // value than either.
     StateAdoption restoreFromPersisted(const BrightnessState& state, TimeMillis now);
 
+    // Settles both values at their darkest possible level, with no active
+    // fade. Called on a restart that finds persisted brightness state it
+    // cannot trust at all -- neither a valid primary nor a valid backup,
+    // or only a backup whose numbers describe state this host had
+    // already superseded before it stopped (see
+    // BrightnessFileStore::load()'s trustedAsCurrent). The last value
+    // this host actually applied is unknown in that case, so the engine's
+    // ordinarily-bright built-in default is not safe to fall back to.
+    void settleDarkAfterUntrustedRestart();
+
     std::uint64_t revision() const { return revision_; }
 
  private:

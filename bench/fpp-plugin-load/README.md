@@ -27,16 +27,18 @@ The script prints the host architecture and an unconditional emulation notice
 for exactly this reason. **Nothing here speaks to native arm64 or ARMv7
 behaviour on real fleet hardware.**
 
-**The in-container compile duration is not a real-host number.** The final
-runs measured the adapter compile at **28.6 s (FPP 9, 28569 ms)** and
-**46.3 s (FPP 10, 46279 ms)**. Earlier runs of the identical compile, on a
-less loaded machine, took 18.4 s and 19.4 s for FPP 9 and 18.9 s and 20.2 s
-for FPP 10. All of those were measured under emulated x86_64 on an arm64
-host, and the final pair was measured while other emulated bench containers
-were also running. Never quote any of these figures without that caveat, and
-note the stronger point: the same work varied from 18 s to 46 s across runs
-on one machine. That spread, more than the caveat, is why none of these
-numbers is a packaging time estimate or a real-host figure.
+**The in-container compile duration is not a real-host number.** The runs
+against the current pins (FPP 9 `9.5.3`, FPP 10 `10.0`, both re-verified
+2026-08-24 after the FPP 10 re-pin below) measured the adapter compile at
+**26.8 s (FPP 9, 26818 ms)** and **10.4 s (FPP 10, 10396 ms)**. Earlier runs
+against `10.0-beta5` measured 28.6 s (FPP 9, 28569 ms) and 46.3 s (FPP 10,
+46279 ms), and before that 18.4 s / 19.4 s and 18.9 s / 20.2 s on a less
+loaded machine. All of those were measured under emulated x86_64 on an arm64
+host. Never quote any of these figures without that caveat, and note the
+stronger point: the same work has varied from roughly 10 s to 46 s across
+runs on one machine, sometimes with other emulated bench containers also
+running. That spread, more than the caveat, is why none of these numbers is
+a packaging time estimate or a real-host figure.
 
 **No latency, throughput, or per-frame cost claim can be made from this
 bench.** There is no pixel output hardware here, the frame path runs under
@@ -71,7 +73,7 @@ Both FPP versions are built from source at a commit-pinned tree, taken from
 | Major | Tag | Commit | Plugin ABI version declared by the header |
 |---|---|---|---|
 | FPP 9 | `9.5.3` | `7979a4bb0bb9068fea71f3b447e273d5c0ea01e3` | not versioned |
-| FPP 10 | `10.0-beta5` | `741cfc4344bd0d1b913941d507c3a123a8c82e5a` | 6 |
+| FPP 10 | `10.0` | `370e62ed7e8c8318da6ee5b01312b8b75082d952` | 6 |
 
 FPP 9 is the default. FPP 10 is a documented switch, `--major fpp10`. The
 script verifies that the tag it fetched resolves to the pinned commit before
@@ -80,7 +82,16 @@ prints the resolved image reference, and labels a local image ID as a local
 build output rather than presenting it as a digest anyone else can pull.
 
 `git describe --tags` inside the two final containers returned `9.5.3` and
-`10.0-beta5` respectively, matching the pinned commits the script printed.
+`10.0` respectively, matching the pinned commits the script printed.
+
+FPP 10 was re-pinned from `10.0-beta5` to the `10.0` final release on
+2026-08-24, because the release is what the fleet actually runs and API 6's
+dlopen gate checks ABI fingerprint symbols -- precisely the kind of thing
+that can move between a beta and a release, so a beta5 pass is not evidence
+for `10.0`. `Plugin.h` and `Plugins.h` are byte-identical between the two
+pinned commits, but the bench was re-run against `10.0` rather than assumed
+compatible; see the assertion table below for what that run actually
+observed.
 
 ## Layout
 
@@ -238,7 +249,9 @@ Each assertion is named, and each records PASS or FAIL independently. An
 early exit cannot look green: the summary is printed from an `EXIT` trap, and
 recording fewer than eight results is itself counted as a failure.
 
-Observed on the final version of the script:
+Re-observed 2026-08-24 against the current pins (FPP 9 `9.5.3`, FPP 10 `10.0`
+release, after the re-pin from `10.0-beta5` below), with the brightness-state
+persistence and the FPP 10 shutdown-predicate changes in place:
 
 | Assertion | What it actually asserts | FPP 9 | FPP 10 |
 |---|---|---|---|
@@ -246,7 +259,7 @@ Observed on the final version of the script:
 | `A2_command_vocabulary` | The registered command declares `targetPercent` min 0 max 100, and `fadeSeconds` min 0 max 86400 default 0, under those exact key names. | PASS | PASS |
 | `A3_invoke_and_ranges` | An in-range invoke returns 200; out-of-range `targetPercent`, non-integer `targetPercent`, and out-of-range `fadeSeconds` each return 500 carrying the ShowMesh runtime's own refusal text. | PASS | PASS |
 | `A4_channel_output_scaled` | Real channel output on the wire, downstream of `modifyChannelData`: a `0xff` source byte stays `0xff` at ceiling 100 and becomes `0x80` at ceiling 50, computed from the plugin's own integer formula rather than hardcoded. | PASS | PASS |
-| `A5_fade_monotonic_exact_and_immediate` | Over a fade: enough frames sampled to be a measurement, strictly decreasing overall, non-increasing frame to frame, landing on the exact 75 percent value `0xbf`, and `fadeSeconds` 0 stepping straight to the target with no intermediate value. Observed 129 frames on FPP 9 and 133 on FPP 10. | PASS | PASS |
+| `A5_fade_monotonic_exact_and_immediate` | Over a fade: enough frames sampled to be a measurement, strictly decreasing overall, non-increasing frame to frame, landing on the exact 75 percent value `0xbf`, and `fadeSeconds` 0 stepping straight to the target with no intermediate value. Observed 132 frames on FPP 9 and 136 on FPP 10. | PASS | PASS |
 | `A6_clean_teardown` | `fppd` exits after the stop signal with the plugin still resident and writes no crash signature to the log tail taken after that signal; on FPP 10, additionally that a runtime unload returns `loaded:false` **and** withdraws the plugin's registered command, and that a second shutdown with the plugin unloaded is also clean. | PASS | PASS |
 | `A7_no_second_multisync_listener` | Exactly one UDP 32320 socket exists, held by `fppd`, both before and after a restart. | PASS | PASS |
 | `A8_restart_survival` | The command is registered again after a container recreate, and that restart's own log tail carries the load line with no load-failure line. | PASS | PASS |

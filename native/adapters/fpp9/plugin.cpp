@@ -26,6 +26,7 @@
 #include "channel_ranges.h"
 #include "coordinator_delivery.h"
 #include "fpp_definition_source.h"
+#include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
 
 namespace {
@@ -36,13 +37,43 @@ showmesh::TimeMillis nowMillis() {
         .count();
 }
 
+// Reports what the constructor found on disk for brightness state, once,
+// at startup. A silent dark settle is worse than a blackout: it is
+// indistinguishable from a dead output chain and sends an operator
+// debugging the wrong subsystem on show night. See
+// BrightnessEngine::settleDarkAfterUntrustedRestart and
+// ShowMeshRuntime::brightnessRestartTrust().
+void logBrightnessRestartTrust(showmesh::BrightnessRestartTrust trust) {
+    switch (trust) {
+        case showmesh::BrightnessRestartTrust::kTrustedOrNoRecord:
+            return;
+        case showmesh::BrightnessRestartTrust::kPrimaryUnreadableBackupRecovered:
+            LogErr(VB_PLUGIN,
+                   "ShowMesh: the primary brightness record could not be read; only a superseded backup "
+                   "was found. Refusing to trust it, this plugin has deliberately settled at zero "
+                   "brightness rather than risk restoring brighter than what was actually applied. This "
+                   "clears on the next ShowMesh brightness command or an adopted MultiSync full state.\n");
+            return;
+        case showmesh::BrightnessRestartTrust::kNeitherRecordReadable:
+            LogErr(VB_PLUGIN,
+                   "ShowMesh: neither the primary nor the backup brightness record could be read. This "
+                   "plugin has deliberately settled at zero brightness rather than guess what was last "
+                   "applied. This clears on the next ShowMesh brightness command or an adopted MultiSync "
+                   "full state.\n");
+            return;
+    }
+}
+
 class ShowMeshFpp9Plugin : public FPPPlugin {
  public:
     ShowMeshFpp9Plugin()
         : FPPPlugin(showmesh::kPluginName),
           sequenceStore_(showmesh::resolveSequenceStateDir()),
+          brightnessStore_(showmesh::resolveSequenceStateDir()),
           delivery_(nowMillis),
-          runtime_(&definitions_, delivery_.client(), nowMillis, &sequenceStore_, delivery_.client()) {
+          runtime_(&definitions_, delivery_.client(), nowMillis, &sequenceStore_, delivery_.client(),
+                  &brightnessStore_) {
+        logBrightnessRestartTrust(runtime_.brightnessRestartTrust());
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
         showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
@@ -51,6 +82,10 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         // runs this object's destructor, so a listener registered first
         // would leave the global settings registry holding a callback that
         // captures a freed this.
+        runtime_.setBrightnessFlushFailureHandler([] {
+            LogErr(VB_PLUGIN,
+                   "ShowMesh brightness state flush failed; the darker-safe restart guarantee may not hold\n");
+        });
         runtime_.start();
         registerSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName,
                                   [this](const std::string&) {
@@ -74,6 +109,17 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         } catch (...) {
         }
         runtime_.stop();
+        // FPP 9 has no runtime reload, so this only ever runs at process
+        // exit: the only restart this guards is a full fppd restart or
+        // reboot, but the guarantee is the same one the FPP 10 adapter's
+        // unload path makes, and every accepted observation is already
+        // durable on its own (drainOnce() persists its sequence number
+        // immediately), so a missed flush here is not a data-loss risk --
+        // only a lost "extra guarantee" on whatever changed since the last
+        // one. Both are no-ops that cannot throw when unconfigured or
+        // already durable.
+        runtime_.flushSequenceState();
+        runtime_.flushBrightnessState();
         // Withdrawn by NAME, and never deleted, because on FPP 9 this
         // destructor runs after CommandManager has already deleted every
         // registered command: fppd.cpp calls CommandManager::Cleanup()
@@ -116,6 +162,28 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         const std::uint64_t revision = runtime_.brightness()->revision();
         if (revision == publishedRevision_) return;
         publishedRevision_ = revision;
+        // Marked dirty here, on a revision change, not only at teardown.
+        // A revision bumps when a target changes (a command, or an adopted
+        // full state), never per interpolated frame, so this is a rare
+        // mark and not an SD-wear problem: the sequence store already
+        // writes more often than this, once per accepted playlist event.
+        //
+        // Teardown alone was not enough. On FPP 9 there is no unload or
+        // shutdown hook at all, so the only flush was in the destructor,
+        // and an fppd killed by a signal never runs it: setting a ceiling
+        // and then stopping fppd gracefully was observed to persist
+        // nothing, leaving the darker-safe restart guarantee not holding
+        // on the version the deployed fleet runs. Marking dirty on change
+        // makes the guarantee independent of how the process ends. The
+        // persisted record carries the fade window, so one write at the
+        // start of a fade is enough to restore it darker-safely.
+        //
+        // This is markBrightnessDirty(), not a direct flush: this method
+        // runs on FPP's per-frame output thread, and the store's write is
+        // a full read, a SHA-256, two fsyncs, and a rename against an SD
+        // card -- work that must never run inside the frame budget. The
+        // worker thread performs the actual write.
+        runtime_.markBrightnessDirty();
         std::string payload = runtime_.encodeFullState();
         if (payload.empty()) return;
         PluginManager::INSTANCE.multiSyncData(showmesh::kPluginName,
@@ -129,6 +197,10 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // constructor's init-list order, and runtime_'s constructor reads
     // sequenceStore_->load() immediately.
     showmesh::SequenceFileStore sequenceStore_;
+    // Same reasoning and the same directory as sequenceStore_ (see
+    // resolveSequenceStateDir(), sequence_store.h): runtime_'s
+    // constructor reads brightnessStore_->load() immediately too.
+    showmesh::BrightnessFileStore brightnessStore_;
     // Declared before runtime_ for the same reason sequenceStore_ is: the
     // runtime holds pointers into it from construction onward.
     showmesh::adapter::CoordinatorDelivery delivery_;

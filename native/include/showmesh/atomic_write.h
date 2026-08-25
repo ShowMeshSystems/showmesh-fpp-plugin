@@ -22,4 +22,16 @@ bool writeFileAtomically(const std::string& path, const std::string& contents);
 // Joins a directory and a file name with exactly one separator.
 std::string joinPath(const std::string& dir, const std::string& name);
 
+// Rotates any existing, valid primary into the backup slot (a metadata-
+// only rename: no data is copied) and then durably writes newContents to
+// the primary via writeFileAtomically. Shared by every primary/backup
+// store in this repository that validates its own record with a per-file
+// checksum (SequenceFileStore, BrightnessFileStore): rotation is skipped
+// when primaryIsCurrentlyValid is false, so a primary that is already
+// invalid can never clobber a still-valid backup with garbage. The
+// caller determines validity itself, in whatever format its own records
+// use; this function knows nothing about record formats.
+bool writeWithBackupRotation(const std::string& primaryPath, const std::string& backupPath,
+                              bool primaryIsCurrentlyValid, const std::string& newContents);
+
 }  // namespace showmesh

@@ -13,11 +13,14 @@
 #include <vector>
 
 #include "check.h"
+#include "showmesh/brightness_codec.h"
+#include "showmesh/brightness_store.h"
 #include "showmesh/coordinator_client.h"
 #include "showmesh/coordinator_config.h"
 #include "showmesh/http_transport.h"
 #include "showmesh/sequence_store.h"
 
+using showmesh::BrightnessFileStore;
 using showmesh::CommandOutcome;
 using showmesh::CoordinatorClient;
 using showmesh::CredentialSource;
@@ -149,7 +152,8 @@ class TempDir {
     }
     ~TempDir() {
         for (const char* name : {"sequence-state", "sequence-state.bak", "sequence-state.tmp",
-                                 "sequence-state.bak.tmp"}) {
+                                 "sequence-state.bak.tmp", "brightness-state", "brightness-state.bak",
+                                 "brightness-state.tmp", "brightness-state.bak.tmp"}) {
             std::remove((path_ + "/" + name).c_str());
         }
         ::rmdir(path_.c_str());
@@ -802,6 +806,316 @@ TEST(ARuntimeFlagsAllInvalidSequenceFilesAtStartupButNotAGenuineFirstRun) {
     restarted.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "");
     CHECK(restarted.drainOnce());
     CHECK_EQ(secondSink.published[0].sequence, static_cast<std::uint64_t>(1));
+}
+
+TEST(ARuntimeWithNoBrightnessStoreConfiguredStaysAtEngineDefaults) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+    CHECK_EQ(runtime.brightness()->effectivePercentAt(gNow), 100);
+    // No-op, never crashes, when nothing is configured.
+    CHECK(runtime.flushBrightnessState());
+}
+
+// A configured store that has never been written to is the true "first
+// run" case: the engine's own built-in default (100) is correct here,
+// distinct from every other way brightnessStore_->load() can come back
+// without a trusted record.
+TEST(ARuntimeOverAnEmptyBrightnessStoreStaysAtEngineDefaults) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    BrightnessFileStore store(dir.path());
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+    CHECK_EQ(runtime.brightness()->effectivePercentAt(gNow), 100);
+    CHECK(runtime.brightnessRestartTrust() == showmesh::BrightnessRestartTrust::kTrustedOrNoRecord);
+}
+
+// The F1 regression: a corrupted primary record must not fall back to
+// the backup's numbers as if they were current. The backup is, by
+// construction, the state the (now unrecoverable) primary superseded, so
+// trusting it can restore a value brighter than anything this host
+// actually applied after it was written -- exactly what happens below
+// without the fix: ceiling 80 is genuinely applied, an operator dims to
+// 20 which is also genuinely applied, the primary corrupts, and a naive
+// restart would come back at the superseded 80 instead of not brighter
+// than the unknown true last-applied value.
+TEST(ARestartWithACorruptedPrimaryAndAStaleBackupNeverComesBackBrighterThanWhatWasApplied) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    const TimeMillis savedNow = gNow;
+    std::vector<std::uint8_t> frame(4, 0xff);
+
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+
+        CHECK(runtime.applyBrightnessCommand("80", "0").ok);
+        runtime.modifyChannelData(frame.data(), frame.size());  // 80 actually applied to the wall
+        CHECK(runtime.flushBrightnessState());                   // primary: 80
+
+        CHECK(runtime.applyBrightnessCommand("20", "0").ok);
+        runtime.modifyChannelData(frame.data(), frame.size());  // 20 actually applied to the wall
+        CHECK(runtime.flushBrightnessState());  // rotates 80 into the backup slot, primary: 20
+    }
+
+    // The primary (20, the true last-applied value) is now unreadable.
+    // Only the stale backup (80) survives.
+    {
+        std::ofstream corrupt(dir.path() + "/brightness-state", std::ios::trunc);
+        corrupt << "not a valid record";
+    }
+
+    RecordingSink secondSink;
+    BrightnessFileStore secondStore(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore);
+
+    // Never the backup's superseded 80, and never the engine's own
+    // bright built-in default of 100: the true last-applied value (20)
+    // is unrecoverable, so the only safe restart is dark.
+    CHECK_NEAR(restarted.brightness()->ceilingAt(gNow), 0.0, 1e-9);
+    CHECK(restarted.brightness()->ceilingAt(gNow) < 80.0);
+    // The coordinator-visible regression this closes: a dark settle must
+    // not pass silently. The adapter logs on this exact signal at
+    // startup (see plugin.cpp's logBrightnessRestartTrust), so if this
+    // stops being reported, the operator-facing log line stops too.
+    CHECK(restarted.brightnessRestartTrust() ==
+          showmesh::BrightnessRestartTrust::kPrimaryUnreadableBackupRecovered);
+
+    gNow = savedNow;
+}
+
+// The F2 regression: a missing or doubly-corrupt record must not restart
+// at the engine's built-in default of 100, the brightest value in the
+// range, once real state has ever been written. A default is only
+// correct on a true first run (see
+// ARuntimeOverAnEmptyBrightnessStoreStaysAtEngineDefaults).
+TEST(ARestartOverADoublyCorruptRecordNeverComesBackAtTheBrightDefault) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    const TimeMillis savedNow = gNow;
+    std::vector<std::uint8_t> frame(4, 0xff);
+
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+        CHECK(runtime.applyBrightnessCommand("40", "0").ok);
+        runtime.modifyChannelData(frame.data(), frame.size());
+        CHECK(runtime.flushBrightnessState());  // primary: 40, no backup yet
+    }
+
+    {
+        std::ofstream corrupt(dir.path() + "/brightness-state", std::ios::trunc);
+        corrupt << "not a valid record";
+    }
+
+    RecordingSink secondSink;
+    BrightnessFileStore secondStore(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore);
+
+    CHECK_NEAR(restarted.brightness()->ceilingAt(gNow), 0.0, 1e-9);
+    CHECK(restarted.brightness()->ceilingAt(gNow) < 100.0);
+    CHECK(restarted.brightnessRestartTrust() == showmesh::BrightnessRestartTrust::kNeitherRecordReadable);
+
+    gNow = savedNow;
+}
+
+TEST(FlushBrightnessStatePersistsTheCurrentStateEvenWithoutAFrame) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    BrightnessFileStore store(dir.path());
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+
+    CHECK(runtime.applyBrightnessCommand("40", "0").ok);
+    CHECK(runtime.flushBrightnessState());
+
+    showmesh::BrightnessStateLoad loaded = store.load();
+    CHECK(loaded.ok);
+    CHECK_NEAR(loaded.state.ceilingTarget, 40.0, 1e-9);
+}
+
+// The acceptance property this whole feature exists for: a restart mid-
+// fade must never apply channel data brighter than what this host had
+// already applied before the restart. Exercised through the full
+// runtime + on-disk store, not just BrightnessEngine::restoreFromPersisted
+// directly (brightness_test.cpp already covers that in isolation), so
+// this proves the store round-trips a real captured state and the
+// runtime wires restoreFromPersisted to it on construction.
+TEST(ARestartMidFadeNeverComesBackBrighterThanWhatWasApplied) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    const TimeMillis savedNow = gNow;
+
+    const TimeMillis fadeStart = gNow;
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+
+        // Drop to 30 instantly, then start fading back up to 100 over
+        // 100 seconds -- a fade whose target is BRIGHTER than where it
+        // starts, so a bug that resumed at the target instead of the
+        // darker of the two would be visible.
+        CHECK(runtime.applyBrightnessCommand("30", "0").ok);
+        CHECK(runtime.applyBrightnessCommand("100", "100").ok);
+
+        // Halfway through the fade, a frame is actually rendered: this
+        // is the only thing that ever updates lastAppliedCeiling, so it
+        // is the true record of what reached the outputs.
+        gNow = fadeStart + 50'000;
+        std::vector<std::uint8_t> frame(4, 0xff);
+        runtime.modifyChannelData(frame.data(), frame.size());
+        CHECK(runtime.flushBrightnessState());
+        // runtime (and its worker thread) is torn down here, standing in
+        // for the process exiting mid-fade with no further frame ever
+        // rendered or flushed.
+    }
+
+    // The restart's own clock makes the persisted fade window
+    // untrustworthy (before the window even started), the exact
+    // condition BrightnessEngine::restoreFromPersisted refuses to resume
+    // a fade under.
+    gNow = fadeStart - 1;
+    RecordingSink secondSink;
+    BrightnessFileStore secondStore(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore);
+
+    // Halfway through a 30->100 fade is 65: brighter than 30, darker than
+    // 100. The restored ceiling must land there, never at the fade's
+    // brighter target of 100.
+    CHECK_NEAR(restarted.brightness()->ceilingAt(gNow), 65.0, 1e-9);
+    CHECK(restarted.brightness()->ceilingAt(gNow) < 100.0);
+
+    gNow = savedNow;
+}
+
+// The F4 regression: the test above forces fadeTimingIsTrustworthy false
+// so it only exercises the branch where the acceptance property already
+// holds. This covers the branch that actually breaks it -- an ordinary
+// restart with a working clock, mid a trustworthy up-fade -- which
+// SM-214's acceptance sentence does not carve an exception for.
+TEST(ARestartMidATrustedUpFadeNeverComesBackBrighterThanWhatWasApplied) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    const TimeMillis savedNow = gNow;
+
+    const TimeMillis commandTime = gNow;
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+
+        // Settle at 30 and let a frame actually apply it, then start a
+        // 3600s fade up to 100. The command's own flush (brightness_
+        // command.h's run(), simulated here by an explicit flush right
+        // after the command) is what persists the fade window at start,
+        // with lastAppliedCeiling still 30: no frame has rendered the
+        // fade in progress yet.
+        CHECK(runtime.applyBrightnessCommand("30", "0").ok);
+        std::vector<std::uint8_t> frame(4, 0xff);
+        runtime.modifyChannelData(frame.data(), frame.size());
+        CHECK(runtime.applyBrightnessCommand("100", "3600").ok);
+        CHECK(runtime.flushBrightnessState());
+
+        // 10 seconds later, one more frame actually applies ~30.19, then
+        // the process is killed with no further frame or flush -- the
+        // persisted record still says lastAppliedCeiling=30.
+        gNow = commandTime + 10'000;
+        runtime.modifyChannelData(frame.data(), frame.size());
+        CHECK_NEAR(runtime.brightness()->ceilingAt(gNow), 30.19, 0.01);
+    }
+
+    // Restarted 30 minutes after the command, with a sane, forward clock:
+    // fadeTimingIsTrustworthy is true, the branch the test above never
+    // reaches.
+    gNow = commandTime + 1'800'000;
+    RecordingSink secondSink;
+    BrightnessFileStore secondStore(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore);
+
+    // Naively resuming the recorded 30->100 fade from its original start
+    // would land at 65 here (30 minutes is half of the 3600s window).
+    // That is 35 points brighter than the 30 this host is known to have
+    // applied. The restored value must not exceed 30.
+    CHECK_NEAR(restarted.brightness()->ceilingAt(gNow), 30.0, 1e-9);
+    CHECK(restarted.brightness()->ceilingAt(gNow) < 65.0);
+    // A trusted primary is not a dark settle: nothing to report.
+    CHECK(restarted.brightnessRestartTrust() == showmesh::BrightnessRestartTrust::kTrustedOrNoRecord);
+
+    gNow = savedNow;
+}
+
+// The F3 regression: publishFullStateIfChanged() runs on FPP's per-frame
+// output thread, so it must never perform the store's write itself.
+// markBrightnessDirty() is the seam it calls instead: a cheap flag set
+// plus a wakeup, never touching disk. flushBrightnessIfDirty() is what
+// the worker thread calls to actually do the write; exercising it
+// directly here, without starting the worker, makes the separation
+// deterministic instead of racing a background thread.
+TEST(MarkingBrightnessDirtyNeverWritesUntilTheWorkerFlushesIt) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    BrightnessFileStore store(dir.path());
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+
+    CHECK(runtime.applyBrightnessCommand("40", "0").ok);
+    runtime.markBrightnessDirty();
+
+    // The frame path's own call must not have reached disk.
+    CHECK(!store.load().ok);
+
+    // What the worker thread's loop does with a pending dirty mark.
+    CHECK(runtime.flushBrightnessIfDirty());
+    showmesh::BrightnessStateLoad loaded = store.load();
+    CHECK(loaded.ok);
+    CHECK_NEAR(loaded.state.ceilingTarget, 40.0, 1e-9);
+
+    // Nothing pending: a second call is a no-op that still reports
+    // success.
+    CHECK(runtime.flushBrightnessIfDirty());
+}
+
+// The F3 double-write regression: an operator command already flushes
+// synchronously (brightness_command.h's run()), so the very next frame's
+// dirty mark at the same revision must not write the identical record to
+// disk again. store()'s rotation is what makes a redundant write
+// observable: it would push the already-current record into the backup
+// slot a second time, overwriting the genuinely older backup for no
+// reason.
+TEST(ARedundantDirtyMarkAtTheSameRevisionDoesNotRewriteTheFile) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    BrightnessFileStore store(dir.path());
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+
+    CHECK(runtime.applyBrightnessCommand("50", "0").ok);
+    CHECK(runtime.flushBrightnessState());  // primary: 50, no backup yet
+
+    CHECK(runtime.applyBrightnessCommand("80", "0").ok);
+    CHECK(runtime.flushBrightnessState());  // rotates 50 into the backup slot, primary: 80
+
+    // The next frame's dirty mark, at the same revision applyBrightness-
+    // Command("80", "0") already produced and flushBrightnessState()
+    // already persisted above.
+    runtime.markBrightnessDirty();
+    CHECK(runtime.flushBrightnessIfDirty());
+
+    showmesh::BrightnessStateLoad loaded = store.load();
+    CHECK(loaded.ok);
+    CHECK_NEAR(loaded.state.ceilingTarget, 80.0, 1e-9);
+    // The backup must still be the genuinely older 50 record, not 80
+    // rotated into it a second time by the redundant flush.
+    std::ifstream backup(dir.path() + "/brightness-state.bak", std::ios::binary);
+    std::string backupLine;
+    CHECK(static_cast<bool>(std::getline(backup, backupLine)));
+    showmesh::BrightnessStateDecode backupState = showmesh::decodeBrightnessState(backupLine);
+    CHECK(backupState.ok);
+    CHECK_NEAR(backupState.state.ceilingTarget, 50.0, 1e-9);
 }
 
 TEST(TheWorkerPublishesEveryDefinitionOnTheHostAtStartEvenWithNothingPlaying) {

@@ -77,9 +77,9 @@ case "$BENCH_FPP_MAJOR" in
         EXTRA_CXXFLAGS=""
         ;;
     fpp10)
-        FPP_TAG="10.0-beta5"
-        FPP_COMMIT="741cfc4344bd0d1b913941d507c3a123a8c82e5a"
-        FPP_IMAGE="showmesh-bench/fpp:10.0-beta5"
+        FPP_TAG="10.0"
+        FPP_COMMIT="370e62ed7e8c8318da6ee5b01312b8b75082d952"
+        FPP_IMAGE="showmesh-bench/fpp:10.0"
         ADAPTER_TARGET="fpp10"
         SO_NAME="libshowmesh-fpp10.so"
         # dlclose() unmaps nothing for a plugin declaring

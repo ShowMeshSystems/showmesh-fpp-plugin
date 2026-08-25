@@ -398,11 +398,14 @@ TEST(RestartNeverFailsBrighterThanWhatWasApplied) {
     persisted.lastAppliedCeiling = 30;
     persisted.persistedAtMillis = kT0 + 1'000;
 
-    // Trustworthy timing resumes the fade at its real position, which is
-    // still below the target.
+    // Trustworthy timing resumes the fade toward the same target, but not
+    // from a position brighter than lastAppliedCeiling: the recorded
+    // window's own interpolation at this instant (60) exceeds the 30 this
+    // host is known to have applied, so the fade is re-anchored to start
+    // now at 30 instead.
     BrightnessEngine resumed;
     CHECK(resumed.restoreFromPersisted(persisted, kT0 + 50'000) == StateAdoption::kAdopted);
-    CHECK_NEAR(resumed.ceilingAt(kT0 + 50'000), 60.0, 1e-9);
+    CHECK_NEAR(resumed.ceilingAt(kT0 + 50'000), 30.0, 1e-9);
 
     // Untrustworthy timing settles at the darker of the two, never at 90.
     BrightnessEngine settled;

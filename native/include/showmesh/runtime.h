@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "showmesh/brightness.h"
+#include "showmesh/brightness_store.h"
 #include "showmesh/callback_handoff.h"
 #include "showmesh/playlist_identity.h"
 #include "showmesh/sequence_store.h"
@@ -48,6 +49,22 @@ bool playlistNameIsPathSafe(const std::string& name);
 struct CommandOutcome {
     bool ok = false;
     std::string message;
+};
+
+// What the constructor found on disk for brightness state, reported so
+// the adapter can announce a dark settle loudly rather than let it pass
+// silently. kTrustedOrNoRecord covers both a trusted primary (normal
+// restart) and a true first run (nothing ever written): neither is
+// anything an operator needs to hear about. The other two both mean
+// BrightnessEngine::settleDarkAfterUntrustedRestart() ran.
+enum class BrightnessRestartTrust {
+    kTrustedOrNoRecord,
+    // The primary record failed to parse; only a backup -- the state the
+    // primary superseded -- was recoverable, and it was not trusted.
+    kPrimaryUnreadableBackupRecovered,
+    // Neither the primary nor the backup record could be parsed, despite
+    // at least one existing on disk.
+    kNeitherRecordReadable,
 };
 
 // ObservationSink is where a resolved playlist-entry observation goes.
@@ -155,8 +172,16 @@ class ShowMeshRuntime {
     // sequence number is persisted before the observation is handed to
     // the sink. Passing nullptr keeps the previous behavior (always
     // starts at 0, nothing persisted), which existing tests rely on.
+    //
+    // brightnessStore is likewise optional. When non-null and it holds a
+    // checksum-valid record, the constructor calls
+    // BrightnessEngine::restoreFromPersisted with it, under engineMutex_,
+    // before start() ever runs: see brightness_store.h for what that
+    // restores and the darker-only guarantee it makes. Passing nullptr
+    // leaves the engine at its built-in defaults, the previous behavior.
     ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
-                    SequenceFileStore* sequenceStore = nullptr, DefinitionPublisher* definitions_publisher = nullptr);
+                    SequenceFileStore* sequenceStore = nullptr, DefinitionPublisher* definitions_publisher = nullptr,
+                    BrightnessFileStore* brightnessStore = nullptr);
     ~ShowMeshRuntime();
 
     // Guarded engine access. The returned accessor holds engineMutex_ for
@@ -216,6 +241,55 @@ class ShowMeshRuntime {
     // configured.
     bool flushSequenceState();
 
+    // Persists the engine's current full state immediately, unless the
+    // engine's revision has not changed since the last successful flush,
+    // in which case this is a no-op that still returns true. A no-op
+    // returning true when no brightness store is configured. engineMutex_
+    // is held only long enough to read the revision and capture the
+    // state; the store's actual write -- a read, a hash, two fsyncs, and
+    // a rename -- runs with the lock released, so a caller never blocks
+    // modifyChannelData, or another flush caller, for the duration of a
+    // slow write. Safe to call from any thread; callers do not need to
+    // serialize against each other, only against engine_ itself the way
+    // every other engine_ access already does.
+    bool flushBrightnessState();
+
+    // Marks the engine's brightness state as needing to be persisted,
+    // without touching disk itself: sets a flag and wakes the worker
+    // thread, the same handoff observeCallback() already uses. Called
+    // from FPP's per-frame output thread (via the adapters'
+    // publishFullStateIfChanged) so the write flushBrightnessState()
+    // actually does -- a full read, a SHA-256, two fsyncs, a rename --
+    // never runs inside the output thread's frame budget. The worker
+    // thread performs the write; see flushBrightnessIfDirty().
+    void markBrightnessDirty();
+
+    // What the worker thread calls once per loop iteration: flushes if
+    // markBrightnessDirty() was called since the last flush, otherwise a
+    // no-op that returns true. Exposed so a test can drive the dirty-flag
+    // handoff deterministically without starting the worker thread.
+    bool flushBrightnessIfDirty();
+
+    // Invoked from the worker thread when an automatic (dirty-flag
+    // triggered) brightness flush fails. Unset by default, so a caller
+    // that never configures one -- every existing test -- sees no
+    // behavior change. The FPP adapters set this to log through
+    // LogErr, which native/src must never call directly: this is the
+    // seam that lets a host-neutral write report failure through an
+    // FPP-specific channel without including an FPP header here.
+    void setBrightnessFlushFailureHandler(std::function<void()> handler) {
+        brightnessFlushFailureHandler_ = std::move(handler);
+    }
+
+    // Set once, at construction, from what brightnessStore_->load() found
+    // (or from BrightnessFileStore's default when no store is
+    // configured). Read by the adapter constructor right after runtime_
+    // itself finishes constructing, so it can log a settleDarkAfterUntrusted-
+    // Restart() event exactly once, loudly, at startup, rather than let a
+    // full-black restart pass with nothing anywhere saying why. This is
+    // the seam: native/src cannot call LogErr itself.
+    BrightnessRestartTrust brightnessRestartTrust() const { return brightnessRestartTrust_; }
+
     const CallbackHandoff& handoff() const { return handoff_; }
     std::uint64_t publishedCount() const { return published_.load(); }
     std::uint64_t unavailableCount() const { return unavailable_.load(); }
@@ -253,6 +327,9 @@ class ShowMeshRuntime {
     Clock clock_;
     SequenceFileStore* sequenceStore_;
     DefinitionPublisher* definitionPublisher_;
+    BrightnessFileStore* brightnessStore_;
+    // Set once in the constructor; see brightnessRestartTrust().
+    BrightnessRestartTrust brightnessRestartTrust_ = BrightnessRestartTrust::kTrustedOrNoRecord;
 
     std::mutex engineMutex_;
     BrightnessEngine engine_;
@@ -267,6 +344,21 @@ class ShowMeshRuntime {
     // worker starts waiting is not lost: the predicate already sees it
     // true instead of the worker blocking for up to 250ms regardless.
     bool hasWork_ = false;
+    // Guarded by wakeMutex_, same as hasWork_ and for the same reason:
+    // markBrightnessDirty() (any thread) sets it before notifying, and
+    // flushBrightnessIfDirty() (worker thread only) clears it before
+    // deciding whether to flush, so a dirty mark landing between those
+    // two is never lost.
+    bool brightnessDirty_ = false;
+    // See setBrightnessFlushFailureHandler().
+    std::function<void()> brightnessFlushFailureHandler_;
+    // Guarded by engineMutex_; touched only inside flushBrightnessState().
+    // Lets a redundant flush at an unchanged revision -- the operator-
+    // command flush followed by the next frame's now-stale dirty mark --
+    // skip the write instead of rotating an identical record into the
+    // backup slot for nothing.
+    std::uint64_t flushedBrightnessRevision_ = 0;
+    bool brightnessEverFlushed_ = false;
     std::atomic<bool> running_{false};
     // True only while workerLoop() is on the stack. It is what lets a
     // sweep abandon its remaining definitions when stop() is waiting to
