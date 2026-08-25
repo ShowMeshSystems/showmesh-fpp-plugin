@@ -1,0 +1,68 @@
+{
+  "description": "RFC 8785 JSON Canonicalization Scheme (JCS) cases for the FPP plugin coordinator contract, docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md section 1.3. Each case's expectedCanonical and expectedSha256 are frozen contract expectations, generated once from pkg/fppidentity.Canonicalize and HashCanonical and re-checked against the plugin repository's native/src/json.cpp. A consumer runs its own canonicalizer over input and compares byte for byte against expectedCanonical, then hashes those bytes and compares against expectedSha256.",
+  "cases": [
+    {
+      "name": "duplicate-sequence-name-playlist",
+      "description": "A realistic FPP playlist definition with a name, desc, repeat, and a mainPlaylist array where two entries (chorus.fseq) share an identical sequenceName at different positions with different mediaName and duration. This is the duplicate-filename case the entry-key design exists for: sequenceName alone cannot identify an entry.",
+      "input": "{\n  \"name\": \"Main Show\",\n  \"desc\": \"Friday night finale\",\n  \"repeat\": 0,\n  \"mainPlaylist\": [\n    {\"type\": \"both\", \"sequenceName\": \"intro.fseq\", \"mediaName\": \"intro.mp3\", \"enabled\": 1, \"duration\": 12.5},\n    {\"type\": \"both\", \"sequenceName\": \"chorus.fseq\", \"mediaName\": \"chorus.mp3\", \"enabled\": 1, \"duration\": 30},\n    {\"type\": \"both\", \"sequenceName\": \"chorus.fseq\", \"mediaName\": \"chorus_reprise.mp3\", \"enabled\": 1, \"duration\": 28}\n  ]\n}",
+      "expectedCanonical": "{\"desc\":\"Friday night finale\",\"mainPlaylist\":[{\"duration\":12.5,\"enabled\":1,\"mediaName\":\"intro.mp3\",\"sequenceName\":\"intro.fseq\",\"type\":\"both\"},{\"duration\":30,\"enabled\":1,\"mediaName\":\"chorus.mp3\",\"sequenceName\":\"chorus.fseq\",\"type\":\"both\"},{\"duration\":28,\"enabled\":1,\"mediaName\":\"chorus_reprise.mp3\",\"sequenceName\":\"chorus.fseq\",\"type\":\"both\"}],\"name\":\"Main Show\",\"repeat\":0}",
+      "expectedSha256": "b6d7e3692f2dea2246382c5d67bd30365e1213e7f285fc768dbae05d3dd3ecfd"
+    },
+    {
+      "name": "duplicate-sequence-name-playlist-reordered",
+      "description": "The same playlist definition as duplicate-sequence-name-playlist, with the mainPlaylist entries reordered and every object's own members shuffled and re-spaced. The canonical form and hash differ from duplicate-sequence-name-playlist because array element order is significant even though object member order is not.",
+      "input": "{\n  \"mainPlaylist\": [\n    {\"duration\": 28, \"enabled\": 1, \"mediaName\": \"chorus_reprise.mp3\", \"sequenceName\": \"chorus.fseq\", \"type\": \"both\"},\n    {\"enabled\": 1, \"type\": \"both\", \"sequenceName\": \"intro.fseq\", \"mediaName\": \"intro.mp3\", \"duration\": 12.5},\n    {\"mediaName\": \"chorus.mp3\", \"sequenceName\": \"chorus.fseq\", \"duration\": 30, \"enabled\": 1, \"type\": \"both\"}\n  ],\n  \"repeat\": 0,\n  \"desc\": \"Friday night finale\",\n  \"name\": \"Main Show\"\n}",
+      "expectedCanonical": "{\"desc\":\"Friday night finale\",\"mainPlaylist\":[{\"duration\":28,\"enabled\":1,\"mediaName\":\"chorus_reprise.mp3\",\"sequenceName\":\"chorus.fseq\",\"type\":\"both\"},{\"duration\":12.5,\"enabled\":1,\"mediaName\":\"intro.mp3\",\"sequenceName\":\"intro.fseq\",\"type\":\"both\"},{\"duration\":30,\"enabled\":1,\"mediaName\":\"chorus.mp3\",\"sequenceName\":\"chorus.fseq\",\"type\":\"both\"}],\"name\":\"Main Show\",\"repeat\":0}",
+      "expectedSha256": "5f7c2b18ec6139f34da66bbb69fd90c34964d85d49dd4dbbec53cd79f781f227"
+    },
+    {
+      "name": "duplicate-sequence-name-playlist-edited",
+      "description": "The same playlist definition as duplicate-sequence-name-playlist with one field edited: the second chorus.fseq entry's duration changes from 28 to 29. The hash differs from both duplicate-sequence-name-playlist and duplicate-sequence-name-playlist-reordered.",
+      "input": "{\n  \"name\": \"Main Show\",\n  \"desc\": \"Friday night finale\",\n  \"repeat\": 0,\n  \"mainPlaylist\": [\n    {\"type\": \"both\", \"sequenceName\": \"intro.fseq\", \"mediaName\": \"intro.mp3\", \"enabled\": 1, \"duration\": 12.5},\n    {\"type\": \"both\", \"sequenceName\": \"chorus.fseq\", \"mediaName\": \"chorus.mp3\", \"enabled\": 1, \"duration\": 30},\n    {\"type\": \"both\", \"sequenceName\": \"chorus.fseq\", \"mediaName\": \"chorus_reprise.mp3\", \"enabled\": 1, \"duration\": 29}\n  ]\n}",
+      "expectedCanonical": "{\"desc\":\"Friday night finale\",\"mainPlaylist\":[{\"duration\":12.5,\"enabled\":1,\"mediaName\":\"intro.mp3\",\"sequenceName\":\"intro.fseq\",\"type\":\"both\"},{\"duration\":30,\"enabled\":1,\"mediaName\":\"chorus.mp3\",\"sequenceName\":\"chorus.fseq\",\"type\":\"both\"},{\"duration\":29,\"enabled\":1,\"mediaName\":\"chorus_reprise.mp3\",\"sequenceName\":\"chorus.fseq\",\"type\":\"both\"}],\"name\":\"Main Show\",\"repeat\":0}",
+      "expectedSha256": "ab0df5be12159119af8fbadd48ef568ec7c945533c29bc5cf1064de528c7db96"
+    },
+    {
+      "name": "member-name-utf16-vs-utf8-sort",
+      "description": "Two single-character member names, U+E000 (a 3-byte UTF-8 sequence) and U+10000 (a supplementary character encoded as a 4-byte UTF-8 sequence, a UTF-16 surrogate pair). RFC 8785 requires sorting by UTF-16 code unit, under which U+10000's surrogate pair (starting at 0xD800) sorts before U+E000. Raw UTF-8 byte order disagrees and would sort them the other way, so this case fails under a byte-order sort.",
+      "input": "{\"\\ue000\":1,\"\\ud800\\udc00\":2}",
+      "expectedCanonical": "{\"\ud800\udc00\":2,\"\ue000\":1}",
+      "expectedSha256": "9d4cdc71dda603c42f9b21d88d0c2ffc31a76cd1bd461d7359406cf169845f1e"
+    },
+    {
+      "name": "nested-objects-and-arrays",
+      "description": "An object containing an array that itself contains a nested object, exercising recursive canonicalization: the outer object's members sort, the array's element order is preserved, and the nested object's members sort independently.",
+      "input": "{\"b\":[3,2,{\"y\":1,\"x\":2}],\"a\":\"text\"}",
+      "expectedCanonical": "{\"a\":\"text\",\"b\":[3,2,{\"x\":2,\"y\":1}]}",
+      "expectedSha256": "9c8cb9ce4d26f535ba3c0e1b35600f29c08c92f718176c48beb83dafc6883a7d"
+    },
+    {
+      "name": "string-escapes-and-control-character",
+      "description": "A string containing every named JSON escape (quote, backslash, backspace, form feed, newline, carriage return, tab), a solidus (which JCS does not escape on output), and a control character below 0x20 with no named escape (vertical tab, 0x0b), which must render as \\u000b.",
+      "input": "{\"s\":\"a\\\"b\\\\c/d\\b\\f\\n\\r\\t\\u000bZ\"}",
+      "expectedCanonical": "{\"s\":\"a\\\"b\\\\c/d\\b\\f\\n\\r\\t\\u000bZ\"}",
+      "expectedSha256": "f4622129bcb89af53cd0105520bb1cee53457d8487bd9f26548267e8f7f1f313"
+    },
+    {
+      "name": "number-formatting",
+      "description": "ECMAScript Number::toString formatting boundary cases in one array: 0 and -0 both render as 0, an ordinary integer, 1e21 (the boundary where JCS switches to exponential notation), 1e-7 (exponential) and 1e-6 (the boundary where it switches back to plain decimal), and the largest finite float64 (1.7976931348623157e+308), which needs all 17 significant digits to round-trip.",
+      "input": "[0,-0,42,1e21,1e-7,1e-6,1.7976931348623157e+308]",
+      "expectedCanonical": "[0,0,42,1e+21,1e-7,0.000001,1.7976931348623157e+308]",
+      "expectedSha256": "dc24289892aabf188fb5ceae4431175556f5ad004644d1d20f1d06c900a2d5b1"
+    },
+    {
+      "name": "duplicate-member-names",
+      "description": "An object with the member name \"a\" repeated. JCS gives no canonical answer for which duplicate should survive, so this must be rejected rather than silently resolved by keeping the first or last occurrence.",
+      "input": "{\"a\":1,\"a\":2}",
+      "expectError": true,
+      "errorKind": "duplicate-member-name"
+    },
+    {
+      "name": "malformed-json",
+      "description": "Structurally invalid JSON (an unterminated object with no member name). Must be rejected, not repaired.",
+      "input": "{not valid json",
+      "expectError": true,
+      "errorKind": "malformed-json"
+    }
+  ]
+}
