@@ -65,6 +65,14 @@ class ObservationSink {
     // is never silently downgraded to filename identity. Returns true when
     // accepted; see publish().
     virtual bool publishUnavailable(const PlaylistEntryObservation& observation) = 0;
+    // Asks an in-flight publish() or publishUnavailable() to give up its
+    // retry budget and return promptly. A sink with nothing to interrupt
+    // does nothing. ShowMeshRuntime::stop() calls this before joining the
+    // worker thread, because a publish stuck in backoff against an
+    // unreachable coordinator can otherwise hold the join for the retry
+    // policy's full worst case, which FPP 10's shutdown deadline does not
+    // allow.
+    virtual void requestStop() {}
 };
 
 // PlaylistDefinitionSource resolves a playlist's complete definition. The
@@ -99,6 +107,9 @@ class DefinitionPublisher {
     virtual bool publishDefinition(const std::string& instanceUuid, const std::string& playlistName,
                                    const std::string& playlistHash, const std::string& canonicalDefinition,
                                    TimeMillis capturedAtMillis) = 0;
+    // See ObservationSink::requestStop(); the same reasoning applies to a
+    // definition post stuck in backoff during sweepDefinitions().
+    virtual void requestStop() {}
 };
 
 // Clock is injected so the whole runtime is testable without waiting.

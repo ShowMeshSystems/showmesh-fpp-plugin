@@ -227,3 +227,17 @@ TEST(ActionNamesRoundTrip) {
     }
     CHECK(showmesh::playlistActionFromName("something else") == PlaylistAction::kUnknown);
 }
+
+// finding 6: FPP writes "Unknown" (capital U, settings.cpp on both FPP 9
+// and FPP 10) as the SystemUUID default, not "unknown". A guard that only
+// recognized the lowercase spelling let every un-provisioned host's real
+// SystemUUID value through as if it were a real, persistent identity, and
+// every such host would then share the same one.
+TEST(BothCasingsOfFppsUnprovisionedSystemUuidAreRecognized) {
+    CHECK(showmesh::isUnprovisionedInstanceUuid("Unknown"));
+    CHECK(showmesh::isUnprovisionedInstanceUuid("unknown"));
+    CHECK(showmesh::isUnprovisionedInstanceUuid("UNKNOWN"));
+    CHECK(!showmesh::isUnprovisionedInstanceUuid(kUuid));
+    CHECK(!showmesh::isUnprovisionedInstanceUuid(""));
+    CHECK(!showmesh::isUnprovisionedInstanceUuid("unknowns"));
+}

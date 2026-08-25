@@ -3,6 +3,7 @@
 // out of the network and retry path entirely, and gap evidence produced
 // by queue pressure reaches the wire instead of being silently absorbed.
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -38,7 +39,8 @@ void noteWorkThread() {
 // A real sleep, not a recorded one: the point of the test below is that
 // the callback returns promptly while something else is genuinely
 // blocked in backoff.
-void sleepingSleeper(int millis) {
+void sleepingSleeper(int millis, const std::atomic<bool>* stopRequested) {
+    (void)stopRequested;
     noteWorkThread();
     std::this_thread::sleep_for(std::chrono::milliseconds(millis));
 }

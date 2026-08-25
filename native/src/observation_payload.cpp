@@ -76,7 +76,14 @@ PayloadResult buildObservationBody(const PlaylistEntryObservation& observation) 
         if (!observation.identity.playlistName.empty()) {
             addString(&members, "playlistName", observation.identity.playlistName);
             addString(&members, "section", observation.identity.section);
-            addNumber(&members, "position", observation.identity.position);
+            // A negative position is exactly what makes a kNegativePosition
+            // observation unavailable in the first place, and the contract
+            // refuses a negative position on the wire unconditionally
+            // (§1.6 step 7), whether or not `unavailable` is set. So it
+            // travels only when it is a value the coordinator can accept.
+            if (observation.identity.position >= 0) {
+                addNumber(&members, "position", observation.identity.position);
+            }
         }
     } else {
         addString(&members, "playlistName", observation.identity.playlistName);

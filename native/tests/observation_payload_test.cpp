@@ -88,6 +88,29 @@ TEST(TheDefinitionBodyHashesBackToTheHashItDeclares) {
     CHECK(checked);
 }
 
+// finding 2: negative_position is only ever produced when
+// identity.position is itself negative, and the contract's ingestion step
+// 7 refuses a negative position unconditionally, whether or not
+// `unavailable` is set. Putting it on the wire anyway made every
+// negative_position observation an automatic 400.
+TEST(ANegativePositionUnavailableObservationOmitsPositionFromTheWire) {
+    PlaylistEntryObservation observation;
+    observation.identity.instanceUuid = "M4-7840e12f81da4191c0d00fbb6a889314";
+    observation.identity.playlistName = "Halloween";
+    observation.identity.section = "mainPlaylist";
+    observation.identity.position = -1;
+    observation.unavailable = IdentityUnavailable::kNegativePosition;
+    observation.action = PlaylistAction::kPlaying;
+    observation.sequence = 5;
+    observation.observedAtMillis = 1755900000000;
+
+    const PayloadResult payload = buildObservationBody(observation);
+    CHECK(payload.ok);
+    CHECK(contains(payload.body, "\"unavailable\":\"negative_position\""));
+    CHECK(contains(payload.body, "\"playlistName\":\"Halloween\""));
+    CHECK(!contains(payload.body, "\"position\""));
+}
+
 TEST(ADefinitionBodyWithoutAnIdentityFieldIsRefusedRatherThanSentIncomplete) {
     CHECK(!buildDefinitionBody("", "Halloween", std::string(64, 'a'), "{}", 1).ok);
     CHECK(!buildDefinitionBody("M4-7840", "", std::string(64, 'a'), "{}", 1).ok);

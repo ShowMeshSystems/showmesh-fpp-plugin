@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <set>
@@ -33,9 +34,13 @@ struct RetryPolicy {
     int maxBackoffMillis = 30000;
 };
 
-using Sleeper = void (*)(int millis);
+// stopRequested is polled during the sleep, not just before and after it,
+// so a real implementation can wake promptly instead of sleeping out its
+// full argument once a caller asks the retry loop to give up. Never
+// null: postWithRetry always passes its own stop flag.
+using Sleeper = void (*)(int millis, const std::atomic<bool>* stopRequested);
 
-void sleepMillis(int millis);
+void sleepMillis(int millis, const std::atomic<bool>* stopRequested);
 
 // What an operator can see locally without the coordinator's help. A
 // 401, a 403, a schema refusal, and an unreachable coordinator are four
@@ -118,8 +123,18 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
                            const std::string& playlistHash, const std::string& canonicalDefinition,
                            TimeMillis capturedAtMillis) override;
 
+    // Overrides both ObservationSink's and DefinitionPublisher's
+    // requestStop(): one flag, checked by postWithRetry between attempts
+    // and by the sleeper during a backoff wait.
+    void requestStop() override { stopRequested_.store(true, std::memory_order_relaxed); }
+
     CoordinatorStatus status() const;
     bool holdsDefinition(const std::string& instanceUuid, const std::string& playlistHash) const;
+    // True once a definition with this exact content has been refused
+    // for a reason that will not change without a plugin restart (its
+    // own JSON was rejected, or the coordinator refused the hash it
+    // declares). Content addressed, exactly like heldDefinitions_.
+    bool definitionIsRefusedTerminally(const std::string& instanceUuid, const std::string& playlistHash) const;
 
  private:
     struct Outcome {
@@ -147,7 +162,18 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // purpose: the route is content addressed and idempotent, so a
     // restart re-posting costs one request per playlist and nothing else.
     std::set<std::pair<std::string, std::string>> heldDefinitions_;
+    // A definition hash the coordinator has terminally refused (its own
+    // JSON was unusable, or the coordinator rejected the declared hash,
+    // §3.5's definition-hash-mismatch). Neither reason changes on a
+    // retry of the same bytes, so without this a definition that will
+    // never be accepted was re-sent, in full, on every subsequent
+    // callback for its playlist, ahead of the observation it blocked. In
+    // memory only, like heldDefinitions_: a restart is a fresh attempt.
+    std::set<std::pair<std::string, std::string>> refusedDefinitions_;
     std::string lastWrittenStatus_;
+    // Set by requestStop(), read by postWithRetry() and the sleeper. See
+    // requestStop() above.
+    std::atomic<bool> stopRequested_{false};
 };
 
 }  // namespace showmesh

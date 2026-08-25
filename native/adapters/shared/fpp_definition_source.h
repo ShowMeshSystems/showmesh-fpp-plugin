@@ -54,10 +54,13 @@ class FppDefinitionSource : public PlaylistDefinitionSource {
 
     std::string instanceUuid() override {
         const std::string uuid = getSetting("SystemUUID");
-        // FPP reports "unknown" before the identity is established. That is
-        // an absent UUID, not an identity, and treating it as one would
-        // give every un-provisioned host the same entry keys.
-        if (uuid.empty() || uuid == "unknown") return std::string();
+        // FPP reports "Unknown" (capital U in settings.cpp on both FPP 9
+        // and FPP 10) before the identity is established. That is an
+        // absent UUID, not an identity, and treating it as one would give
+        // every un-provisioned host the same entry keys. Compared
+        // case-insensitively so the exact casing FPP happens to write
+        // cannot slip past this guard again.
+        if (uuid.empty() || isUnprovisionedInstanceUuid(uuid)) return std::string();
         return uuid;
     }
 };

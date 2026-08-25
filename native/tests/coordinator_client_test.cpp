@@ -1,6 +1,9 @@
 #include "showmesh/coordinator_client.h"
 
+#include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "check.h"
@@ -28,7 +31,10 @@ TimeMillis testClock() { return gNow; }
 // here rather than in a fake object. Every test that installs it clears
 // it first.
 std::vector<int> gSleeps;
-void recordSleep(int millis) { gSleeps.push_back(millis); }
+void recordSleep(int millis, const std::atomic<bool>* stopRequested) {
+    (void)stopRequested;
+    gSleeps.push_back(millis);
+}
 
 const char* kUuid = "6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44";
 const char* kHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -359,7 +365,16 @@ TEST(ADefinitionHashAlreadyPostedIsNotPostedAgain) {
     CHECK_EQ(client.status().definitionsAlreadyHeld, std::uint64_t{1});
 }
 
-TEST(ADefinitionTheCoordinatorRefusedIsPostedAgainOnTheNextSweep) {
+// finding 3 (item 1): a terminal 400 (definition-hash-mismatch, or any
+// other schema refusal) for a given (instanceUuid, playlistHash) cannot
+// change on a retry of the identical bytes: playlistHash is the hash of
+// the exact canonicalDefinition being posted, so a second call with the
+// same key necessarily carries the same content. Retrying it anyway
+// re-sent, in full, on every subsequent callback for that playlist,
+// ahead of the observation it blocked, for a result that could never
+// change. It must be remembered and skipped, exactly like a held
+// (accepted) definition is.
+TEST(ADefinitionTheCoordinatorRefusedTerminallyIsNotRetriedWithTheSameContent) {
     FakeTransport transport;
     transport.responses.push_back(FakeTransport::refused(400, "definition-hash-mismatch"));
     FakeCredentials credentials;
@@ -370,10 +385,14 @@ TEST(ADefinitionTheCoordinatorRefusedIsPostedAgainOnTheNextSweep) {
     CHECK(!client.publishDefinition(kUuid, "Halloween", kHash, definition, gNow));
     CHECK(!client.holdsDefinition(kUuid, kHash));
 
+    // The coordinator would now accept it, but the plugin never asks
+    // again: the next attempt is answered from the local negative cache,
+    // without a second request.
     transport.responses.clear();
     transport.responses.push_back(FakeTransport::ok());
-    CHECK(client.publishDefinition(kUuid, "Halloween", kHash, definition, gNow));
-    CHECK_EQ(transport.requests.size(), std::size_t{2});
+    CHECK(!client.publishDefinition(kUuid, "Halloween", kHash, definition, gNow));
+    CHECK_EQ(transport.requests.size(), std::size_t{1});
+    CHECK_EQ(client.status().definitionsRefused, std::uint64_t{2});
 }
 
 TEST(ADefinitionOverTheContractBoundIsRefusedLocallyWithoutARequest) {
@@ -409,6 +428,34 @@ TEST(ACredentialThatWillNotLoadIsAVisibleConfigurationFailureNotARetryLoop) {
     // The credential itself never reaches the local record.
     CHECK(!contains(status.configurationError, kToken));
     CHECK(!contains(status.lastError, kToken));
+}
+
+// finding 5: status_.configured was only ever set true in the
+// constructor, and a recorded configurationError was never cleared on a
+// later success. A plugin that started before the credential file
+// existed kept reporting "configured: false" and the stale "credential
+// file does not exist" text forever, even once posts were succeeding.
+TEST(AConfigurationProblemThatClearsIsReflectedOnceAPostSucceeds) {
+    FakeTransport transport;
+    transport.responses.push_back(FakeTransport::unreachable("connection refused"));
+    FakeCredentials credentials;
+    credentials.available = false;
+    gSleeps.clear();
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy());
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK(!client.status().configured);
+    CHECK(contains(client.status().configurationError, "credential file"));
+
+    // The credential file appears; the next post succeeds.
+    credentials.available = true;
+    transport.responses.clear();
+    transport.responses.push_back(FakeTransport::ok());
+    CHECK(client.publish(resolvedObservation()));
+
+    const CoordinatorStatus status = client.status();
+    CHECK(status.configured);
+    CHECK(status.configurationError.empty());
 }
 
 TEST(AClientWithNoCoordinatorUrlRefusesVisiblyRatherThanPosting) {

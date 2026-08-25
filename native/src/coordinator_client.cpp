@@ -32,9 +32,21 @@ void addNumber(std::vector<json::Value::Member>* members, const char* name, doub
 
 }  // namespace
 
-void sleepMillis(int millis) {
-    if (millis <= 0) return;
-    std::this_thread::sleep_for(std::chrono::milliseconds(millis));
+void sleepMillis(int millis, const std::atomic<bool>* stopRequested) {
+    // Slept in small chunks rather than one call so a stop request lands
+    // within kPollMillis rather than at the end of the full backoff.
+    // FPP 10's shutdown predicate gives up after 60 seconds and a single
+    // backoff step can be as large as maxBackoffMillis (30 seconds by
+    // default), so a single uninterruptible sleep_for here is exactly
+    // wide enough to blow through that deadline.
+    constexpr int kPollMillis = 50;
+    int remaining = millis;
+    while (remaining > 0) {
+        if (stopRequested != nullptr && stopRequested->load(std::memory_order_relaxed)) return;
+        const int chunk = remaining < kPollMillis ? remaining : kPollMillis;
+        std::this_thread::sleep_for(std::chrono::milliseconds(chunk));
+        remaining -= chunk;
+    }
 }
 
 std::string renderCoordinatorStatus(const CoordinatorStatus& status) {
@@ -102,6 +114,12 @@ CoordinatorStatus CoordinatorClient::status() const {
 bool CoordinatorClient::holdsDefinition(const std::string& instanceUuid, const std::string& playlistHash) const {
     std::lock_guard<std::mutex> guard(mutex_);
     return heldDefinitions_.count(std::make_pair(instanceUuid, playlistHash)) != 0;
+}
+
+bool CoordinatorClient::definitionIsRefusedTerminally(const std::string& instanceUuid,
+                                                       const std::string& playlistHash) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return refusedDefinitions_.count(std::make_pair(instanceUuid, playlistHash)) != 0;
 }
 
 void CoordinatorClient::publishStatus() {
@@ -175,6 +193,14 @@ bool CoordinatorClient::publishDefinition(const std::string& instanceUuid, const
         ++status_.definitionsAlreadyHeld;
         return true;
     }
+    if (definitionIsRefusedTerminally(instanceUuid, playlistHash)) {
+        // Already known to be unacceptable; spending a request on it again
+        // only adds latency ahead of the observation citing it, for a
+        // result that cannot change until the plugin restarts.
+        std::lock_guard<std::mutex> guard(mutex_);
+        ++status_.definitionsRefused;
+        return false;
+    }
 
     PayloadResult payload =
         buildDefinitionBody(instanceUuid, playlistName, playlistHash, canonicalDefinition, capturedAtMillis);
@@ -204,6 +230,15 @@ bool CoordinatorClient::publishDefinition(const std::string& instanceUuid, const
             heldDefinitions_.insert(std::make_pair(instanceUuid, playlistHash));
         } else {
             ++status_.definitionsRefused;
+            // "schema-refused" (400, including definition-hash-mismatch)
+            // is the coordinator judging this exact content unacceptable;
+            // retrying the identical bytes gets the identical answer. A
+            // stop, an unreachable coordinator, an auth problem, or a 5xx
+            // are all conditions that can differ on the next attempt, so
+            // only the content judgment itself is cached.
+            if (outcome.label == "schema-refused") {
+                refusedDefinitions_.insert(std::make_pair(instanceUuid, playlistHash));
+            }
         }
     }
     publishStatus();
@@ -237,6 +272,15 @@ CoordinatorClient::Outcome CoordinatorClient::postWithRetry(const char* path, co
     std::string configurationError;
 
     for (int attempt = 0; attempt < policy_.maxAttempts; ++attempt) {
+        if (stopRequested_.load(std::memory_order_relaxed)) {
+            // Give up the remaining retry budget rather than spend it: a
+            // caller only asks for this during shutdown, where a prompt
+            // return matters more than one more attempt.
+            outcome.label = "stopped";
+            outcome.error = "stop requested before the retry budget was spent";
+            break;
+        }
+
         std::string token;
         std::string credentialError;
         if (!credentials_->token(&token, &credentialError)) {
@@ -308,7 +352,12 @@ CoordinatorClient::Outcome CoordinatorClient::postWithRetry(const char* path, co
 
         if (attempt + 1 < policy_.maxAttempts) {
             ++retries;
-            sleeper_(backoffMillis);
+            sleeper_(backoffMillis, &stopRequested_);
+            if (stopRequested_.load(std::memory_order_relaxed)) {
+                outcome.label = "stopped";
+                outcome.error = "stop requested during backoff";
+                break;
+            }
             backoffMillis = backoffMillis >= policy_.maxBackoffMillis ? policy_.maxBackoffMillis
                                                                      : backoffMillis * 2;
             if (backoffMillis > policy_.maxBackoffMillis) backoffMillis = policy_.maxBackoffMillis;
@@ -330,6 +379,13 @@ CoordinatorClient::Outcome CoordinatorClient::postWithRetry(const char* path, co
         if (outcome.accepted) {
             status_.lastError.clear();
             status_.lastSuccessAtMillis = clock_();
+            // A successful post proves the client is fully configured
+            // right now. Without this, a plugin that started before the
+            // credential file existed kept reporting "configured: false"
+            // and the stale configuration error text forever, even once
+            // posts were succeeding.
+            status_.configured = true;
+            status_.configurationError.clear();
         } else {
             status_.lastError = outcome.error;
             status_.lastFailureAtMillis = clock_();
