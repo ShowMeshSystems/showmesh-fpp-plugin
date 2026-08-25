@@ -369,7 +369,7 @@ install_plugin() {
     end_ns=$(date +%s%N)
     duration_ms=$(( (end_ns - start_ns) / 1000000 ))
     if [ "${EMULATED:-0}" = "1" ]; then
-        echo "test-plugin-load-fpp: in-container adapter compile took ${duration_ms}ms (measured under x86_64 emulation on host arch $HOST_ARCH, NOT representative of a real host and not a basis for a packaging time estimate)"
+        echo "test-plugin-load-fpp: in-container adapter compile took ${duration_ms}ms (measured under emulation, container image architecture '$IMAGE_ARCH' on host arch '$HOST_ARCH', NOT representative of a real host and not a basis for a packaging time estimate)"
     else
         echo "test-plugin-load-fpp: in-container adapter compile took ${duration_ms}ms"
     fi
