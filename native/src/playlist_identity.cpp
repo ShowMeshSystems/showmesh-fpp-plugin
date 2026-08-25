@@ -1,11 +1,21 @@
 #include "showmesh/playlist_identity.h"
 
+#include <cctype>
 #include <vector>
 
 #include "showmesh/json.h"
 #include "showmesh/sha256.h"
 
 namespace showmesh {
+
+bool isUnprovisionedInstanceUuid(const std::string& value) {
+    static const char* const kUnprovisioned = "unknown";
+    if (value.size() != 7) return false;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(value[i])) != kUnprovisioned[i]) return false;
+    }
+    return true;
+}
 
 const char* playlistActionName(PlaylistAction action) {
     switch (action) {

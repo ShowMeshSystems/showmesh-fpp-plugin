@@ -24,6 +24,7 @@
 #include "brightness_command.h"
 #include "callback_fields.h"
 #include "channel_ranges.h"
+#include "coordinator_delivery.h"
 #include "fpp_definition_source.h"
 #include "showmesh/runtime.h"
 
@@ -40,7 +41,8 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     ShowMeshFpp9Plugin()
         : FPPPlugin(showmesh::kPluginName),
           sequenceStore_(showmesh::resolveSequenceStateDir()),
-          runtime_(&definitions_, nullptr, nowMillis, &sequenceStore_) {
+          delivery_(nowMillis),
+          runtime_(&definitions_, delivery_.client(), nowMillis, &sequenceStore_, delivery_.client()) {
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
         showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
@@ -127,6 +129,9 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // constructor's init-list order, and runtime_'s constructor reads
     // sequenceStore_->load() immediately.
     showmesh::SequenceFileStore sequenceStore_;
+    // Declared before runtime_ for the same reason sequenceStore_ is: the
+    // runtime holds pointers into it from construction onward.
+    showmesh::adapter::CoordinatorDelivery delivery_;
     showmesh::ShowMeshRuntime runtime_;
     Command* command_ = nullptr;
     std::uint64_t publishedRevision_ = 0;

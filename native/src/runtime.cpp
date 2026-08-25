@@ -58,8 +58,13 @@ bool playlistNameIsPathSafe(const std::string& name) {
 }
 
 ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
-                                 SequenceFileStore* sequenceStore)
-    : definitions_(definitions), sink_(sink), clock_(clock), sequenceStore_(sequenceStore), handoff_(16) {
+                                 SequenceFileStore* sequenceStore, DefinitionPublisher* definitionPublisher)
+    : definitions_(definitions),
+      sink_(sink),
+      clock_(clock),
+      sequenceStore_(sequenceStore),
+      definitionPublisher_(definitionPublisher),
+      handoff_(16) {
     if (definitions_ != nullptr) {
         std::lock_guard<std::mutex> lock(engineMutex_);
         engine_.setInstanceId(definitions_->instanceUuid());
@@ -179,12 +184,23 @@ bool ShowMeshRuntime::drainOnce() {
         ++sequencePersistFailures_;
     }
 
+    // Read once and reused by both unavailable paths below, as well as
+    // the resolved path further down: an unavailable observation still
+    // carries whatever instance UUID the plugin actually has. Omitting it
+    // is not "identity partially unknown", it is a different observation
+    // the coordinator refuses outright (buildObservationBody() refuses
+    // any observation with an empty instanceUuid, matching the
+    // coordinator's own step 6 refusal), which is only correct when the
+    // UUID is genuinely unavailable.
+    const std::string instanceUuid = definitions_ == nullptr ? std::string() : definitions_->instanceUuid();
+
     if (evidence.identityFieldTruncated()) {
         // A truncated playlist name or section can share its bounded
         // prefix with a different entry's; reporting it as identity would
         // be confidently wrong, so it is reported unavailable instead and
         // never reaches resolveEntryIdentity.
         observation.unavailable = IdentityUnavailable::kTruncatedIdentityField;
+        observation.identity.instanceUuid = instanceUuid;
         ++unavailable_;
         // An unavailable observation is still an observation the
         // coordinator can acknowledge: only clear the gap on acceptance,
@@ -195,7 +211,6 @@ bool ShowMeshRuntime::drainOnce() {
         return true;
     }
 
-    const std::string instanceUuid = definitions_ == nullptr ? std::string() : definitions_->instanceUuid();
     const std::string definition =
         definitions_ == nullptr ? std::string() : definitions_->definitionFor(evidence.playlistName);
 
@@ -204,6 +219,7 @@ bool ShowMeshRuntime::drainOnce() {
 
     if (!resolution.ok) {
         observation.unavailable = resolution.reason;
+        observation.identity.instanceUuid = instanceUuid;
         observation.identity.playlistName = evidence.playlistName;
         observation.identity.section = evidence.section;
         observation.identity.position = evidence.position;
@@ -216,6 +232,17 @@ bool ShowMeshRuntime::drainOnce() {
 
     observation.identity = resolution.identity;
     observation.entryKey = resolution.entryKey;
+    // Before the observation citing it, not after: an observation whose
+    // definition has not arrived is still accepted, but Track H holds the
+    // binding as having no definition until it does. The return value is
+    // deliberately not gated on: a definition the coordinator could not
+    // take is not a reason to withhold the observation, and the next
+    // sweep retries the definition anyway.
+    if (definitionPublisher_ != nullptr) {
+        definitionPublisher_->publishDefinition(resolution.identity.instanceUuid, resolution.identity.playlistName,
+                                                resolution.identity.playlistHash, resolution.canonicalDefinition,
+                                                evidence.observedAtMillis);
+    }
     const bool accepted = sink_ != nullptr && sink_->publish(observation);
     if (accepted) {
         ++published_;
@@ -235,16 +262,76 @@ bool ShowMeshRuntime::flushSequenceState() {
     return sequenceStore_->store(sequence_.current());
 }
 
+bool ShowMeshRuntime::sweepDefinitions() {
+    if (definitions_ == nullptr || definitionPublisher_ == nullptr) return false;
+    const std::string instanceUuid = definitions_->instanceUuid();
+    // Without an instance UUID a definition cannot be filed against an
+    // instance, and FPP reports one only once the host identity is
+    // established. Leaving sweptOnce_ unset means the next worker pass
+    // tries again rather than waiting out the re-scan interval.
+    if (instanceUuid.empty()) return false;
+
+    bool stopping = false;
+    for (const std::string& playlistName : definitions_->playlistNames()) {
+        // stop() has to be able to join promptly: a sweep of many
+        // definitions against an unreachable coordinator spends its
+        // bounded backoff once per definition.
+        if (workerActive_.load() && !running_.load()) break;
+        if (playlistNameIsPathSafe(playlistName)) {
+            const std::string definition = definitions_->definitionFor(playlistName);
+            // Section and position are not part of the playlist hash, so
+            // any valid pair resolves the same definition hash; the entry
+            // key this also produces is discarded.
+            IdentityResolution resolution =
+                resolveEntryIdentity(instanceUuid, playlistName, definition, std::string(), 0);
+            if (resolution.ok) {
+                definitionPublisher_->publishDefinition(instanceUuid, playlistName, resolution.identity.playlistHash,
+                                                        resolution.canonicalDefinition, clock_());
+            }
+        }
+        // Yield to the observation queue between definitions rather than
+        // only after the whole sweep: against a slow or unreachable
+        // coordinator, one definition can cost the retry policy's full
+        // backoff budget, and the handoff holds only 16 pending events.
+        // A sweep of many playlists that never came back to drainOnce()
+        // let real-time callback events overflow the handoff and
+        // coalesce away underneath it.
+        while (drainOnce()) {
+            if (workerActive_.load() && !running_.load()) {
+                stopping = true;
+                break;
+            }
+        }
+        if (stopping) break;
+    }
+
+    lastSweepMillis_ = clock_();
+    sweptOnce_ = true;
+    return true;
+}
+
+bool ShowMeshRuntime::maybeSweepDefinitions() {
+    if (sweptOnce_ && clock_() - lastSweepMillis_ < kDefinitionRescanIntervalMillis) return false;
+    return sweepDefinitions();
+}
+
 void ShowMeshRuntime::workerLoop() {
+    workerActive_.store(true);
     while (running_.load()) {
         while (drainOnce()) {
-            if (!running_.load()) return;
+            if (!running_.load()) {
+                workerActive_.store(false);
+                return;
+            }
         }
+        maybeSweepDefinitions();
+        if (!running_.load()) break;
         if (testHookBeforeWait_) testHookBeforeWait_();
         std::unique_lock<std::mutex> lock(wakeMutex_);
         wake_.wait_for(lock, std::chrono::milliseconds(250), [this] { return hasWork_ || !running_.load(); });
         hasWork_ = false;
     }
+    workerActive_.store(false);
 }
 
 void ShowMeshRuntime::start() {
@@ -254,6 +341,11 @@ void ShowMeshRuntime::start() {
 
 void ShowMeshRuntime::stop() {
     if (!running_.exchange(false)) return;
+    // A worker stuck inside publish() or publishDefinition(), retrying
+    // against an unreachable coordinator, must be interrupted before the
+    // join below waits on it, not after: the join itself has no timeout.
+    if (sink_ != nullptr) sink_->requestStop();
+    if (definitionPublisher_ != nullptr) definitionPublisher_->requestStop();
     {
         std::lock_guard<std::mutex> lock(wakeMutex_);
         hasWork_ = true;

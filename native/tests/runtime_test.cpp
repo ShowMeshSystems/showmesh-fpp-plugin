@@ -13,12 +13,22 @@
 #include <vector>
 
 #include "check.h"
+#include "showmesh/coordinator_client.h"
+#include "showmesh/coordinator_config.h"
+#include "showmesh/http_transport.h"
 #include "showmesh/sequence_store.h"
 
 using showmesh::CommandOutcome;
+using showmesh::CoordinatorClient;
+using showmesh::CredentialSource;
+using showmesh::DefinitionPublisher;
+using showmesh::HttpRequest;
+using showmesh::HttpResponse;
+using showmesh::HttpTransport;
 using showmesh::ObservationSink;
 using showmesh::PlaylistDefinitionSource;
 using showmesh::PlaylistEntryObservation;
+using showmesh::RetryPolicy;
 using showmesh::SequenceFileStore;
 using showmesh::ShowMeshRuntime;
 using showmesh::StateAdoption;
@@ -40,11 +50,33 @@ class FakeDefinitions : public PlaylistDefinitionSource {
         return definition;
     }
     std::string instanceUuid() override { return uuid; }
+    std::vector<std::string> playlistNames() override { return names; }
 
     std::string definition = kDefinition;
     std::string uuid = kUuid;
     std::string lastRequested;
+    std::vector<std::string> names;
     int definitionCalls = 0;
+};
+
+class RecordingPublisher : public DefinitionPublisher {
+ public:
+    bool publishDefinition(const std::string& instanceUuid, const std::string& playlistName,
+                           const std::string& playlistHash, const std::string& canonicalDefinition,
+                           showmesh::TimeMillis capturedAtMillis) override {
+        published.push_back(Record{instanceUuid, playlistName, playlistHash, canonicalDefinition, capturedAtMillis});
+        return accept;
+    }
+
+    struct Record {
+        std::string instanceUuid;
+        std::string playlistName;
+        std::string playlistHash;
+        std::string canonicalDefinition;
+        showmesh::TimeMillis capturedAtMillis;
+    };
+    std::vector<Record> published;
+    bool accept = true;
 };
 
 class RecordingSink : public ObservationSink {
@@ -62,6 +94,46 @@ class RecordingSink : public ObservationSink {
     std::vector<PlaylistEntryObservation> unavailable;
     bool acceptPublish = true;
     bool acceptUnavailable = true;
+};
+
+// A transport that answers 200 and records what actually reached the
+// wire. Used to run an unavailable observation through the real
+// CoordinatorClient and the real buildObservationBody(), rather than
+// through RecordingSink, which never builds a payload at all and so
+// cannot see a field the payload builder itself would refuse on.
+class RecordingTransport : public HttpTransport {
+ public:
+    HttpResponse post(const HttpRequest& request) override {
+        requests.push_back(request);
+        HttpResponse response;
+        response.transportOk = true;
+        response.statusCode = 200;
+        return response;
+    }
+    std::vector<HttpRequest> requests;
+};
+
+// Always answers "no response at all", exactly what an unreachable
+// coordinator looks like to the transport seam.
+class UnreachableTransport : public HttpTransport {
+ public:
+    HttpResponse post(const HttpRequest& request) override {
+        requests.push_back(request);
+        HttpResponse response;
+        response.transportOk = false;
+        response.error = "connection refused";
+        return response;
+    }
+    std::vector<HttpRequest> requests;
+};
+
+class AlwaysCredentials : public CredentialSource {
+ public:
+    bool token(std::string* out, std::string*) override {
+        *out = "a-test-bearer-token";
+        return true;
+    }
+    void invalidate() override {}
 };
 
 // A scratch directory for the sequence-persistence tests below, created
@@ -232,6 +304,53 @@ TEST(ATruncatedSectionProducesAnUnavailableObservation) {
     CHECK(runtime.drainOnce());
     CHECK_EQ(sink.unavailable.size(), static_cast<std::size_t>(1));
     CHECK(sink.unavailable[0].unavailable == showmesh::IdentityUnavailable::kTruncatedIdentityField);
+}
+
+// finding 1: an unavailable observation was built with no instanceUuid
+// even when the plugin had one, because neither unavailable path in
+// drainOnce() copied it in. buildObservationBody() then refuses any
+// observation with an empty instanceUuid (matching the coordinator's own
+// refusal), so the observation never left the host. RecordingSink cannot
+// see this: it never calls buildObservationBody() at all. Routing through
+// a real CoordinatorClient and a real transport is what makes this class
+// of defect visible again.
+TEST(ATruncatedIdentityObservationReachesTheRealTransportWithItsInstanceUuid) {
+    FakeDefinitions definitions;
+    RecordingTransport transport;
+    AlwaysCredentials credentials;
+    RetryPolicy policy;
+    CoordinatorClient client(&transport, &credentials, "http://coordinator.invalid", testClock, nullptr, nullptr,
+                             policy);
+    ShowMeshRuntime runtime(&definitions, &client, testClock);
+
+    const std::string longName(300, 'a');
+    runtime.observeCallback(longName.c_str(), "start", "mainPlaylist", 0, "", "");
+    CHECK(runtime.drainOnce());
+
+    // A locally refused observation never reaches the transport at all.
+    CHECK_EQ(transport.requests.size(), std::size_t{1});
+    CHECK(transport.requests.front().body.find("\"instanceUuid\":\"" + std::string(kUuid) + "\"") !=
+          std::string::npos);
+    CHECK(transport.requests.front().body.find("\"unavailable\":\"truncated_identity_field\"") != std::string::npos);
+}
+
+TEST(AnUnresolvedIdentityObservationReachesTheRealTransportWithItsInstanceUuid) {
+    FakeDefinitions definitions;
+    definitions.definition = "";
+    RecordingTransport transport;
+    AlwaysCredentials credentials;
+    RetryPolicy policy;
+    CoordinatorClient client(&transport, &credentials, "http://coordinator.invalid", testClock, nullptr, nullptr,
+                             policy);
+    ShowMeshRuntime runtime(&definitions, &client, testClock);
+
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 2, "a.fseq", "song.mp3");
+    CHECK(runtime.drainOnce());
+
+    CHECK_EQ(transport.requests.size(), std::size_t{1});
+    CHECK(transport.requests.front().body.find("\"instanceUuid\":\"" + std::string(kUuid) + "\"") !=
+          std::string::npos);
+    CHECK(transport.requests.front().body.find("\"unavailable\":\"missing_definition\"") != std::string::npos);
 }
 
 // The gap belongs to whoever accepts it. A REJECTED delivery, of either
@@ -683,4 +802,175 @@ TEST(ARuntimeFlagsAllInvalidSequenceFilesAtStartupButNotAGenuineFirstRun) {
     restarted.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "");
     CHECK(restarted.drainOnce());
     CHECK_EQ(secondSink.published[0].sequence, static_cast<std::uint64_t>(1));
+}
+
+TEST(TheWorkerPublishesEveryDefinitionOnTheHostAtStartEvenWithNothingPlaying) {
+    FakeDefinitions definitions;
+    definitions.names = {"Halloween Main", "Christmas Main"};
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    // No callback has fired: the coordinator would otherwise hold nothing
+    // until FPP played something, and authoring happens with FPP idle.
+    CHECK(runtime.sweepDefinitions());
+    CHECK_EQ(publisher.published.size(), std::size_t{2});
+    CHECK_EQ(publisher.published[0].playlistName, std::string("Halloween Main"));
+    CHECK_EQ(publisher.published[1].playlistName, std::string("Christmas Main"));
+    CHECK_EQ(publisher.published[0].instanceUuid, std::string(kUuid));
+    CHECK_EQ(publisher.published[0].playlistHash.size(), std::size_t{64});
+    // The complete definition the plugin hashed travels with the hash.
+    CHECK(!publisher.published[0].canonicalDefinition.empty());
+    CHECK(sink.published.empty());
+}
+
+// finding 3 (item 2): sweepDefinitions() never returned to the
+// observation queue between definitions. Against a slow coordinator this
+// let up to 5 attempts x 10 seconds of backoff pass per playlist while
+// drainOnce() was never called, and the handoff holds only 16 pending
+// events: real-time callbacks arriving during a many-playlist sweep would
+// overflow it and coalesce away before the sweep ever got back to them.
+// Queuing more events than the sweep's own playlist count, before the
+// sweep starts, and checking they all drained by the time it returns
+// (rather than only when a later drainOnce() call is made) is what
+// distinguishes yielding between definitions from a lucky ordering.
+TEST(ASweepDrainsPendingObservationsBetweenDefinitionsRatherThanAfterAll) {
+    FakeDefinitions definitions;
+    definitions.names = {"Halloween Main", "Christmas Main", "Fourth of July"};
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    for (int i = 0; i < 5; ++i) {
+        runtime.observeCallback("Main Show", "playing", "mainPlaylist", i, "a.fseq", "");
+    }
+    CHECK_EQ(runtime.handoff().pending(), std::size_t{5});
+
+    CHECK(runtime.sweepDefinitions());
+    // 3 from the sweep itself, plus one per drained observation that
+    // resolved identity (5): RecordingPublisher records every call, with
+    // no held-definition cache of its own.
+    CHECK_EQ(publisher.published.size(), std::size_t{8});
+    // Drained during the sweep, not left behind for a caller to notice
+    // only after it returns.
+    CHECK_EQ(runtime.handoff().pending(), std::size_t{0});
+    CHECK_EQ(sink.published.size(), std::size_t{5});
+}
+
+TEST(ARescanIsBoundedToOncePerMinute) {
+    FakeDefinitions definitions;
+    definitions.names = {"Halloween Main"};
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    const TimeMillis start = gNow;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    CHECK(runtime.maybeSweepDefinitions());
+    CHECK_EQ(publisher.published.size(), std::size_t{1});
+
+    gNow = start + 59'999;
+    CHECK(!runtime.maybeSweepDefinitions());
+    CHECK_EQ(publisher.published.size(), std::size_t{1});
+
+    gNow = start + 60'000;
+    CHECK(runtime.maybeSweepDefinitions());
+    CHECK_EQ(publisher.published.size(), std::size_t{2});
+    gNow = start;
+}
+
+TEST(ASweepWithNoInstanceUuidDoesNotStartTheRescanClock) {
+    FakeDefinitions definitions;
+    definitions.names = {"Halloween Main"};
+    definitions.uuid.clear();
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    CHECK(!runtime.maybeSweepDefinitions());
+    CHECK(publisher.published.empty());
+
+    // The UUID appearing later must not have to wait out a minute that
+    // never actually contained a sweep.
+    definitions.uuid = kUuid;
+    CHECK(runtime.maybeSweepDefinitions());
+    CHECK_EQ(publisher.published.size(), std::size_t{1});
+}
+
+TEST(ResolvingAnEntryIdentityAlsoPublishesTheDefinitionBehindItsHash) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 2, "a.fseq", "");
+    CHECK(runtime.drainOnce());
+
+    CHECK_EQ(sink.published.size(), std::size_t{1});
+    CHECK_EQ(publisher.published.size(), std::size_t{1});
+    // The same hash the observation cites, so the definition can never be
+    // filed under one the observation will not match.
+    CHECK_EQ(publisher.published[0].playlistHash, sink.published[0].identity.playlistHash);
+}
+
+TEST(AnUnavailableObservationPublishesNoDefinitionBecauseThereIsNoHash) {
+    FakeDefinitions definitions;
+    definitions.definition.clear();
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 2, "a.fseq", "");
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.unavailable.size(), std::size_t{1});
+    CHECK(publisher.published.empty());
+}
+
+TEST(ADefinitionTheCoordinatorRefusedDoesNotWithholdTheObservation) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    RecordingPublisher publisher;
+    publisher.accept = false;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, &publisher);
+
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 2, "a.fseq", "");
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.published.size(), std::size_t{1});
+    CHECK_EQ(runtime.publishedCount(), std::uint64_t{1});
+}
+
+// finding 4: postWithRetry() slept with a plain, uninterruptible
+// sleeper_(backoffMillis) and never checked a stop flag between attempts.
+// A worker stuck retrying publish() against an unreachable coordinator
+// could hold ShowMeshRuntime::stop()'s join for the full retry budget
+// (default policy: up to roughly 57 seconds). FPP 10's shutdown
+// predicate gives up after 60 seconds, so stop() has to return in a small
+// fraction of that even mid-backoff. This uses the real (default)
+// sleeper, not a recording one, and the real default RetryPolicy, so the
+// bound below is only meaningful because it is not mocked away.
+TEST(StopReturnsPromptlyEvenWhileAPublishIsRetryingAgainstAnUnreachableCoordinator) {
+    FakeDefinitions definitions;
+    UnreachableTransport transport;
+    AlwaysCredentials credentials;
+    CoordinatorClient client(&transport, &credentials, "http://coordinator.invalid", testClock);
+    ShowMeshRuntime runtime(&definitions, &client, testClock);
+
+    runtime.start();
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 2, "a.fseq", "song.mp3");
+
+    // Give the worker time to pick the event up and land inside its
+    // first backoff wait, so stop() below has to interrupt an in-flight
+    // retry rather than merely beating the worker to it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    const auto begin = std::chrono::steady_clock::now();
+    runtime.stop();
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    const auto elapsedMillis = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+
+    // Well under FPP 10's 60 second shutdown deadline, and nowhere near
+    // the uninterrupted worst case of roughly 57 seconds.
+    CHECK(elapsedMillis < 5000);
+    // The worker really did attempt delivery and really was retrying,
+    // rather than the bound being trivially satisfied by nothing running.
+    CHECK(!transport.requests.empty());
 }

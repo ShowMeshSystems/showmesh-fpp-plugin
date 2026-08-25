@@ -33,6 +33,14 @@ enum class IdentityUnavailable {
 
 const char* identityUnavailableReason(IdentityUnavailable reason);
 
+// True for FPP's own default SystemUUID value, "Unknown" on both FPP 9
+// and FPP 10, meaning the host's identity has not been established yet.
+// Compared case-insensitively (ASCII only, which is all FPP ever writes
+// here) rather than against one exact spelling: an instance UUID this
+// function fails to recognize as unprovisioned is treated as real, and a
+// real host's UUID must never collide with an unprovisioned one's.
+bool isUnprovisionedInstanceUuid(const std::string& value);
+
 // The observation schema is versioned independently of the plugin release.
 constexpr int kObservationSchemaVersion = 1;
 
