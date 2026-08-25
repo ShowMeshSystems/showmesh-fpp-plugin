@@ -57,11 +57,22 @@ bool playlistNameIsPathSafe(const std::string& name) {
     return true;
 }
 
-ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock)
-    : definitions_(definitions), sink_(sink), clock_(clock), handoff_(16) {
+ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
+                                 SequenceFileStore* sequenceStore)
+    : definitions_(definitions), sink_(sink), clock_(clock), sequenceStore_(sequenceStore), handoff_(16) {
     if (definitions_ != nullptr) {
         std::lock_guard<std::mutex> lock(engineMutex_);
         engine_.setInstanceId(definitions_->instanceUuid());
+    }
+    // Resuming above the highest value ever issued, not above the highest
+    // value ever acknowledged: sequence_.restore() only moves forward, so
+    // this can never rewind a value this same process already holds
+    // higher in memory, and it is exactly what turns a plugin restart
+    // from a permanent 409 wedge into an ordinary resumption.
+    if (sequenceStore_ != nullptr) {
+        const SequenceFileStore::LoadResult loaded = sequenceStore_->loadDetailed();
+        sequence_.restore(loaded.value);
+        sequenceFilesWereAllInvalidAtStartup_ = loaded.filesPresentButInvalid;
     }
 }
 
@@ -156,6 +167,17 @@ bool ShowMeshRuntime::drainOnce() {
     observation.observedAtMillis = evidence.observedAtMillis;
     observation.sequence = sequence_.next();
     observation.coalescedSincePreviousAcknowledged = unacknowledgedCoalesced_;
+    // Persisted for every drained event, whether or not identity
+    // resolves and whether or not the sink ultimately accepts it: the
+    // number was already minted and must never be reissued after a
+    // restart, so it has to be durable before this function returns
+    // rather than only once a publish succeeds. The observation still
+    // publishes below on failure; the number is already minted and
+    // dropping the observation would lose data, so a failed store()
+    // is only counted, never treated as a reason to stop.
+    if (sequenceStore_ != nullptr && !sequenceStore_->store(observation.sequence)) {
+        ++sequencePersistFailures_;
+    }
 
     if (evidence.identityFieldTruncated()) {
         // A truncated playlist name or section can share its bounded
@@ -200,6 +222,17 @@ bool ShowMeshRuntime::drainOnce() {
         unacknowledgedCoalesced_ = 0;
     }
     return true;
+}
+
+// sequence_ is otherwise only touched from the worker thread (inside
+// drainOnce()), so a caller invoking this from another thread while the
+// worker is still running would race it. Callers must stop() (which
+// joins the worker) before calling this from outside the worker thread,
+// the same precondition drainOnce() itself already documents for direct
+// test use.
+bool ShowMeshRuntime::flushSequenceState() {
+    if (sequenceStore_ == nullptr) return true;
+    return sequenceStore_->store(sequence_.current());
 }
 
 void ShowMeshRuntime::workerLoop() {

@@ -2,17 +2,24 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <mutex>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "check.h"
+#include "showmesh/sequence_store.h"
 
 using showmesh::CommandOutcome;
 using showmesh::ObservationSink;
 using showmesh::PlaylistDefinitionSource;
 using showmesh::PlaylistEntryObservation;
+using showmesh::SequenceFileStore;
 using showmesh::ShowMeshRuntime;
 using showmesh::StateAdoption;
 using showmesh::TimeMillis;
@@ -55,6 +62,30 @@ class RecordingSink : public ObservationSink {
     std::vector<PlaylistEntryObservation> unavailable;
     bool acceptPublish = true;
     bool acceptUnavailable = true;
+};
+
+// A scratch directory for the sequence-persistence tests below, created
+// with mkdtemp so parallel test runs never collide and removed on scope
+// exit.
+class TempDir {
+ public:
+    TempDir() {
+        char buffer[] = "/tmp/showmesh-runtime-test-XXXXXX";
+        const char* made = ::mkdtemp(buffer);
+        CHECK(made != nullptr);
+        path_ = made != nullptr ? std::string(made) : std::string();
+    }
+    ~TempDir() {
+        for (const char* name : {"sequence-state", "sequence-state.bak", "sequence-state.tmp",
+                                 "sequence-state.bak.tmp"}) {
+            std::remove((path_ + "/" + name).c_str());
+        }
+        ::rmdir(path_.c_str());
+    }
+    const std::string& path() const { return path_; }
+
+ private:
+    std::string path_;
 };
 
 }  // namespace
@@ -436,4 +467,220 @@ TEST(APlaylistNameThatCouldEscapeItsDirectoryIsRefused) {
             ::showmesh_test::reportFailure(__FILE__, __LINE__, std::string("accepted an unsafe name: ") + unsafe);
         }
     }
+}
+
+// A restarted plugin resuming from 0 is the exact wedge SM-213 exists to
+// close: the coordinator refuses any sequence it has already seen, so a
+// second process that starts back at 1 is refused forever. This proves
+// the fix at the runtime boundary: a second ShowMeshRuntime, backed by
+// the same on-disk store, issues sequence numbers strictly above the
+// first runtime's, without either runtime ever reaching a coordinator.
+TEST(ARestartedRuntimeResumesAboveThePersistedSequence) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+
+    {
+        SequenceFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, &store);
+        for (int i = 0; i < 3; ++i) {
+            runtime.observeCallback("Main Show", "playing", "mainPlaylist", i, "a.fseq", "");
+            CHECK(runtime.drainOnce());
+        }
+    }
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(3));
+    CHECK_EQ(sink.published.back().sequence, static_cast<std::uint64_t>(3));
+
+    // A fresh runtime, as a restarted fppd would construct, over the same
+    // directory.
+    RecordingSink secondSink;
+    SequenceFileStore secondStore(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, &secondStore);
+    restarted.observeCallback("Main Show", "playing", "mainPlaylist", 3, "a.fseq", "");
+    CHECK(restarted.drainOnce());
+
+    CHECK_EQ(secondSink.published.size(), static_cast<std::size_t>(1));
+    CHECK(secondSink.published[0].sequence > static_cast<std::uint64_t>(3));
+    CHECK_EQ(secondSink.published[0].sequence, static_cast<std::uint64_t>(4));
+}
+
+// A runtime with no configured sequence store keeps the previous
+// behavior exactly: always starts at 0, and drainOnce() does not touch
+// the filesystem at all.
+TEST(ARuntimeWithNoSequenceStoreConfiguredStillStartsAtZero) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "");
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.published[0].sequence, static_cast<std::uint64_t>(1));
+    // No-op, never crashes, when nothing is configured.
+    CHECK(runtime.flushSequenceState());
+}
+
+// drainOnce() already persists its own sequence number, so a flush right
+// after one, with nothing else in between, cannot tell flushSequenceState()
+// apart from a no-op that just returns true: load() == 1 either way. This
+// reaches a state where the in-memory sequence is genuinely ahead of what
+// is durable (drainOnce()'s own store() call fails, because the directory
+// component is a plain file, not a directory, so mkdir() cannot create it
+// no matter the caller's privilege), then makes the directory writable and
+// flushes, so only a flush that actually calls through to store() can make
+// this pass.
+TEST(FlushSequenceStatePersistsAValueThatDrainOnceFailedToPersist) {
+    char fileTemplate[] = "/tmp/showmesh-runtime-flush-test-XXXXXX";
+    const int fd = ::mkstemp(fileTemplate);
+    CHECK(fd >= 0);
+    if (fd >= 0) ::close(fd);
+    // The store's directory itself is the blocking file (not a subpath
+    // beneath it), so replacing the file with a directory at the exact
+    // same path is enough to make every path this store already computed
+    // valid again.
+    const std::string dirPath = fileTemplate;
+
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    SequenceFileStore store(dirPath);
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, &store);
+
+    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "");
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(sink.published[0].sequence, static_cast<std::uint64_t>(1));
+    // The observation still published; nothing landed on disk.
+    CHECK_EQ(store.load(), static_cast<std::uint64_t>(0));
+    CHECK_EQ(runtime.sequencePersistFailureCount(), static_cast<std::uint64_t>(1));
+
+    // Replace the blocking file with a real directory so the store this
+    // runtime already holds a pointer into can finally be written.
+    CHECK_EQ(std::remove(fileTemplate), 0);
+    CHECK_EQ(::mkdir(fileTemplate, 0755), 0);
+
+    CHECK(runtime.flushSequenceState());
+    CHECK_EQ(store.load(), static_cast<std::uint64_t>(1));
+
+    std::remove((dirPath + "/sequence-state").c_str());
+    std::remove((dirPath + "/sequence-state.bak").c_str());
+    ::rmdir(fileTemplate);
+}
+
+// The exact repro from the F1 finding: a state directory that does not
+// exist yet, the shape resolveSequenceStateDir() hands a fresh
+// SequenceFileStore on a default host nothing has provisioned. Before the
+// fix, every store() call inside drainOnce() failed silently and a
+// restarted runtime always resumed at 1 no matter how many observations
+// the first process had already issued.
+TEST(ARuntimeCreatesAMissingSequenceStateDirectoryAndPersistsThroughARestart) {
+    TempDir dir;
+    const std::string missing = dir.path() + "/state";
+
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    {
+        SequenceFileStore store(missing);
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, &store);
+        for (int i = 0; i < 3; ++i) {
+            runtime.observeCallback("Main Show", "playing", "mainPlaylist", i, "a.fseq", "");
+            CHECK(runtime.drainOnce());
+        }
+        CHECK_EQ(runtime.sequencePersistFailureCount(), static_cast<std::uint64_t>(0));
+    }
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(3));
+    CHECK_EQ(sink.published.back().sequence, static_cast<std::uint64_t>(3));
+
+    RecordingSink secondSink;
+    SequenceFileStore secondStore(missing);
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, &secondStore);
+    restarted.observeCallback("Main Show", "playing", "mainPlaylist", 3, "a.fseq", "");
+    CHECK(restarted.drainOnce());
+    CHECK_EQ(secondSink.published[0].sequence, static_cast<std::uint64_t>(4));
+
+    std::remove((missing + "/sequence-state").c_str());
+    std::remove((missing + "/sequence-state.bak").c_str());
+    ::rmdir(missing.c_str());
+}
+
+// A directory that cannot be written at all (its component is a plain
+// file, forever, unlike a permission bit a root test runner would simply
+// bypass): every store() fails, but the observation still publishes and
+// the failure is counted rather than silently dropped.
+TEST(ARuntimeCountsRatherThanSilentlyDropsAPersistentStoreFailure) {
+    char fileTemplate[] = "/tmp/showmesh-runtime-unwritable-test-XXXXXX";
+    const int fd = ::mkstemp(fileTemplate);
+    CHECK(fd >= 0);
+    if (fd >= 0) ::close(fd);
+    const std::string blocked = std::string(fileTemplate) + "/state";
+
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    SequenceFileStore store(blocked);
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, &store);
+
+    for (int i = 0; i < 3; ++i) {
+        runtime.observeCallback("Main Show", "playing", "mainPlaylist", i, "a.fseq", "");
+        CHECK(runtime.drainOnce());
+    }
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(3));
+    CHECK_EQ(runtime.sequencePersistFailureCount(), static_cast<std::uint64_t>(3));
+
+    std::remove(fileTemplate);
+}
+
+// A corrupted on-disk file at startup must never rewind a restarted
+// runtime below what a fresh SequenceState already starts at, and must
+// never crash construction.
+TEST(ARuntimeConstructedOverACorruptSequenceFileStartsCleanRatherThanCrashing) {
+    TempDir dir;
+    {
+        std::ofstream corrupt(dir.path() + "/sequence-state", std::ios::trunc);
+        corrupt << "not a valid record";
+    }
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    SequenceFileStore store(dir.path());
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, &store);
+    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "");
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.published[0].sequence, static_cast<std::uint64_t>(1));
+}
+
+// "No files at all" (a genuine first run) and "files present, all
+// invalid" (a value was certainly issued before; its height is unknown)
+// both make a fresh SequenceState resume at the same value, 0. Only the
+// second one is the SM-213 wedge risk, so ShowMeshRuntime must tell an
+// operator the two apart rather than resuming silently either way.
+TEST(ARuntimeFlagsAllInvalidSequenceFilesAtStartupButNotAGenuineFirstRun) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    {
+        SequenceFileStore fresh(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, &fresh);
+        CHECK(!runtime.sequenceFilesWereAllInvalidAtStartup());
+    }
+
+    {
+        SequenceFileStore seed(dir.path());
+        CHECK(seed.store(500));
+        CHECK(seed.store(700));  // both primary and backup now exist
+    }
+    {
+        std::ofstream primary(dir.path() + "/sequence-state", std::ios::trunc);
+        primary << "garbage";
+    }
+    {
+        std::ofstream backup(dir.path() + "/sequence-state.bak", std::ios::trunc);
+        backup << "also garbage";
+    }
+
+    RecordingSink secondSink;
+    SequenceFileStore corrupted(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, &corrupted);
+    CHECK(restarted.sequenceFilesWereAllInvalidAtStartup());
+    // Resumes at 1 anyway, the same as a genuine first run: 0 is the only
+    // safe number without a real height to resume from. The flag above,
+    // not a different resumption value, is what makes this visible.
+    restarted.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "");
+    CHECK(restarted.drainOnce());
+    CHECK_EQ(secondSink.published[0].sequence, static_cast<std::uint64_t>(1));
 }

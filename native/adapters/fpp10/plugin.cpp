@@ -33,7 +33,9 @@ showmesh::TimeMillis nowMillis() {
 class ShowMeshFpp10Plugin : public FPPPlugin {
  public:
     ShowMeshFpp10Plugin()
-        : FPPPlugin(showmesh::kPluginName), runtime_(&definitions_, nullptr, nowMillis) {
+        : FPPPlugin(showmesh::kPluginName),
+          sequenceStore_(showmesh::resolveSequenceStateDir()),
+          runtime_(&definitions_, nullptr, nowMillis, &sequenceStore_) {
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
         showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
@@ -107,6 +109,11 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
     }
 
     showmesh::adapter::FppDefinitionSource definitions_;
+    // Declared before runtime_ so it is constructed first: member
+    // initialization follows declaration order regardless of the
+    // constructor's init-list order, and runtime_'s constructor reads
+    // sequenceStore_->load() immediately.
+    showmesh::SequenceFileStore sequenceStore_;
     showmesh::ShowMeshRuntime runtime_;
     Command* command_ = nullptr;
     std::uint64_t publishedRevision_ = 0;
