@@ -17,15 +17,37 @@ packaging, and cross-version compatibility on the fleet remain unproven and
 belong to the real-host install work. `native/adapters/FPP-PINS.md` says the
 same thing about the compile alone, and this bench does not change that.
 
-**Every run so far was emulated.** The host was `arm64`; both FPP images are
-`linux/amd64`, and Docker printed its platform-mismatch warning on every
-container start. So every container observed here executed under x86_64
-emulation, which is a further step away from a real host than a container
-alone. A `ps` inside a running container showed apache re-exec'd through
-`/run/rosetta/rosetta`, so the emulation layer actually observed was Rosetta.
-The script prints the host architecture and an unconditional emulation notice
-for exactly this reason. **Nothing here speaks to native arm64 or ARMv7
-behaviour on real fleet hardware.**
+**The container's CPU type is pinned and reported, not assumed.** Earlier
+versions of this bench derived the emulation notice from the host's `uname
+-m` alone and printed a hardcoded `linux/amd64` label, which is wrong on a
+host where both an `amd64` and an `arm64` image exist under FPP tag names,
+as they do on the arm64 Mac this bench is developed on. `--cpu` now selects
+the container's platform explicitly (`amd64`, the default, or `arm64`), the
+image tag is keyed by that choice so the two builds can never collide under
+one name, and the script refuses to start if a cached image's real
+architecture (read with `docker image inspect ... --format
+'{{.Architecture}}'`) does not match what was requested, rather than
+silently running whatever happens to be cached.
+
+**What was actually observed, and when.** On FPP 9 `9.5.3`, re-verified
+2026-08-25 on an arm64 Mac: the default `--cpu amd64` run used the
+`linux/amd64` image and executed under emulation (`docker inspect` reported
+container image `showmesh-bench/fpp:9.5.3`, `uname -m` inside the container
+returned `x86_64`, and `file /opt/fpp/src/fppd` reported an x86-64 ELF
+binary); a `--cpu arm64` run of the same pin used the `linux/arm64` image
+and executed natively (image `showmesh-bench/fpp:9.5.3-arm64`, `uname -m`
+returned `aarch64`, `fppd` was an ARM aarch64 ELF binary). All eight
+assertions passed both ways. The in-container adapter compile measured
+24241 ms emulated versus 9239 ms native in that same pair of runs, which is
+the clearest evidence yet that emulation, not just machine load, is a real
+factor in the duration numbers below. No `/run/rosetta` directory was found
+in the amd64 container on this Docker version, so the earlier claim that the
+emulation layer was specifically Rosetta was a property of an older Docker
+version and machine, not of this bench; the mechanism actually providing the
+emulation was not independently confirmed this time. **A container on a Mac,
+native `arm64` or emulated `amd64`, is not a Raspberry Pi or any other real
+fleet host. Nothing here speaks to real ARMv7 or real-fleet-hardware
+behaviour.**
 
 **The in-container compile duration is not a real-host number.** The runs
 against the current pins (FPP 9 `9.5.3`, FPP 10 `10.0`, both re-verified
@@ -33,16 +55,21 @@ against the current pins (FPP 9 `9.5.3`, FPP 10 `10.0`, both re-verified
 **26.8 s (FPP 9, 26818 ms)** and **10.4 s (FPP 10, 10396 ms)**. Earlier runs
 against `10.0-beta5` measured 28.6 s (FPP 9, 28569 ms) and 46.3 s (FPP 10,
 46279 ms), and before that 18.4 s / 19.4 s and 18.9 s / 20.2 s on a less
-loaded machine. All of those were measured under emulated x86_64 on an arm64
-host. Never quote any of these figures without that caveat, and note the
-stronger point: the same work has varied from roughly 10 s to 46 s across
-runs on one machine, sometimes with other emulated bench containers also
-running. That spread, more than the caveat, is why none of these numbers is
-a packaging time estimate or a real-host figure.
+loaded machine. All of those were measured under the default `--cpu amd64`,
+emulated on this arm64 host. Never quote any of these figures without that
+caveat, and note the stronger point: the same work has varied from roughly
+10 s to 46 s across runs on one machine, sometimes with other emulated bench
+containers also running. That spread, more than the caveat, is why none of
+these numbers is a packaging time estimate or a real-host figure. A native
+`--cpu arm64` FPP 9 compile measured 9239 ms against the same pin on
+2026-08-25, well under half of that run's emulated equivalent (24241 ms),
+which is further reason none of these durations mean anything outside the
+exact CPU type and load the run header reports.
 
 **No latency, throughput, or per-frame cost claim can be made from this
-bench.** There is no pixel output hardware here, the frame path runs under
-emulation, and nothing in the assertion set measures cost.
+bench.** There is no pixel output hardware here, the frame path runs inside a
+container under emulation or, at best, on a Mac rather than fleet hardware,
+and nothing in the assertion set measures cost.
 
 **Driving `playlistCallback` through to a published observation is
 structurally blocked, and that is a known gap.** The observation sink
@@ -109,10 +136,11 @@ scripts/test-plugin-load-fpp.sh  drives a run and reports each assertion
 ```
 scripts/test-plugin-load-fpp.sh --major fpp9
 scripts/test-plugin-load-fpp.sh --major fpp10 --id ci --port 8290
+scripts/test-plugin-load-fpp.sh --major fpp9 --cpu arm64 --id native --port 8291
 scripts/test-plugin-load-fpp.sh --id ci --down
 ```
 
-Or through the root `Makefile`, which forwards `MAJOR`, `BENCH_ID`, and
+Or through the root `Makefile`, which forwards `MAJOR`, `CPU`, `BENCH_ID`, and
 `BENCH_HTTP_PORT` in either the make-variable or the environment form:
 
 ```
@@ -129,14 +157,15 @@ Flags:
 | Flag | Meaning |
 |---|---|
 | `--major fpp9\|fpp10` | Which pinned FPP major to stand up. Default `fpp9`. |
+| `--cpu amd64\|arm64` | Container platform. Default `amd64`, so existing recorded results keep their meaning. Refuses to run if a cached image under the resolved tag is not actually built for the requested CPU. |
 | `--id ID` | Isolates this run. Default `local`. See below. |
 | `--port PORT` | Host port for the container's HTTP API. Default `8190`. |
-| `--prebuilt` | Use the private prebuilt FPP 9 fixture image instead of a source build. Refused for `fpp10`. |
+| `--prebuilt` | Use the private prebuilt FPP 9 fixture image instead of a source build. Refused for `fpp10` and for `--cpu arm64`. |
 | `--down` | Tear this run down and exit, including its named media volume. |
 | `-h`, `--help` | Full flag list. |
 
 Environment variables, all with working defaults and all listed in
-`.env.example`: `BENCH_ID`, `BENCH_HTTP_PORT`, `BENCH_FPP_MAJOR`,
+`.env.example`: `BENCH_ID`, `BENCH_HTTP_PORT`, `BENCH_FPP_MAJOR`, `BENCH_CPU`,
 `BENCH_USE_PREBUILT`, `FPP_PREBUILT_IMAGE`. The default port is 8190 rather
 than 8090 so this bench and the sibling multisync bench can run at the same
 time.
@@ -161,6 +190,14 @@ This exists because a shared singleton bench `fppd` with global state is a
 known failure mode: `/home/fpp/media` is `fppd`'s own state, holding settings,
 the installed plugin, and `fppd.log`, and leaking it between runs makes
 results from one run silently depend on another.
+
+The built `showmesh-bench/fpp:*` images are a separate axis, keyed by
+`--major` and `--cpu` rather than by `BENCH_ID`, and are meant to be shared:
+two runs requesting the same major and CPU reuse one image rather than each
+building their own. `--cpu arm64` suffixes the tag (`-arm64`) so it can never
+collide with the `--cpu amd64` build of the same FPP tag; see "What was
+actually observed, and when" above for why that collision, not just
+per-`BENCH_ID` isolation, is the thing this bench now guards against.
 
 Isolation was verified by running three benches concurrently, including two
 on the same FPP major, which is the stronger case. Observed while all three

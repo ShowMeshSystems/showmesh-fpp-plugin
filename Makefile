@@ -71,6 +71,8 @@ check: fmt-check vet lint test native-test
 # against it. Requires Docker; not part of `make check` because it needs a
 # real container runtime and a multi-minute image build on a fresh machine.
 # Override BENCH_ID and BENCH_HTTP_PORT to run more than one at a time.
+# CPU selects the container's platform (amd64, the default, or arm64); see
+# the README for what each means for emulation.
 # LEAVES THE CONTAINER RUNNING; tear it down with
 # `scripts/test-plugin-load-fpp.sh --id <id> --down`.
 # See bench/fpp-plugin-load/README.md.
@@ -78,6 +80,7 @@ check: fmt-check vet lint test native-test
 test-plugin-load-fpp:
 	scripts/test-plugin-load-fpp.sh \
 		--major $(or $(MAJOR),fpp9) \
+		--cpu $(or $(CPU),amd64) \
 		--id $(or $(BENCH_ID),local) \
 		--port $(or $(BENCH_HTTP_PORT),8190)
 
