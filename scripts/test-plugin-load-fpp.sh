@@ -20,6 +20,7 @@ BENCH_DIR="$REPO_ROOT/bench/fpp-plugin-load"
 BENCH_ID="${BENCH_ID:-local}"
 BENCH_HTTP_PORT="${BENCH_HTTP_PORT:-8190}"
 BENCH_FPP_MAJOR="${BENCH_FPP_MAJOR:-fpp9}"
+BENCH_CPU="${BENCH_CPU:-amd64}"
 BENCH_USE_PREBUILT="${BENCH_USE_PREBUILT:-0}"
 DOWN=0
 
@@ -32,10 +33,17 @@ Usage: $(basename "$0") [options]
   --port PORT    Host port for the container's HTTP API. Default:
                  \$BENCH_HTTP_PORT or 8190.
   --major MAJOR  fpp9 or fpp10. Default: \$BENCH_FPP_MAJOR or fpp9.
+  --cpu CPU      amd64 or arm64. Default: \$BENCH_CPU or amd64, so existing
+                 recorded results keep their meaning. arm64 is a native run
+                 on an arm64 host; the image tag is suffixed "-arm64" so it
+                 can never collide with an amd64 build of the same FPP tag.
+                 Refuses to run if a cached image under the resolved tag is
+                 not actually built for the requested CPU.
   --prebuilt     Use the private prebuilt FPP 9 fixture image instead of
                  building from source. Requires FPP_PREBUILT_IMAGE; see
                  bench/fpp-plugin-load/.env.example. Refused for fpp10:
-                 there is no fixture image for it.
+                 there is no fixture image for it. Refused for --cpu arm64:
+                 the fixture is amd64 only.
   --down         Tear this run down and exit. Removes the container, the
                  network AND the named media volume (docker compose down -v),
                  so the next run with this --id starts from a clean fppd
@@ -53,6 +61,7 @@ while [ $# -gt 0 ]; do
         --id) BENCH_ID="$2"; shift 2 ;;
         --port) BENCH_HTTP_PORT="$2"; shift 2 ;;
         --major) BENCH_FPP_MAJOR="$2"; shift 2 ;;
+        --cpu) BENCH_CPU="$2"; shift 2 ;;
         --prebuilt) BENCH_USE_PREBUILT=1; shift ;;
         --down) DOWN=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -93,10 +102,43 @@ case "$BENCH_FPP_MAJOR" in
         ;;
 esac
 
+case "$BENCH_CPU" in
+    amd64)
+        FPP_PLATFORM="linux/amd64"
+        ;;
+    arm64)
+        FPP_PLATFORM="linux/arm64"
+        # Keyed by architecture so an amd64 and an arm64 build of the same
+        # FPP tag can never collide under one image name, the way
+        # showmesh-bench/fpp:9.5.3-arm64 already did by hand before this.
+        FPP_IMAGE="${FPP_IMAGE}-arm64"
+        ;;
+    *)
+        echo "test-plugin-load-fpp: --cpu must be amd64 or arm64, got '$BENCH_CPU'" >&2
+        exit 2
+        ;;
+esac
+
 if [ "$BENCH_USE_PREBUILT" = "1" ] && [ "$BENCH_FPP_MAJOR" = "fpp10" ]; then
     echo "test-plugin-load-fpp: --prebuilt has no FPP 10 fixture image; FPP 10 is source-build only" >&2
     exit 2
 fi
+
+if [ "$BENCH_USE_PREBUILT" = "1" ] && [ "$BENCH_CPU" = "arm64" ]; then
+    echo "test-plugin-load-fpp: --prebuilt has no arm64 fixture image; the fixture is amd64 only" >&2
+    exit 2
+fi
+
+# Normalizes both docker's image-architecture vocabulary (amd64/arm64) and
+# uname -m's (x86_64/amd64, arm64/aarch64) to the same two strings, so the
+# host and image architectures can be compared directly below.
+normalize_arch() {
+    case "$1" in
+        x86_64|amd64) echo "amd64" ;;
+        arm64|aarch64) echo "arm64" ;;
+        *) echo "$1" ;;
+    esac
+}
 
 # The build context must be a LOCAL checkout carrying a real .git directory
 # and a ref literally named by the pinned tag: EXTRA_INSTALL_FLAG=--skip-clone
@@ -110,7 +152,19 @@ fi
 # would otherwise both rm -rf/fetch the one shared ${BENCH_FPP_MAJOR}
 # checkout dir and race. The cost is that every run re-fetches its own
 # shallow, single-tag copy instead of reusing one shared per-major checkout.
-if [ "$BENCH_USE_PREBUILT" != "1" ] && ! docker image inspect "$FPP_IMAGE" >/dev/null 2>&1; then
+if [ "$BENCH_USE_PREBUILT" != "1" ] && docker image inspect "$FPP_IMAGE" >/dev/null 2>&1; then
+    # An already-present tag is reused as-is rather than rebuilt, so it must
+    # actually be the requested architecture. Without this, a tag built once
+    # under the host default (or under a stale --cpu) would run silently
+    # under the wrong CPU type forever after.
+    cached_arch="$(docker image inspect "$FPP_IMAGE" --format '{{.Architecture}}')"
+    if [ "$cached_arch" != "$BENCH_CPU" ]; then
+        echo "test-plugin-load-fpp: REFUSING to run: $FPP_IMAGE is already cached as architecture '$cached_arch', but --cpu $BENCH_CPU was requested. Remove or re-tag the mismatched image (or pass the matching --cpu) rather than silently running the wrong CPU type." >&2
+        exit 1
+    fi
+    # No build will happen, but compose still needs a value to interpolate.
+    FPP_BUILD_CONTEXT="$BENCH_DIR/.fpp-src/${BENCH_FPP_MAJOR}-${BENCH_ID}"
+elif [ "$BENCH_USE_PREBUILT" != "1" ]; then
     checkout_dir="$BENCH_DIR/.fpp-src/${BENCH_FPP_MAJOR}-${BENCH_ID}"
     if [ ! -d "$checkout_dir/.git" ] || [ "$(git -C "$checkout_dir" rev-parse HEAD 2>/dev/null)" != "$FPP_COMMIT" ]; then
         echo "test-plugin-load-fpp: preparing a local, commit-pinned $BENCH_FPP_MAJOR checkout at $checkout_dir"
@@ -137,7 +191,7 @@ else
     FPP_BUILD_CONTEXT="$BENCH_DIR/.fpp-src/${BENCH_FPP_MAJOR}-${BENCH_ID}"
 fi
 
-export FPP_IMAGE FPP_TAG FPP_COMMIT FPP_BUILD_CONTEXT BENCH_ID BENCH_HTTP_PORT
+export FPP_IMAGE FPP_TAG FPP_COMMIT FPP_BUILD_CONTEXT FPP_PLATFORM BENCH_ID BENCH_HTTP_PORT
 
 PROJECT="showmesh-fppbench-${BENCH_ID}"
 CONTAINER="showmesh-fppbench-${BENCH_ID}-fpp"
@@ -236,32 +290,44 @@ if [ "$BENCH_USE_PREBUILT" = "1" ]; then
     fi
 fi
 
-echo "test-plugin-load-fpp: FPP major=$BENCH_FPP_MAJOR tag=$FPP_TAG commit=$FPP_COMMIT image=$FPP_IMAGE"
-resolved_ref="$(docker image inspect "$FPP_IMAGE" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)"
-if [ -z "$resolved_ref" ]; then
-    resolved_ref="$(docker image inspect "$FPP_IMAGE" --format '{{.Id}}' 2>/dev/null || echo 'not built yet')"
-    echo "test-plugin-load-fpp: resolved image reference: $resolved_ref (LOCAL BUILD OUTPUT, not a published digest anyone else can pull; do not present this as a reproducible pin)"
-else
-    echo "test-plugin-load-fpp: resolved image reference: $resolved_ref"
-fi
-
-# Both images are linux/amd64 only, so on any other host arch this runs under
-# emulation and every duration this script prints is inflated by an
-# unmeasured factor.
-HOST_ARCH="$(uname -m)"
-echo "test-plugin-load-fpp: host architecture: $HOST_ARCH (container image platform: linux/amd64)"
-case "$HOST_ARCH" in
-    x86_64|amd64) EMULATED=0 ;;
-    *) EMULATED=1
-       echo "test-plugin-load-fpp: EMULATED RUN, host arch '$HOST_ARCH' does not match the image's linux/amd64 platform, so this container runs under x86_64 emulation. Any duration this run reports is inflated by an unmeasured factor and is not evidence of real-host or real-fleet-hardware timing. Nothing here speaks to native arm64 or armv7 behavior."
-       ;;
-esac
+echo "test-plugin-load-fpp: FPP major=$BENCH_FPP_MAJOR tag=$FPP_TAG commit=$FPP_COMMIT image=$FPP_IMAGE platform=$FPP_PLATFORM"
 
 # --force-recreate discards the previous container's writable layer, where the
 # stale apache/php pid file that crash-loops a plain second `up -d` lives, while
 # keeping the built image and the named media volume.
 echo "test-plugin-load-fpp: docker compose up -d --force-recreate"
 "${COMPOSE[@]}" up -d --force-recreate
+
+# The image is guaranteed to exist now, built or pulled by the up above, so
+# its real architecture and reference are read from docker itself rather than
+# assumed from --cpu or the host default.
+resolved_ref="$(docker image inspect "$FPP_IMAGE" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)"
+if [ -z "$resolved_ref" ]; then
+    resolved_ref="$(docker image inspect "$FPP_IMAGE" --format '{{.Id}}' 2>/dev/null || echo 'unknown')"
+    echo "test-plugin-load-fpp: resolved image reference: $resolved_ref (LOCAL BUILD OUTPUT, not a published digest anyone else can pull; do not present this as a reproducible pin)"
+else
+    echo "test-plugin-load-fpp: resolved image reference: $resolved_ref"
+fi
+
+IMAGE_ARCH="$(docker image inspect "$FPP_IMAGE" --format '{{.Architecture}}' 2>/dev/null || echo 'unknown')"
+if [ "$IMAGE_ARCH" != "$BENCH_CPU" ]; then
+    # A build honoring the pinned platform: key above should never produce
+    # this, but it is cheap to confirm rather than trust, and it is exactly
+    # the class of silent mismatch this whole change exists to close.
+    echo "test-plugin-load-fpp: FATAL: $FPP_IMAGE was built/pulled as architecture '$IMAGE_ARCH', not the requested '$BENCH_CPU'" >&2
+    exit 1
+fi
+
+HOST_ARCH="$(uname -m)"
+HOST_ARCH_NORM="$(normalize_arch "$HOST_ARCH")"
+echo "test-plugin-load-fpp: host architecture: $HOST_ARCH, container image architecture: $IMAGE_ARCH (platform $FPP_PLATFORM)"
+if [ "$IMAGE_ARCH" = "$HOST_ARCH_NORM" ]; then
+    EMULATED=0
+    echo "test-plugin-load-fpp: NATIVE RUN, the container image architecture matches the host architecture, so this container runs with no CPU emulation layer."
+else
+    EMULATED=1
+    echo "test-plugin-load-fpp: EMULATED RUN, host arch '$HOST_ARCH' does not match the container image architecture '$IMAGE_ARCH', so this container runs under emulation. Any duration this run reports is inflated by an unmeasured factor and is not evidence of real-host or real-fleet-hardware timing. Nothing here speaks to native arm64 or armv7 behavior on real fleet hardware."
+fi
 
 wait_for_http() {
     local tries="${1:-60}"
@@ -303,7 +369,7 @@ install_plugin() {
     end_ns=$(date +%s%N)
     duration_ms=$(( (end_ns - start_ns) / 1000000 ))
     if [ "${EMULATED:-0}" = "1" ]; then
-        echo "test-plugin-load-fpp: in-container adapter compile took ${duration_ms}ms (measured under x86_64 emulation on host arch $HOST_ARCH, NOT representative of a real host and not a basis for a packaging time estimate)"
+        echo "test-plugin-load-fpp: in-container adapter compile took ${duration_ms}ms (measured under emulation, container image architecture '$IMAGE_ARCH' on host arch '$HOST_ARCH', NOT representative of a real host and not a basis for a packaging time estimate)"
     else
         echo "test-plugin-load-fpp: in-container adapter compile took ${duration_ms}ms"
     fi

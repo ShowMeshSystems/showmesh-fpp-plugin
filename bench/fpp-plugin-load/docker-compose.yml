@@ -6,9 +6,12 @@
 # scripts/test-plugin-load-fpp.sh; a bare `docker compose up` here has no
 # project name and no BENCH_ID and would collide across runs.
 #
-# FPP_IMAGE/FPP_TAG/FPP_COMMIT/FPP_BUILD_CONTEXT are set by that script from
-# --major; .env.example lists them for setting by hand. An already-present
-# FPP_IMAGE is used as-is and not rebuilt.
+# FPP_IMAGE/FPP_TAG/FPP_COMMIT/FPP_BUILD_CONTEXT/FPP_PLATFORM are set by that
+# script from --major and --cpu; .env.example lists them for setting by hand.
+# An already-present FPP_IMAGE is used as-is and not rebuilt, but the script
+# refuses to do so unless docker reports that image's real architecture
+# matches FPP_PLATFORM, so a container never silently runs the wrong CPU
+# type under a name that implies the other one.
 #
 # FPP_BUILD_CONTEXT must be a LOCAL commit-pinned checkout with a real .git
 # directory, not a remote git-URL context, because EXTRA_INSTALL_FLAG
@@ -20,6 +23,12 @@
 services:
   fpp:
     image: ${FPP_IMAGE}
+    # Pinned explicitly rather than left to inherit the host's build default:
+    # without this key, `docker compose build` on an arm64 host builds an
+    # arm64 image under a tag name the script and README otherwise assume is
+    # amd64, and an already-cached image is used as-is by CPU type it happens
+    # to hold. FPP_PLATFORM is set by the script from --cpu.
+    platform: ${FPP_PLATFORM}
     build:
       context: ${FPP_BUILD_CONTEXT}
       dockerfile: Docker/Dockerfile
