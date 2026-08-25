@@ -1,0 +1,135 @@
+{
+  "description": "entryKey derivation cases for the FPP plugin coordinator contract, docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md section 1.3. expectedCanonicalKeyObject is the exact RFC 8785 canonical text of the five-member object {instanceUuid, playlistHash, playlistName, position, section} before hashing, so a consumer can tell a canonicalization bug apart from a hashing bug. expectedEntryKey is the lowercase-hex SHA-256 of those canonical bytes. A consumer builds the five-member object from identity, canonicalizes it with its own canonicalizer, compares against expectedCanonicalKeyObject, then hashes and compares against expectedEntryKey.",
+  "cases": [
+    {
+      "name": "baseline",
+      "description": "A baseline identity: all five fields present and non-empty.",
+      "identity": {
+        "instanceUuid": "6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44",
+        "playlistName": "Main Show",
+        "playlistHash": "deadbeef",
+        "section": "mainPlaylist",
+        "position": 0
+      },
+      "expectedCanonicalKeyObject": "{\"instanceUuid\":\"6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44\",\"playlistHash\":\"deadbeef\",\"playlistName\":\"Main Show\",\"position\":0,\"section\":\"mainPlaylist\"}",
+      "expectedEntryKey": "4412de28018bd7bd4b20df96341da9737a24ec604d88c2b2372a8a068f55e591"
+    },
+    {
+      "name": "duplicate-filename-different-position",
+      "description": "Identical to baseline except position is 1 instead of 0. This is the duplicate-filename case the entry-key design exists for: two entries with the same sequenceName in the same playlist at different positions must not collide, and this differs from baseline only in position.",
+      "identity": {
+        "instanceUuid": "6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44",
+        "playlistName": "Main Show",
+        "playlistHash": "deadbeef",
+        "section": "mainPlaylist",
+        "position": 1
+      },
+      "expectedCanonicalKeyObject": "{\"instanceUuid\":\"6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44\",\"playlistHash\":\"deadbeef\",\"playlistName\":\"Main Show\",\"position\":1,\"section\":\"mainPlaylist\"}",
+      "expectedEntryKey": "86ec5160cd670a7724f459c6ae29f36cb9d5f067e512c835afdadb2ac58c2bc4"
+    },
+    {
+      "name": "field-changed-instanceUuid",
+      "description": "Identical to baseline except instanceUuid changes. Verifies changing instanceUuid alone changes the key.",
+      "identity": {
+        "instanceUuid": "a1c2e3f4-5566-7788-99aa-bbccddeeff00",
+        "playlistName": "Main Show",
+        "playlistHash": "deadbeef",
+        "section": "mainPlaylist",
+        "position": 0
+      },
+      "expectedCanonicalKeyObject": "{\"instanceUuid\":\"a1c2e3f4-5566-7788-99aa-bbccddeeff00\",\"playlistHash\":\"deadbeef\",\"playlistName\":\"Main Show\",\"position\":0,\"section\":\"mainPlaylist\"}",
+      "expectedEntryKey": "084b600d7c85238d1bd8f92e99d7d202c8d096b47c065f605cebe1f84fc509ad"
+    },
+    {
+      "name": "field-changed-playlistHash",
+      "description": "Identical to baseline except playlistHash changes. Verifies changing playlistHash alone changes the key.",
+      "identity": {
+        "instanceUuid": "6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44",
+        "playlistName": "Main Show",
+        "playlistHash": "cafebabe",
+        "section": "mainPlaylist",
+        "position": 0
+      },
+      "expectedCanonicalKeyObject": "{\"instanceUuid\":\"6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44\",\"playlistHash\":\"cafebabe\",\"playlistName\":\"Main Show\",\"position\":0,\"section\":\"mainPlaylist\"}",
+      "expectedEntryKey": "8d1d82c63bfc347746007d24e6956ac3605b91c36fa0048c84dbf254381c9b00"
+    },
+    {
+      "name": "field-changed-playlistName",
+      "description": "Identical to baseline except playlistName changes. Verifies changing playlistName alone changes the key.",
+      "identity": {
+        "instanceUuid": "6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44",
+        "playlistName": "Other Show",
+        "playlistHash": "deadbeef",
+        "section": "mainPlaylist",
+        "position": 0
+      },
+      "expectedCanonicalKeyObject": "{\"instanceUuid\":\"6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44\",\"playlistHash\":\"deadbeef\",\"playlistName\":\"Other Show\",\"position\":0,\"section\":\"mainPlaylist\"}",
+      "expectedEntryKey": "2004f3a887a80f2b804b04b895a689ad4fd7856ff0b5fca1d018314194f5bfbf"
+    },
+    {
+      "name": "field-changed-section",
+      "description": "Identical to baseline except section changes. Verifies changing section alone changes the key.",
+      "identity": {
+        "instanceUuid": "6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44",
+        "playlistName": "Main Show",
+        "playlistHash": "deadbeef",
+        "section": "leadIn",
+        "position": 0
+      },
+      "expectedCanonicalKeyObject": "{\"instanceUuid\":\"6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44\",\"playlistHash\":\"deadbeef\",\"playlistName\":\"Main Show\",\"position\":0,\"section\":\"leadIn\"}",
+      "expectedEntryKey": "1469c9d27bcfd8bf48c7d1d85b6d75b7785a71cd20b274189c173c30a64bdc61"
+    },
+    {
+      "name": "near-collision-pair-a",
+      "description": "Half of a near-collision pair with near-collision-pair-b. playlistName is \"show:1\" and section is \"main\". Under a naive delimiter-joined key such as playlistName + \":\" + section, this would join to \"show:1:main\". near-collision-pair-b's playlistName \"show\" and section \"1|main\" would join, under a naive playlistName + \"|\" + section scheme reusing the same separator family, to a string built from the same characters in a different split. The entryKey object encoding keeps instanceUuid, playlistHash, playlistName, position, and section as distinct JSON members, so no character embedded in one field can be reinterpreted as a boundary between fields; assert this case's key differs from near-collision-pair-b's.",
+      "identity": {
+        "instanceUuid": "6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44",
+        "playlistName": "show:1",
+        "playlistHash": "aa",
+        "section": "main",
+        "position": 0
+      },
+      "expectedCanonicalKeyObject": "{\"instanceUuid\":\"6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44\",\"playlistHash\":\"aa\",\"playlistName\":\"show:1\",\"position\":0,\"section\":\"main\"}",
+      "expectedEntryKey": "160ba04ed1e7e0463360e177eda22022d517a81c951d861faf9a938cd4478eed"
+    },
+    {
+      "name": "near-collision-pair-b",
+      "description": "Half of a near-collision pair with near-collision-pair-a. playlistName is \"show\" and section is \"1|main\", carrying both a colon-family and pipe-family separator character inside the section field. Assert this case's key differs from near-collision-pair-a's.",
+      "identity": {
+        "instanceUuid": "6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44",
+        "playlistName": "show",
+        "playlistHash": "aa",
+        "section": "1|main",
+        "position": 0
+      },
+      "expectedCanonicalKeyObject": "{\"instanceUuid\":\"6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44\",\"playlistHash\":\"aa\",\"playlistName\":\"show\",\"position\":0,\"section\":\"1|main\"}",
+      "expectedEntryKey": "e877b7e33c97731b48f44a137d6995f1be58463df130b0b8a547e70803a02f25"
+    },
+    {
+      "name": "empty-section",
+      "description": "Identical to baseline except section is the empty string, which contract section 1.2 allows explicitly (\"section may be empty\").",
+      "identity": {
+        "instanceUuid": "6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44",
+        "playlistName": "Main Show",
+        "playlistHash": "deadbeef",
+        "section": "",
+        "position": 0
+      },
+      "expectedCanonicalKeyObject": "{\"instanceUuid\":\"6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44\",\"playlistHash\":\"deadbeef\",\"playlistName\":\"Main Show\",\"position\":0,\"section\":\"\"}",
+      "expectedEntryKey": "eeebcf094e361fdea5367ce0ba40a5f8820f735d13ba97a94e4045ee165b85e5"
+    },
+    {
+      "name": "large-position",
+      "description": "Identical to baseline except position is 2147483647 (32-bit signed integer max), exercising a large integer through ECMAScript number formatting.",
+      "identity": {
+        "instanceUuid": "6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44",
+        "playlistName": "Main Show",
+        "playlistHash": "deadbeef",
+        "section": "mainPlaylist",
+        "position": 2147483647
+      },
+      "expectedCanonicalKeyObject": "{\"instanceUuid\":\"6f1c1a52-1b6c-4b53-9a0e-9f7c2f0d1b44\",\"playlistHash\":\"deadbeef\",\"playlistName\":\"Main Show\",\"position\":2147483647,\"section\":\"mainPlaylist\"}",
+      "expectedEntryKey": "cf05803d9b427a4dac7ac9e6f0ed4b0ec83cf07f5f32f2bd798f559bdd0bb957"
+    }
+  ]
+}

@@ -36,12 +36,32 @@ const char* kDefinitionReordered =
     "    {\"enabled\": 1, \"type\": \"both\", \"mediaName\": \"song.mp3\", \"sequenceName\": \"a.fseq\"}\n"
     "  ],\n  \"name\": \"Main Show\"\n}";
 
-// A genuinely different playlist: the two items are reordered.
+// An edited playlist: the first item's content changed. Note that both
+// items of kDefinition above are byte-identical to each other, so this is
+// not evidence that reordering is detected, only that a content change is.
 const char* kDefinitionEdited =
     "{\"name\":\"Main Show\",\"repeat\":0,"
     "\"mainPlaylist\":["
     "{\"type\":\"both\",\"sequenceName\":\"b.fseq\",\"mediaName\":\"other.mp3\",\"enabled\":1},"
     "{\"type\":\"both\",\"sequenceName\":\"a.fseq\",\"mediaName\":\"song.mp3\",\"enabled\":1}"
+    "]}";
+
+// Two items that genuinely differ from each other, so swapping their order
+// below is an actual reorder and not a no-op on identical content.
+const char* kDefinitionDistinctItems =
+    "{\"name\":\"Main Show\",\"repeat\":0,"
+    "\"mainPlaylist\":["
+    "{\"type\":\"both\",\"sequenceName\":\"a.fseq\",\"mediaName\":\"first.mp3\",\"enabled\":1},"
+    "{\"type\":\"both\",\"sequenceName\":\"b.fseq\",\"mediaName\":\"second.mp3\",\"enabled\":1}"
+    "]}";
+
+// kDefinitionDistinctItems with its two items swapped, content otherwise
+// unchanged.
+const char* kDefinitionDistinctItemsReordered =
+    "{\"name\":\"Main Show\",\"repeat\":0,"
+    "\"mainPlaylist\":["
+    "{\"type\":\"both\",\"sequenceName\":\"b.fseq\",\"mediaName\":\"second.mp3\",\"enabled\":1},"
+    "{\"type\":\"both\",\"sequenceName\":\"a.fseq\",\"mediaName\":\"first.mp3\",\"enabled\":1}"
     "]}";
 
 }  // namespace
@@ -64,6 +84,21 @@ TEST(EditingOrReorderingThePlaylistChangesTheHashAndInvalidatesTheOldKey) {
     CHECK(after.ok);
     CHECK_NE(before.identity.playlistHash, after.identity.playlistHash);
     CHECK_NE(before.entryKey, after.entryKey);
+
+    // The edit case above changes item content, not order: kDefinition's
+    // two items are byte-identical to each other, so reordering them is a
+    // no-op regardless of whether canonicalization is order-sensitive.
+    // Exercise an actual reorder, with two items that differ from each
+    // other, so an array canonicalizer that dropped order-sensitivity
+    // (for example by sorting items) would still fail this.
+    IdentityResolution originalOrder =
+        resolveEntryIdentity(kUuid, "Main Show", kDefinitionDistinctItems, "mainPlaylist", 0);
+    IdentityResolution reordered =
+        resolveEntryIdentity(kUuid, "Main Show", kDefinitionDistinctItemsReordered, "mainPlaylist", 0);
+    CHECK(originalOrder.ok);
+    CHECK(reordered.ok);
+    CHECK_NE(originalOrder.identity.playlistHash, reordered.identity.playlistHash);
+    CHECK_NE(originalOrder.entryKey, reordered.entryKey);
 }
 
 TEST(DuplicateFilenamesAtDifferentPositionsProduceDistinctKeys) {
@@ -75,10 +110,20 @@ TEST(DuplicateFilenamesAtDifferentPositionsProduceDistinctKeys) {
     CHECK_NE(first.entryKey, second.entryKey);
 }
 
+// Pinned independently of this process: the entry key for this exact
+// identity, computed once and frozen here. Comparing two same-process
+// resolutions against each other is not evidence of cross-process
+// determinism; a key that silently folded in something process-local (a
+// pid, a memory address, an unseeded random value) would still agree with
+// itself within one process. Comparing against a pinned constant instead
+// catches that.
+const char* kDeterministicEntryKeyForPosition3 = "eaeb24db852ed6b70d6aa39d4979fee9315126418b62c9d44e62127be0fa1327";
+
 TEST(TheEntryKeyIsDeterministicAcrossProcesses) {
     IdentityResolution a = resolveEntryIdentity(kUuid, "Main Show", kDefinition, "mainPlaylist", 3);
     IdentityResolution b = resolveEntryIdentity(kUuid, "Main Show", kDefinition, "mainPlaylist", 3);
     CHECK_EQ(a.entryKey, b.entryKey);
+    CHECK_EQ(a.entryKey, std::string(kDeterministicEntryKeyForPosition3));
     CHECK_EQ(a.entryKey.size(), static_cast<std::size_t>(64));
 }
 
@@ -143,6 +188,14 @@ TEST(TheSequenceOnlyEverMovesForward) {
     CHECK_EQ(seq.next(), static_cast<std::uint64_t>(101));
 }
 
+// Pinned independently of this process: the entry key for this exact
+// identity, computed once and frozen here. Comparing `before` and `after`
+// against each other is not evidence of surviving a restart; both are
+// still computed in this one process, so a key that silently became
+// process-local (a pid folded in, for example) would still agree with
+// itself here. Comparing both against a pinned constant catches that.
+const char* kRestartStableEntryKeyForPosition2 = "efa981636b7d94004b3330a6ce0abbad26c68e0f2977b6a7e3134daa14ae29fe";
+
 TEST(AnUnchangedPlaylistKeepsItsIdentityAcrossARestart) {
     IdentityResolution before = resolveEntryIdentity(kUuid, "Main Show", kDefinition, "mainPlaylist", 2);
     SequenceState beforeSeq;
@@ -156,7 +209,9 @@ TEST(AnUnchangedPlaylistKeepsItsIdentityAcrossARestart) {
     afterSeq.restore(persisted);
     IdentityResolution after = resolveEntryIdentity(kUuid, "Main Show", kDefinition, "mainPlaylist", 2);
 
+    CHECK_EQ(before.entryKey, std::string(kRestartStableEntryKeyForPosition2));
     CHECK_EQ(after.entryKey, before.entryKey);
+    CHECK_EQ(after.entryKey, std::string(kRestartStableEntryKeyForPosition2));
     CHECK_EQ(afterSeq.next(), persisted + 1);
 }
 
