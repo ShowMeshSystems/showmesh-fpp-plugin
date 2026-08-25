@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <fstream>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "showmesh/sha256.h"
@@ -92,29 +93,37 @@ std::string encodeRecord(std::uint64_t value) {
 struct ParsedRecord {
     std::uint64_t value = 0;
     bool ok = false;
+    // Whether the file could be opened at all, independent of whether its
+    // contents validated. Lets a caller tell "this file does not exist"
+    // apart from "this file exists but is corrupt".
+    bool present = false;
 };
 
 ParsedRecord parseRecord(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return ParsedRecord{};
+    ParsedRecord result;
+    result.present = true;
 
     std::string valueLine;
-    if (!std::getline(in, valueLine)) return ParsedRecord{};
+    if (!std::getline(in, valueLine)) return result;
     std::string hashLine;
-    if (!std::getline(in, hashLine)) return ParsedRecord{};
+    if (!std::getline(in, hashLine)) return result;
     std::string trailing;
-    if (std::getline(in, trailing)) return ParsedRecord{};  // no extra content is a valid record
+    if (std::getline(in, trailing)) return result;  // no extra content is a valid record
 
     if (valueLine.empty() || valueLine.find_first_not_of("0123456789") != std::string::npos) {
-        return ParsedRecord{};
+        return result;
     }
-    if (hashLine != sha256Hex(valueLine)) return ParsedRecord{};
+    if (hashLine != sha256Hex(valueLine)) return result;
 
     errno = 0;
     char* end = nullptr;
     const unsigned long long parsed = std::strtoull(valueLine.c_str(), &end, 10);
-    if (errno != 0 || end == nullptr || *end != '\0') return ParsedRecord{};
-    return ParsedRecord{static_cast<std::uint64_t>(parsed), true};
+    if (errno != 0 || end == nullptr || *end != '\0') return result;
+    result.value = static_cast<std::uint64_t>(parsed);
+    result.ok = true;
+    return result;
 }
 
 }  // namespace
@@ -130,15 +139,30 @@ std::string resolveSequenceStateDir() {
 }
 
 SequenceFileStore::SequenceFileStore(std::string dir)
-    : primaryPath_(joinPath(dir, kPrimaryFilename)), backupPath_(joinPath(dir, kBackupFilename)) {}
+    : primaryPath_(joinPath(dir, kPrimaryFilename)), backupPath_(joinPath(dir, kBackupFilename)) {
+    // Best effort, once, here rather than on every store(): nothing else
+    // in this repository provisions this directory (see
+    // resolveSequenceStateDir()'s doc comment above), so a plugin that
+    // starts before an operator or installer has created it must not
+    // silently persist nothing forever. A failure here (including EEXIST)
+    // is not reported: store() below already reports a directory it still
+    // cannot write to, and that is the return value callers already have
+    // to check.
+    ::mkdir(dir.c_str(), 0755);
+}
 
-std::uint64_t SequenceFileStore::load() const {
+std::uint64_t SequenceFileStore::load() const { return loadDetailed().value; }
+
+SequenceFileStore::LoadResult SequenceFileStore::loadDetailed() const {
     const ParsedRecord primary = parseRecord(primaryPath_);
     const ParsedRecord backup = parseRecord(backupPath_);
-    std::uint64_t best = 0;
-    if (primary.ok && primary.value > best) best = primary.value;
-    if (backup.ok && backup.value > best) best = backup.value;
-    return best;
+    LoadResult result;
+    if (primary.ok && primary.value > result.value) result.value = primary.value;
+    if (backup.ok && backup.value > result.value) result.value = backup.value;
+    const bool anyPresent = primary.present || backup.present;
+    const bool anyValid = primary.ok || backup.ok;
+    result.filesPresentButInvalid = anyPresent && !anyValid;
+    return result;
 }
 
 bool SequenceFileStore::store(std::uint64_t value) const {

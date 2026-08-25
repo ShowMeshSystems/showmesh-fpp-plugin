@@ -113,13 +113,13 @@ class EngineAccessor {
 class ShowMeshRuntime {
  public:
     // sequenceStore is optional. When non-null, the constructor restores
-    // the in-memory sequence from sequenceStore->load() (so a restarted
-    // plugin resumes above the highest value it ever issued instead of
-    // wedging every observation behind the coordinator's monotonicity
-    // check), and every drained observation's freshly issued sequence
-    // number is persisted before the observation is handed to the sink.
-    // Passing nullptr keeps the previous behavior (always starts at 0,
-    // nothing persisted), which existing tests rely on.
+    // the in-memory sequence from sequenceStore->loadDetailed() (so a
+    // restarted plugin resumes above the highest value it ever issued
+    // instead of wedging every observation behind the coordinator's
+    // monotonicity check), and every drained observation's freshly issued
+    // sequence number is persisted before the observation is handed to
+    // the sink. Passing nullptr keeps the previous behavior (always
+    // starts at 0, nothing persisted), which existing tests rely on.
     ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                     SequenceFileStore* sequenceStore = nullptr);
     ~ShowMeshRuntime();
@@ -171,6 +171,20 @@ class ShowMeshRuntime {
     const CallbackHandoff& handoff() const { return handoff_; }
     std::uint64_t publishedCount() const { return published_.load(); }
     std::uint64_t unavailableCount() const { return unavailable_.load(); }
+    // Count of drainOnce() calls whose freshly minted sequence number
+    // could not be persisted (sequenceStore->store() returned false). The
+    // observation still publishes; only the durability guarantee is
+    // broken, and a nonzero count here is the operator-visible sign of
+    // it, since a restart before the underlying condition (missing or
+    // unwritable state directory) is fixed resumes below what was
+    // actually issued.
+    std::uint64_t sequencePersistFailureCount() const { return sequencePersistFailures_.load(); }
+    // True when construction found the primary or backup sequence-state
+    // file present but neither one valid: a value was certainly issued
+    // before this restart, its height is simply unknown, unlike a
+    // genuine first run where neither file exists yet. Latched once at
+    // construction; see SequenceFileStore::loadDetailed().
+    bool sequenceFilesWereAllInvalidAtStartup() const { return sequenceFilesWereAllInvalidAtStartup_; }
 
     // Test seam only, never called in production. Runs on the worker
     // thread immediately after its last failed drainOnce() and
@@ -211,6 +225,10 @@ class ShowMeshRuntime {
 
     std::atomic<std::uint64_t> published_{0};
     std::atomic<std::uint64_t> unavailable_{0};
+    std::atomic<std::uint64_t> sequencePersistFailures_{0};
+    // Written once from the constructor, before start() runs the worker
+    // thread; read-only afterward, so no lock is needed.
+    bool sequenceFilesWereAllInvalidAtStartup_ = false;
     // Gap evidence that has been counted but not yet acknowledged by a
     // successful publish. It is carried forward rather than cleared, so a
     // failed publish does not erase the record of what was dropped.

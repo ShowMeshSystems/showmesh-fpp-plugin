@@ -192,6 +192,27 @@ load/unload made an ordinary operator action rather than a rare event, would
 wedge every later observation behind a 409 the plugin cannot recover from on
 its own.
 
+`SequenceFileStore`'s constructor also attempts to create its directory if it
+does not already exist (best effort, mode 0755), since nothing else in this
+repository provisions it. When that attempt fails, or the directory exists but
+is not writable, `store()` keeps returning `false` and nothing is silently
+lost: `drainOnce()` still publishes the observation, and counts the failure in
+`ShowMeshRuntime::sequencePersistFailureCount()` so the condition is visible
+rather than only showing up as a later restart resuming below what was
+actually issued.
+
+`load()`'s 0 for a missing, unreadable, or corrupt store on both sides covers
+two different situations: a genuine first run, where 0 is simply correct, and
+a restart after both files are present but neither validates, where a value
+was certainly issued before and its true height is unknown.
+`SequenceFileStore::loadDetailed()` tells them apart via its
+`filesPresentButInvalid` flag, which `ShowMeshRuntime` latches once at
+construction as `sequenceFilesWereAllInvalidAtStartup()`. The runtime still
+resumes at the same value `load()` would give (0), since there is no other
+safe number to pick without a real height to resume from; making the
+situation visible is what lets an operator use the coordinator's own
+sequence-reset route instead of the wedge going unnoticed.
+
 Each adapter constructs its store over `resolveSequenceStateDir()`, which
 follows the same precedence and the same two environment variables as the Go
 helper's own state directory

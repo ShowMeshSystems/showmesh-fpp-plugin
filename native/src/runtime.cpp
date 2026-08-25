@@ -70,7 +70,9 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
     // higher in memory, and it is exactly what turns a plugin restart
     // from a permanent 409 wedge into an ordinary resumption.
     if (sequenceStore_ != nullptr) {
-        sequence_.restore(sequenceStore_->load());
+        const SequenceFileStore::LoadResult loaded = sequenceStore_->loadDetailed();
+        sequence_.restore(loaded.value);
+        sequenceFilesWereAllInvalidAtStartup_ = loaded.filesPresentButInvalid;
     }
 }
 
@@ -169,9 +171,12 @@ bool ShowMeshRuntime::drainOnce() {
     // resolves and whether or not the sink ultimately accepts it: the
     // number was already minted and must never be reissued after a
     // restart, so it has to be durable before this function returns
-    // rather than only once a publish succeeds.
-    if (sequenceStore_ != nullptr) {
-        sequenceStore_->store(observation.sequence);
+    // rather than only once a publish succeeds. The observation still
+    // publishes below on failure; the number is already minted and
+    // dropping the observation would lose data, so a failed store()
+    // is only counted, never treated as a reason to stop.
+    if (sequenceStore_ != nullptr && !sequenceStore_->store(observation.sequence)) {
+        ++sequencePersistFailures_;
     }
 
     if (evidence.identityFieldTruncated()) {

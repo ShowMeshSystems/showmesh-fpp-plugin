@@ -4,11 +4,14 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "check.h"
+#include "showmesh/sha256.h"
 
 using showmesh::resolveSequenceStateDir;
+using showmesh::sha256Hex;
 using showmesh::SequenceFileStore;
 
 namespace {
@@ -120,11 +123,15 @@ TEST(ABitFlippedValueWithAStillPlausibleChecksumMismatchIsRejected) {
     CHECK(store.store(100));
     CHECK(store.store(999));  // backup now holds 100
 
-    // The value line is changed but the checksum line is left as it was
-    // for the true value, so a store that trusted the value line alone
-    // would silently resume at the wrong, lower number.
-    writeRaw(dir.path() + "/sequence-state",
-             "1\n" + std::string("ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39\n"));
+    // The value line is changed to something HIGHER than the backup's
+    // 100, so a store that skipped checksum verification would report
+    // this fabricated value rather than merely failing to regress; the
+    // checksum line is left as a real, well-formed 64-hex checksum, just
+    // one that belongs to a different value (999, the value this same
+    // file legitimately held a moment ago) rather than to "12345". A
+    // store that merely rejected malformed hash lines (too short,
+    // non-hex) would never exercise this at all.
+    writeRaw(dir.path() + "/sequence-state", "12345\n" + sha256Hex("999") + "\n");
     CHECK_EQ(store.load(), static_cast<std::uint64_t>(100));
 }
 
@@ -157,6 +164,66 @@ TEST(StoreDoesNotLeaveATempFileVisibleUnderTheFinalName) {
     CHECK(store.store(1));
     CHECK(fileExists(dir.path() + "/sequence-state"));
     CHECK(!fileExists(dir.path() + "/sequence-state.tmp"));
+}
+
+// Every fixture above uses TempDir, which creates its directory with
+// mkdtemp before the SequenceFileStore under test ever sees it, so
+// store() always finds a writable directory already in place. Nothing
+// above exercises the directory itself being missing or unwritable.
+
+TEST(ConstructingOverAMissingDirectoryCreatesItSoStoreSucceeds) {
+    TempDir dir;
+    // dir.path() exists (mkdtemp made it); "state" underneath it does
+    // not, which is exactly what resolveSequenceStateDir() can hand a
+    // fresh SequenceFileStore on a host nothing has provisioned yet.
+    const std::string missing = dir.path() + "/state";
+    SequenceFileStore store(missing);
+    CHECK(store.store(7));
+    CHECK_EQ(store.load(), static_cast<std::uint64_t>(7));
+
+    // TempDir's own destructor only cleans up files directly inside
+    // dir.path(), so this test removes the nested directory it asked
+    // SequenceFileStore to create.
+    std::remove((missing + "/sequence-state").c_str());
+    std::remove((missing + "/sequence-state.bak").c_str());
+    ::rmdir(missing.c_str());
+}
+
+TEST(AStillUnwritableDirectoryLeavesStoreFailingRatherThanCrashing) {
+    // A path whose directory component is a regular file, not a
+    // directory: mkdir() on it fails with ENOTDIR no matter the caller's
+    // privilege, unlike a permission bit a root test runner would simply
+    // bypass, so this is unwritable in every environment this suite runs
+    // in.
+    char fileTemplate[] = "/tmp/showmesh-sequence-store-blocked-XXXXXX";
+    const int fd = ::mkstemp(fileTemplate);
+    CHECK(fd >= 0);
+    if (fd >= 0) ::close(fd);
+    const std::string blocked = std::string(fileTemplate) + "/state";
+
+    SequenceFileStore store(blocked);
+    CHECK(!store.store(3));
+    CHECK_EQ(store.load(), static_cast<std::uint64_t>(0));
+
+    std::remove(fileTemplate);
+}
+
+TEST(LoadDetailedDistinguishesAGenuineFirstRunFromAllFilesInvalid) {
+    TempDir dir;
+    SequenceFileStore store(dir.path());
+
+    const SequenceFileStore::LoadResult fresh = store.loadDetailed();
+    CHECK_EQ(fresh.value, static_cast<std::uint64_t>(0));
+    CHECK(!fresh.filesPresentButInvalid);
+
+    CHECK(store.store(500));
+    CHECK(store.store(700));  // both primary and backup now exist
+    writeRaw(dir.path() + "/sequence-state", "garbage");
+    writeRaw(dir.path() + "/sequence-state.bak", "also garbage");
+
+    const SequenceFileStore::LoadResult corrupted = store.loadDetailed();
+    CHECK_EQ(corrupted.value, static_cast<std::uint64_t>(0));
+    CHECK(corrupted.filesPresentButInvalid);
 }
 
 TEST(ResolveSequenceStateDirFollowsTheSamePrecedenceAsTheGoHelper) {
