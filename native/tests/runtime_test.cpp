@@ -840,7 +840,7 @@ TEST(ARuntimeOverAnEmptyBrightnessStoreStaysAtEngineDefaults) {
 // 20 which is also genuinely applied, the primary corrupts, and a naive
 // restart would come back at the superseded 80 instead of not brighter
 // than the unknown true last-applied value.
-TEST(ARestartWithACorruptedPrimaryAndAStaleBackupNeverComesBackBrighterThanWhatWasApplied) {
+TEST(ARestartWithACorruptedPrimaryAndAStaleBackupSettlesAtTheSafeCeilingNotTheStaleBackup) {
     TempDir dir;
     FakeDefinitions definitions;
     RecordingSink sink;
@@ -873,13 +873,27 @@ TEST(ARestartWithACorruptedPrimaryAndAStaleBackupNeverComesBackBrighterThanWhatW
 
     // Never the backup's superseded 80, and never the engine's own
     // bright built-in default of 100: the true last-applied value (20)
-    // is unrecoverable, so the only safe restart is dark.
-    CHECK_NEAR(restarted.brightness()->ceilingAt(gNow), 0.0, 1e-9);
+    // is unrecoverable, so the restart settles at the configured safe
+    // ceiling (the runtime's default here, kDefaultSafeCeilingPercent)
+    // rather than at zero, because a read error must not turn the rig
+    // off.
+    //
+    // Note deliberately what this gives up. 20 was the last value
+    // actually applied, and the safe ceiling is above it, so this DOES
+    // come back brighter than what was applied. That is the accepted
+    // trade: when the record cannot be trusted, the last applied value
+    // is unknown, and the only value that could never be brighter is
+    // zero. The safe ceiling is a bounded, operator-chosen dim rather
+    // than an unbounded restore, and it is bounded well below the
+    // engine's bright default. Do not "fix" this back to a
+    // never-brighter assertion without reopening that decision.
+    CHECK_NEAR(restarted.brightness()->ceilingAt(gNow), showmesh::kDefaultSafeCeilingPercent, 1e-9);
     CHECK(restarted.brightness()->ceilingAt(gNow) < 80.0);
-    // The coordinator-visible regression this closes: a dark settle must
-    // not pass silently. The adapter logs on this exact signal at
-    // startup (see plugin.cpp's logBrightnessRestartTrust), so if this
-    // stops being reported, the operator-facing log line stops too.
+    // The coordinator-visible regression this closes: an untrusted-
+    // restart settle must not pass silently. The adapter logs on this
+    // exact signal at startup (see plugin.cpp's logBrightnessRestartTrust),
+    // so if this stops being reported, the operator-facing log line
+    // stops too.
     CHECK(restarted.brightnessRestartTrust() ==
           showmesh::BrightnessRestartTrust::kPrimaryUnreadableBackupRecovered);
 
@@ -915,9 +929,183 @@ TEST(ARestartOverADoublyCorruptRecordNeverComesBackAtTheBrightDefault) {
     BrightnessFileStore secondStore(dir.path());
     ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore);
 
-    CHECK_NEAR(restarted.brightness()->ceilingAt(gNow), 0.0, 1e-9);
+    // Settles at the configured safe ceiling, not the engine's bright
+    // built-in default of 100 and not zero: see the sibling test above.
+    CHECK_NEAR(restarted.brightness()->ceilingAt(gNow), showmesh::kDefaultSafeCeilingPercent, 1e-9);
     CHECK(restarted.brightness()->ceilingAt(gNow) < 100.0);
     CHECK(restarted.brightnessRestartTrust() == showmesh::BrightnessRestartTrust::kNeitherRecordReadable);
+
+    gNow = savedNow;
+}
+
+// Both records unreadable, distinct from the "one existed but
+// nothing readable" case above, but the same branch
+// (kNeitherRecordReadable) and the same safe-ceiling settle: a checksum
+// mismatch, corruption, and an outright missing-but-expected file all
+// land here because BrightnessFileStore::load() cannot tell them apart
+// beyond "a record was expected and none of it can be trusted".
+TEST(ARestartWithBothRecordsUnreadableRestoresToTheConfiguredSafeCeiling) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    const TimeMillis savedNow = gNow;
+    std::vector<std::uint8_t> frame(4, 0xff);
+
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+        CHECK(runtime.applyBrightnessCommand("80", "0").ok);
+        runtime.modifyChannelData(frame.data(), frame.size());
+        CHECK(runtime.flushBrightnessState());
+        CHECK(runtime.applyBrightnessCommand("20", "0").ok);
+        runtime.modifyChannelData(frame.data(), frame.size());
+        CHECK(runtime.flushBrightnessState());  // both primary and backup now exist
+    }
+
+    {
+        std::ofstream corruptPrimary(dir.path() + "/brightness-state", std::ios::trunc);
+        corruptPrimary << "garbage";
+        std::ofstream corruptBackup(dir.path() + "/brightness-state.bak", std::ios::trunc);
+        corruptBackup << "also garbage";
+    }
+
+    RecordingSink secondSink;
+    BrightnessFileStore secondStore(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore);
+
+    CHECK_NEAR(restarted.brightness()->ceilingAt(gNow), showmesh::kDefaultSafeCeilingPercent, 1e-9);
+    CHECK(restarted.brightnessRestartTrust() == showmesh::BrightnessRestartTrust::kNeitherRecordReadable);
+
+    gNow = savedNow;
+}
+
+// A checksum mismatch on the primary (a bit-flipped value line
+// paired with the original, now-stale checksum line) falls back to the
+// superseded backup, exactly like the unparseable-primary case above,
+// and the runtime must not trust that backup's numbers as current.
+TEST(ARestartWithAChecksumMismatchedPrimaryRestoresToTheConfiguredSafeCeiling) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    const TimeMillis savedNow = gNow;
+    std::vector<std::uint8_t> frame(4, 0xff);
+
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+        CHECK(runtime.applyBrightnessCommand("80", "0").ok);
+        runtime.modifyChannelData(frame.data(), frame.size());
+        CHECK(runtime.flushBrightnessState());
+        CHECK(runtime.applyBrightnessCommand("20", "0").ok);
+        runtime.modifyChannelData(frame.data(), frame.size());
+        CHECK(runtime.flushBrightnessState());  // backup now holds the 80 record
+    }
+
+    {
+        // Tamper the value line but leave the checksum line as it was for
+        // the true value, the same technique
+        // ABitFlippedRecordWithAStillPlausibleChecksumMismatchIsRejected
+        // uses in brightness_store_test.cpp.
+        std::ifstream in(dir.path() + "/brightness-state", std::ios::binary);
+        std::string valueLine;
+        std::string checksumLine;
+        std::getline(in, valueLine);
+        std::getline(in, checksumLine);
+        in.close();
+        std::ofstream out(dir.path() + "/brightness-state", std::ios::trunc | std::ios::binary);
+        out << valueLine << "x\n" << checksumLine << "\n";
+    }
+
+    RecordingSink secondSink;
+    BrightnessFileStore secondStore(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore);
+
+    CHECK_NEAR(restarted.brightness()->ceilingAt(gNow), showmesh::kDefaultSafeCeilingPercent, 1e-9);
+    CHECK(restarted.brightnessRestartTrust() ==
+          showmesh::BrightnessRestartTrust::kPrimaryUnreadableBackupRecovered);
+
+    gNow = savedNow;
+}
+
+// The configured safe ceiling is not hardcoded. A non-default
+// value passed to the constructor is what an untrusted restart actually
+// settles at.
+TEST(AConfiguredNonDefaultSafeCeilingIsHonoredOnAnUntrustedRestart) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    const TimeMillis savedNow = gNow;
+    std::vector<std::uint8_t> frame(4, 0xff);
+
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+        CHECK(runtime.applyBrightnessCommand("80", "0").ok);
+        runtime.modifyChannelData(frame.data(), frame.size());
+        CHECK(runtime.flushBrightnessState());  // primary: 80, no backup yet
+    }
+
+    {
+        std::ofstream corrupt(dir.path() + "/brightness-state", std::ios::trunc);
+        corrupt << "not a valid record";
+    }
+
+    RecordingSink secondSink;
+    BrightnessFileStore secondStore(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore, 25);
+
+    CHECK_NEAR(restarted.brightness()->ceilingAt(gNow), 25.0, 1e-9);
+    CHECK(restarted.brightnessRestartTrust() == showmesh::BrightnessRestartTrust::kNeitherRecordReadable);
+
+    gNow = savedNow;
+}
+
+// The settle must bump the revision the same way a local command
+// does, and the runtime's own publish path (encodeFullState(), what the
+// adapters' publishFullStateIfChanged() sends over MultiSync) must carry
+// that bumped revision rather than the zero a fresh engine starts at.
+// Before this change, settleDarkAfterUntrustedRestart() touched neither
+// revision_ nor stateChangedAtMillis_, so a settled node's full state
+// never actually went out.
+TEST(AnUntrustedRestartSettleBumpsTheRevisionAndPublishesFullState) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    const TimeMillis savedNow = gNow;
+    std::vector<std::uint8_t> frame(4, 0xff);
+
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+        CHECK(runtime.applyBrightnessCommand("80", "0").ok);
+        runtime.modifyChannelData(frame.data(), frame.size());
+        CHECK(runtime.flushBrightnessState());
+    }
+
+    {
+        std::ofstream corrupt(dir.path() + "/brightness-state", std::ios::trunc);
+        corrupt << "not a valid record";
+    }
+
+    RecordingSink secondSink;
+    BrightnessFileStore secondStore(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore);
+
+    CHECK(restarted.brightness()->revision() != 0);
+    const std::uint64_t settledRevision = restarted.brightness()->revision();
+    const TimeMillis settledStateChangedAt = restarted.brightness()->captureState(gNow).stateChangedAtMillis;
+    CHECK(settledStateChangedAt != 0);
+
+    // encodeFullState() is exactly what the adapters' publishFullStateIfChanged
+    // sends over MultiSync once the revision differs from the last one
+    // published; decoding the payload it produces here proves the
+    // settle's bumped revision genuinely reaches that path.
+    const std::string payload = restarted.encodeFullState();
+    CHECK(!payload.empty());
+    const showmesh::BrightnessStateDecode decoded = showmesh::decodeBrightnessState(payload);
+    CHECK(decoded.ok);
+    CHECK_EQ(decoded.state.revision, settledRevision);
+    CHECK_EQ(decoded.state.stateChangedAtMillis, settledStateChangedAt);
 
     gNow = savedNow;
 }

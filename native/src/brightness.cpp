@@ -446,11 +446,13 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
     return StateAdoption::kAdopted;
 }
 
-void BrightnessEngine::settleDarkAfterUntrustedRestart() {
-    ceiling_.settle(kMinPercent);
-    gain_.settle(kMinPercent);
-    lastAppliedCeiling_ = kMinPercent;
-    lastAppliedGain_ = kMinPercent;
+void BrightnessEngine::settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now) {
+    const double safeCeiling = clampPercent(static_cast<double>(safeCeilingPercent));
+    ceiling_.settle(safeCeiling);
+    gain_.settle(kMaxPercent);
+    lastAppliedCeiling_ = safeCeiling;
+    lastAppliedGain_ = kMaxPercent;
+    bumpRevision(now);
 }
 
 }  // namespace showmesh

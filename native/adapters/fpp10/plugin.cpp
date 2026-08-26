@@ -23,6 +23,7 @@
 #include "channel_ranges.h"
 #include "coordinator_delivery.h"
 #include "fpp_definition_source.h"
+#include "safe_ceiling.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
 
@@ -35,28 +36,32 @@ showmesh::TimeMillis nowMillis() {
 }
 
 // Reports what the constructor found on disk for brightness state, once,
-// at startup. A silent dark settle is worse than a blackout: it is
-// indistinguishable from a dead output chain and sends an operator
-// debugging the wrong subsystem on show night. See
-// BrightnessEngine::settleDarkAfterUntrustedRestart and
-// ShowMeshRuntime::brightnessRestartTrust().
-void logBrightnessRestartTrust(showmesh::BrightnessRestartTrust trust) {
+// at startup. A silent settle to the safe ceiling is worse than an
+// unexplained dim rig: it sends an operator debugging the wrong subsystem
+// on show night. See BrightnessEngine::settleSafeAfterUntrustedRestart
+// and ShowMeshRuntime::brightnessRestartTrust(). safeCeilingPercent is
+// the value the settle actually used, so the log line names it rather
+// than a stale literal.
+void logBrightnessRestartTrust(showmesh::BrightnessRestartTrust trust, int safeCeilingPercent) {
     switch (trust) {
         case showmesh::BrightnessRestartTrust::kTrustedOrNoRecord:
             return;
         case showmesh::BrightnessRestartTrust::kPrimaryUnreadableBackupRecovered:
             LogErr(VB_PLUGIN,
                    "ShowMesh: the primary brightness record could not be read; only a superseded backup "
-                   "was found. Refusing to trust it, this plugin has deliberately settled at zero "
-                   "brightness rather than risk restoring brighter than what was actually applied. This "
-                   "clears on the next ShowMesh brightness command or an adopted MultiSync full state.\n");
+                   "was found. Refusing to trust it, this plugin has deliberately settled at the "
+                   "configured safe ceiling of %d%% rather than risk restoring brighter than what was "
+                   "actually applied. This clears on the next ShowMesh brightness command or an adopted "
+                   "MultiSync full state.\n",
+                   safeCeilingPercent);
             return;
         case showmesh::BrightnessRestartTrust::kNeitherRecordReadable:
             LogErr(VB_PLUGIN,
                    "ShowMesh: neither the primary nor the backup brightness record could be read. This "
-                   "plugin has deliberately settled at zero brightness rather than guess what was last "
-                   "applied. This clears on the next ShowMesh brightness command or an adopted MultiSync "
-                   "full state.\n");
+                   "plugin has deliberately settled at the configured safe ceiling of %d%% rather than "
+                   "guess what was last applied. This clears on the next ShowMesh brightness command or "
+                   "an adopted MultiSync full state.\n",
+                   safeCeilingPercent);
             return;
     }
 }
@@ -68,9 +73,10 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
           sequenceStore_(showmesh::resolveSequenceStateDir()),
           brightnessStore_(showmesh::resolveSequenceStateDir()),
           delivery_(nowMillis),
+          safeCeilingPercent_(showmesh::adapter::resolveSafeCeilingPercent()),
           runtime_(&definitions_, delivery_.client(), nowMillis, &sequenceStore_, delivery_.client(),
-                  &brightnessStore_) {
-        logBrightnessRestartTrust(runtime_.brightnessRestartTrust());
+                  &brightnessStore_, safeCeilingPercent_) {
+        logBrightnessRestartTrust(runtime_.brightnessRestartTrust(), safeCeilingPercent_);
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
         showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
@@ -236,6 +242,10 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
     // Declared before runtime_ for the same reason sequenceStore_ is: the
     // runtime holds pointers into it from construction onward.
     showmesh::adapter::CoordinatorDelivery delivery_;
+    // Declared before runtime_ for the same reason: resolved from the
+    // "ShowMeshSafeCeilingPercent" setting once, here, before runtime_'s
+    // constructor uses it to settle an untrusted restart.
+    int safeCeilingPercent_;
     showmesh::ShowMeshRuntime runtime_;
     Command* command_ = nullptr;
     std::uint64_t publishedRevision_ = 0;
