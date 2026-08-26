@@ -16,6 +16,14 @@ namespace showmesh {
 constexpr int kMinPercent = 0;
 constexpr int kMaxPercent = 100;
 
+// The built-in fallback for the "ShowMeshSafeCeilingPercent" plugin
+// setting: what an untrusted-restart settle restores to when the setting
+// is absent, empty, unparseable, or out of range. A placeholder the
+// operator is expected to tune per rig, named once here rather than
+// scattered as a literal. See showmesh/safe_ceiling_setting.h for the
+// setting's own pure parser.
+constexpr int kDefaultSafeCeilingPercent = 50;
+
 // The registered action's own bound on a fade, one day in seconds.
 constexpr std::int64_t kMaxFadeSeconds = 86400;
 
@@ -185,15 +193,25 @@ class BrightnessEngine {
     // value than either.
     StateAdoption restoreFromPersisted(const BrightnessState& state, TimeMillis now);
 
-    // Settles both values at their darkest possible level, with no active
-    // fade. Called on a restart that finds persisted brightness state it
-    // cannot trust at all -- neither a valid primary nor a valid backup,
-    // or only a backup whose numbers describe state this host had
-    // already superseded before it stopped (see
-    // BrightnessFileStore::load()'s trustedAsCurrent). The last value
-    // this host actually applied is unknown in that case, so the engine's
-    // ordinarily-bright built-in default is not safe to fall back to.
-    void settleDarkAfterUntrustedRestart();
+    // Settles ceiling at the given safe ceiling percent (clamped to
+    // 0-100) and gain at 100, with no active fade. Called on a restart
+    // that finds persisted brightness state it cannot trust at all --
+    // neither a valid primary nor a valid backup, or only a backup whose
+    // numbers describe state this host had already superseded before it
+    // stopped (see BrightnessFileStore::load()'s trustedAsCurrent). The
+    // last value this host actually applied is unknown in that case, so
+    // the engine's ordinarily-bright built-in default is not safe to fall
+    // back to; a file or setting read error must not turn the rig off,
+    // so it comes back at the operator-configured safe ceiling instead of
+    // dark. Gain settles to 100 because the ceiling alone is what carries
+    // the safety here.
+    //
+    // Also bumps the revision the same way a local change does (now is
+    // used to order it, via the same max(now, stateChangedAtMillis_ + 1)
+    // rule bumpRevision applies elsewhere), so the settle is published
+    // and a MultiSync group can converge on it instead of a settled node
+    // sitting silent forever.
+    void settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now);
 
     std::uint64_t revision() const { return revision_; }
 

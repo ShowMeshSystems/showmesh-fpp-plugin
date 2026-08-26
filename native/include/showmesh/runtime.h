@@ -52,11 +52,11 @@ struct CommandOutcome {
 };
 
 // What the constructor found on disk for brightness state, reported so
-// the adapter can announce a dark settle loudly rather than let it pass
+// the adapter can announce a safe settle loudly rather than let it pass
 // silently. kTrustedOrNoRecord covers both a trusted primary (normal
 // restart) and a true first run (nothing ever written): neither is
 // anything an operator needs to hear about. The other two both mean
-// BrightnessEngine::settleDarkAfterUntrustedRestart() ran.
+// BrightnessEngine::settleSafeAfterUntrustedRestart() ran.
 enum class BrightnessRestartTrust {
     kTrustedOrNoRecord,
     // The primary record failed to parse; only a backup -- the state the
@@ -179,9 +179,17 @@ class ShowMeshRuntime {
     // before start() ever runs: see brightness_store.h for what that
     // restores and the darker-only guarantee it makes. Passing nullptr
     // leaves the engine at its built-in defaults, the previous behavior.
+    // safeCeilingPercent governs only the untrusted-restart settle below;
+    // it is read once here, at construction, because the restore happens
+    // inside this constructor before an adapter could ever call a
+    // setter, and it only matters at restore time -- no settings listener
+    // is needed for it after that. Defaulted to the built-in constant so
+    // every existing caller and test compiles unchanged; both adapters
+    // pass the "ShowMeshSafeCeilingPercent" setting's value instead.
     ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                     SequenceFileStore* sequenceStore = nullptr, DefinitionPublisher* definitions_publisher = nullptr,
-                    BrightnessFileStore* brightnessStore = nullptr);
+                    BrightnessFileStore* brightnessStore = nullptr,
+                    int safeCeilingPercent = kDefaultSafeCeilingPercent);
     ~ShowMeshRuntime();
 
     // Guarded engine access. The returned accessor holds engineMutex_ for
@@ -284,10 +292,11 @@ class ShowMeshRuntime {
     // Set once, at construction, from what brightnessStore_->load() found
     // (or from BrightnessFileStore's default when no store is
     // configured). Read by the adapter constructor right after runtime_
-    // itself finishes constructing, so it can log a settleDarkAfterUntrusted-
-    // Restart() event exactly once, loudly, at startup, rather than let a
-    // full-black restart pass with nothing anywhere saying why. This is
-    // the seam: native/src cannot call LogErr itself.
+    // itself finishes constructing, so it can log a
+    // settleSafeAfterUntrustedRestart() event exactly once, loudly, at
+    // startup, rather than let a settle to the safe ceiling pass with
+    // nothing anywhere saying why. This is the seam: native/src cannot
+    // call LogErr itself.
     BrightnessRestartTrust brightnessRestartTrust() const { return brightnessRestartTrust_; }
 
     const CallbackHandoff& handoff() const { return handoff_; }

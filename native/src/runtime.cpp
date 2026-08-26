@@ -1,5 +1,6 @@
 #include "showmesh/runtime.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -59,7 +60,7 @@ bool playlistNameIsPathSafe(const std::string& name) {
 
 ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                                  SequenceFileStore* sequenceStore, DefinitionPublisher* definitionPublisher,
-                                 BrightnessFileStore* brightnessStore)
+                                 BrightnessFileStore* brightnessStore, int safeCeilingPercent)
     : definitions_(definitions),
       sink_(sink),
       clock_(clock),
@@ -95,9 +96,12 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
     // primary was corrupt, or neither file parsing despite one existing
     // -- means state was durably written here at some point. Only the
     // trusted-primary case is handed to restoreFromPersisted; the other
-    // two hand the engine nothing it can vouch for, so it settles dark
-    // rather than risk the backup's superseded numbers or its own bright
-    // defaults being wrong in the brighter direction.
+    // two hand the engine nothing it can vouch for, so it settles at the
+    // operator-configured safe ceiling rather than risk the backup's
+    // superseded numbers or its own bright defaults being wrong in the
+    // brighter direction. A read error must not turn the rig off, so the
+    // settle lands at safeCeilingPercent (clamped below), not at zero.
+    const int clampedSafeCeilingPercent = std::min(std::max(safeCeilingPercent, kMinPercent), kMaxPercent);
     if (brightnessStore_ != nullptr) {
         BrightnessStateLoad loaded = brightnessStore_->load();
         if (loaded.ok && loaded.trustedAsCurrent) {
@@ -107,12 +111,12 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
             // Primary unreadable; only the superseded backup parsed.
             brightnessRestartTrust_ = BrightnessRestartTrust::kPrimaryUnreadableBackupRecovered;
             std::lock_guard<std::mutex> lock(engineMutex_);
-            engine_.settleDarkAfterUntrustedRestart();
+            engine_.settleSafeAfterUntrustedRestart(clampedSafeCeilingPercent, clock_());
         } else if (loaded.recordExpectedButUnreadable) {
             // Neither file parsed, despite one existing.
             brightnessRestartTrust_ = BrightnessRestartTrust::kNeitherRecordReadable;
             std::lock_guard<std::mutex> lock(engineMutex_);
-            engine_.settleDarkAfterUntrustedRestart();
+            engine_.settleSafeAfterUntrustedRestart(clampedSafeCeilingPercent, clock_());
         }
     }
 }
