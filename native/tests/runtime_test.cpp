@@ -1060,37 +1060,6 @@ TEST(AConfiguredNonDefaultSafeCeilingIsHonoredOnAnUntrustedRestart) {
     gNow = savedNow;
 }
 
-// Gain settles to 100 on the same untrusted-restart path, because
-// the ceiling is what carries the safety, not the gain.
-TEST(AnUntrustedRestartSettlesGainToOneHundred) {
-    TempDir dir;
-    FakeDefinitions definitions;
-    RecordingSink sink;
-    const TimeMillis savedNow = gNow;
-    std::vector<std::uint8_t> frame(4, 0xff);
-
-    {
-        BrightnessFileStore store(dir.path());
-        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
-        CHECK(runtime.applyBrightnessCommand("80", "0").ok);
-        runtime.modifyChannelData(frame.data(), frame.size());
-        CHECK(runtime.flushBrightnessState());
-    }
-
-    {
-        std::ofstream corrupt(dir.path() + "/brightness-state", std::ios::trunc);
-        corrupt << "not a valid record";
-    }
-
-    RecordingSink secondSink;
-    BrightnessFileStore secondStore(dir.path());
-    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore);
-
-    CHECK_NEAR(restarted.brightness()->gainAt(gNow), 100.0, 1e-9);
-
-    gNow = savedNow;
-}
-
 // The settle must bump the revision the same way a local command
 // does, and the runtime's own publish path (encodeFullState(), what the
 // adapters' publishFullStateIfChanged() sends over MultiSync) must carry

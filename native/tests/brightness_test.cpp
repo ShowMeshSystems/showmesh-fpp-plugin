@@ -305,6 +305,47 @@ TEST(AnImplausibleFadeWindowIsRejectedBeforeAdoption) {
     CHECK(engine.adoptState(ok, kT0) == StateAdoption::kAdopted);
 }
 
+// The untrusted-restart settle, tested directly on the engine rather than
+// through a runtime restart. It has to be done here: after a restart the
+// engine is fresh, and a fresh engine's gain default is already 100, so a
+// restart-level assertion that gain equals 100 passes whether or not the
+// settle touched gain at all. Driving the engine to values that differ from
+// both the defaults and the settle values is the only way the assertions
+// can fail if the behaviour regresses.
+TEST(TheUntrustedRestartSettleMovesCeilingToTheSafeValueAndGainToFull) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(80, 0, kT0).ok);
+    CHECK(engine.setGain(40, 0, kT0).ok);
+    CHECK_NEAR(engine.ceilingAt(kT0), 80.0, 1e-9);
+    CHECK_NEAR(engine.gainAt(kT0), 40.0, 1e-9);
+    const std::uint64_t before = engine.revision();
+
+    // 25 is deliberately neither 80, nor 40, nor the built-in safe default
+    // of 50, nor the engine's own 100, so no assertion below can be
+    // satisfied by a value that was already there.
+    engine.settleSafeAfterUntrustedRestart(25, kT0 + 1000);
+
+    CHECK_NEAR(engine.ceilingAt(kT0 + 1000), 25.0, 1e-9);
+    CHECK_NEAR(engine.gainAt(kT0 + 1000), 100.0, 1e-9);
+    CHECK(!engine.fadingAt(kT0 + 1000));
+    // Louder, never brighter: the settle must announce itself so a
+    // MultiSync group can converge instead of the node sitting silent.
+    CHECK(engine.revision() > before);
+}
+
+// A configured safe ceiling outside 0-100 is clamped rather than trusted.
+TEST(TheUntrustedRestartSettleClampsAnOutOfRangeSafeCeiling) {
+    BrightnessEngine high;
+    CHECK(high.setCeiling(10, 0, kT0).ok);
+    high.settleSafeAfterUntrustedRestart(400, kT0 + 1000);
+    CHECK_NEAR(high.ceilingAt(kT0 + 1000), 100.0, 1e-9);
+
+    BrightnessEngine low;
+    CHECK(low.setCeiling(90, 0, kT0).ok);
+    low.settleSafeAfterUntrustedRestart(-5, kT0 + 1000);
+    CHECK_NEAR(low.ceilingAt(kT0 + 1000), 0.0, 1e-9);
+}
+
 // finding 5: an inverted persisted window must settle at the darker
 // value, never at the target, which is what RES-018 section 1 requires.
 TEST(AnInvertedPersistedFadeWindowSettlesDarkerNotAtTheTarget) {
