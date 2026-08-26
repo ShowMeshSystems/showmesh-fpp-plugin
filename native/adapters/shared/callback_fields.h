@@ -27,23 +27,34 @@ inline std::string playlistNameOf(const Json::Value& playlist) {
     return name;
 }
 
-// The entry at one position within one section, when the callback's own
-// playlist object carries it. Absent evidence stays absent.
-inline const Json::Value* entryAt(const Json::Value& playlist, const std::string& section, int item) {
-    if (item < 0 || section.empty() || !playlist.isObject() || !playlist.isMember(section)) return nullptr;
-    const Json::Value& entries = playlist[section];
-    if (!entries.isArray() || static_cast<Json::ArrayIndex>(item) >= entries.size()) return nullptr;
-    return &entries[static_cast<Json::ArrayIndex>(item)];
+// The currently playing entry's own config, when the callback's own
+// playlist object carries one. FPP's Playlist::GetInfo() nests this under
+// "currentEntry" (Playlist::GetCurrentEntry() -> CurrentEntry()->GetConfig()),
+// not under an array keyed by section: the playlist object has no section
+// arrays at all on FPP 10. GetCurrentEntry() returns an empty (non-object)
+// value while the playlist is idle, which isMember() below treats the same
+// as "not present". Absent evidence stays absent.
+inline const Json::Value* currentEntryOf(const Json::Value& playlist) {
+    if (!playlist.isObject() || !playlist.isMember("currentEntry")) return nullptr;
+    const Json::Value& entry = playlist["currentEntry"];
+    return entry.isObject() ? &entry : nullptr;
 }
 
-inline std::string sequenceFilenameOf(const Json::Value& playlist, const std::string& section, int item) {
-    const Json::Value* entry = entryAt(playlist, section, item);
+// PlaylistEntrySequence::GetConfig() writes the sequence's filename to
+// "sequenceName". A media or other non-sequence entry has no such member,
+// so this stays absent rather than guessing.
+inline std::string sequenceFilenameOf(const Json::Value& playlist) {
+    const Json::Value* entry = currentEntryOf(playlist);
     return entry == nullptr ? std::string() : jsonString(*entry, "sequenceName");
 }
 
-inline std::string mediaFilenameOf(const Json::Value& playlist, const std::string& section, int item) {
-    const Json::Value* entry = entryAt(playlist, section, item);
-    return entry == nullptr ? std::string() : jsonString(*entry, "mediaName");
+// PlaylistEntryMedia::GetConfig() writes the media filename to
+// "mediaFilename" (the playlist *definition* spells the same value
+// "mediaName"; the runtime config field is named differently). A
+// sequence-only entry has no such member, so this stays absent.
+inline std::string mediaFilenameOf(const Json::Value& playlist) {
+    const Json::Value* entry = currentEntryOf(playlist);
+    return entry == nullptr ? std::string() : jsonString(*entry, "mediaFilename");
 }
 
 }  // namespace adapter

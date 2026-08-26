@@ -25,6 +25,11 @@ ifeq ($(strip $(JSONCPP_INCLUDE)),)
 JSONCPP_INCLUDE := -isystem /usr/include/jsoncpp
 endif
 
+JSONCPP_LIBS := $(shell pkg-config --libs jsoncpp 2>/dev/null)
+ifeq ($(strip $(JSONCPP_LIBS)),)
+JSONCPP_LIBS := -ljsoncpp
+endif
+
 # FPP's own headers are included with -isystem so their warnings do not
 # drown this repository's. -Werror applies to this code either way.
 INCLUDES := -I$(CORE_DIR)/include -Ishared -isystem $(FPP_SRC) $(JSONCPP_INCLUDE)
@@ -102,6 +107,22 @@ define require_symbols
 		fi; \
 	done
 endef
+
+# Unit tests for the adapter-shared headers that need nothing but jsoncpp
+# (section_names.h, callback_fields.h), plus the host-neutral entry-key
+# derivation they feed. Deliberately does not need FPP_SRC: the shared
+# headers under test only pull in fpp-json-compat.h, never an FPP header,
+# so this runs on a plain dev machine, unlike fpp9/fpp10 above.
+TEST_CORE_SOURCES := $(CORE_DIR)/src/json.cpp $(CORE_DIR)/src/sha256.cpp $(CORE_DIR)/src/playlist_identity.cpp
+TEST_BINARY        := $(BUILD)/adapter_shared_tests
+
+.PHONY: test
+test: $(TEST_BINARY)
+	$(TEST_BINARY)
+
+$(TEST_BINARY): shared/tests/adapter_shared_test.cpp $(CORE_DIR)/tests/main.cpp $(TEST_CORE_SOURCES)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(CORE_DIR)/include -I$(CORE_DIR)/tests -Ishared $(JSONCPP_INCLUDE) $^ $(JSONCPP_LIBS) -o $@
 
 .PHONY: clean
 clean:

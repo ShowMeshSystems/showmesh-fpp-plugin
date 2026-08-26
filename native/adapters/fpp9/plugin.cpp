@@ -27,6 +27,7 @@
 #include "coordinator_delivery.h"
 #include "fpp_definition_source.h"
 #include "safe_ceiling.h"
+#include "section_names.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
 
@@ -147,10 +148,11 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     void playlistCallback(const Json::Value& playlist, const std::string& action, const std::string& section,
                           int item) override {
         const std::string name = showmesh::adapter::playlistNameOf(playlist);
-        const std::string sequenceFilename = showmesh::adapter::sequenceFilenameOf(playlist, section, item);
-        const std::string mediaFilename = showmesh::adapter::mediaFilenameOf(playlist, section, item);
-        runtime_.observeCallback(name.c_str(), action.c_str(), section.c_str(), item, sequenceFilename.c_str(),
-                                 mediaFilename.c_str());
+        const std::string canonicalSection = showmesh::adapter::canonicalPlaylistSection(section);
+        const std::string sequenceFilename = showmesh::adapter::sequenceFilenameOf(playlist);
+        const std::string mediaFilename = showmesh::adapter::mediaFilenameOf(playlist);
+        runtime_.observeCallback(name.c_str(), action.c_str(), canonicalSection.c_str(), item,
+                                 sequenceFilename.c_str(), mediaFilename.c_str());
     }
 
     // FPP's output thread, immediately before data goes to the outputs.
