@@ -19,9 +19,11 @@ for implementation decisions instead of remembered state.
 - For multi-file, ambiguous, architectural, or risky work, inspect the affected
   code and governing records, then present a concrete file-level plan before
   editing.
-- Treat accepted decisions as frozen. Raise one precise contradiction with
-  citations when observed; do not repeatedly relitigate or silently work around
-  it.
+- Fix what you were asked to fix. Report an adjacent defect in a sentence
+  instead of fixing it, and file at most one follow-up issue per task.
+- Treat accepted decisions as frozen. If you observe a contradiction, say so in
+  one sentence and ask. Do not relitigate it, work around it silently, or turn
+  it into a review pass.
 - Decide reversible implementation details and continue. Stop only for a real
   conflict, destructive action, missing authority, or inaccessible required
   evidence.
@@ -30,11 +32,17 @@ for implementation decisions instead of remembered state.
 
 ## Evidence and delivery
 
-Follow `AGENTS.md`'s proportional gates and publishing boundary. Never claim a
-real-host, FPP-version, release, or runtime result that was not observed. For an
-authorized implementation task, ordinary completion includes committing and
-pushing the task branch; it does not include release publication or fleet
-installation.
+Eric runs the real-hardware test. Your work ends at built, unit tested, benched
+in a container where the bench covers it, and pushed. The containerized `fppd`
+bench is yours to run and keep working. Real players, real fixtures, and the
+deployed fleet are his, so never claim a real-host, release, or runtime result
+that was not observed. For an authorized implementation task, ordinary
+completion includes committing and pushing the task branch; it does not include
+release publication or fleet installation.
+
+Keep written output short. Three lines of code comment at most unless the file
+documents a wire format. A Linear comment fits on one screen, with gate output
+in a fenced block or a link rather than prose.
 
 ## Private maintainer overlays
 

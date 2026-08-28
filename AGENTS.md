@@ -15,8 +15,9 @@ component. It supports FPP 9.4-9.x and FPP 10.x.
 - The remaining FPP-host runtime, tests, and release assets live here.
 
 Never implement coordinator-side work in this repository. If a coordinator
-contract is missing or contradicts the pinned governing records, report the
-exact conflict and stop the affected work. Do not invent a parallel wire shape.
+rule is missing or contradicts the pinned governing records, name the exact
+conflict in your response and ask the owner. Do not invent a parallel wire
+shape.
 
 ## Governing records
 
@@ -28,9 +29,10 @@ that directory's provenance and refresh rules.
 - Read `docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md` before touching the
   observation or definition wire shape. It is frozen and byte exact.
 - Read ADR-043 and Track H for playlist-identity work.
-- Treat accepted decisions as frozen implementation inputs. New observed
-  evidence may justify an upstream correction; it does not justify silently
-  replacing the design in this repository.
+- Treat accepted decisions as frozen implementation inputs. Do not silently
+  replace a design. If evidence contradicts one, say so in your response and ask
+  the owner. Do not stop the work, open a correction record, or start a review
+  pass unless the owner asks for one.
 
 ## Frozen implementation rules
 
@@ -65,26 +67,46 @@ that directory's provenance and refresh rules.
 
 ## Evidence and verification
 
-Passing unit tests is not completion. A change closes when its stated behavior
-is observed at the applicable boundary.
+The owner runs the real-hardware test. An agent's work ends at built, unit
+tested, benched in a container where the bench covers it, and pushed.
+
+The containerized `fppd` bench under `bench/` is yours. Run it, keep it working,
+and trust its result. What is not yours is a real player, real fixtures, a real
+SD card, and the deployed fleet. Never simulate those to manufacture evidence,
+and never treat new test scaffolding as the deliverable when the assigned task
+was a fix.
 
 - Choose gates from the final diff. A prose-only change receives prose, link,
   and consistency checks, not unrelated builds or integration suites.
 - For executable changes, run the focused tests plus `make check` when the diff
   can affect shipped binaries, native code, packaging, or generated output.
-- Run version-specific or real-host gates only when the changed behavior or
-  acceptance criteria require them. Keep unavailable hardware evidence open.
+- Run the container bench when the diff can change what it covers. Write
+  real-hardware behavior down as unobserved and hand it to the owner rather than
+  reaching for it.
 - Exercise named failure cases. A test that still passes after the behavior it
   claims to constrain is broken is not evidence.
 - Inspect the final diff for secrets, generated artifacts, and accidental files.
 - Distinguish observed behavior, inference, and unverified expectations. Use
   `should` for behavior that was not observed.
 
+## Stay inside the assigned task
+
+The assigned task is the whole deliverable. Fix what you were asked to fix.
+
+- File at most one follow-up issue per task, and only when the thing you found
+  breaks the work you were assigned. Everything else goes in your response as a
+  sentence for the owner to rule on.
+- Never fix an adjacent defect, refactor neighbouring code, or improve a nearby
+  document because you were in the file.
+- Never create a decision record, plan document, review pass, or replacement
+  issue unless the owner asked for one.
+
 ## Code comments
 
-Write the minimum needed to explain a non-obvious invariant, safety boundary,
-caller-visible contract, or external-system trap that names and types cannot
-express.
+Three lines of comment, maximum, unless the file documents a wire format or an
+external system's exact behavior. Explain a non-obvious rule, safety boundary,
+caller-visible guarantee, or external-system trap that names and types cannot
+express. If the comment is longer than the code it describes, it is wrong.
 
 - Do not preserve narrative history, design essays, review findings, or a
   restatement of the next statement in code comments.
