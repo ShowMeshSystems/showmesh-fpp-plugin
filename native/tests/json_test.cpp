@@ -26,6 +26,44 @@ std::string formatted(double v) {
     return formatNumber(v, &out) ? out : std::string("<unrepresentable>");
 }
 
+// Only containers count toward depth: n nested arrays/objects have depth n
+// regardless of what, if anything, sits in the innermost one. The innermost
+// container itself is either empty or holds one scalar member/element;
+// wrapping containers always hold exactly the next container.
+std::string nestedArrays(int n, bool emptyInnermost) {
+    const std::string innermost = emptyInnermost ? "" : "0";
+    return std::string(static_cast<std::size_t>(n), '[') + innermost + std::string(static_cast<std::size_t>(n), ']');
+}
+std::string nestedObjects(int n, bool emptyInnermost) {
+    std::string open, close;
+    for (int i = 0; i < n - 1; ++i) {
+        open += "{\"k\":";
+        close += "}";
+    }
+    const std::string last = emptyInnermost ? "{}" : "{\"k\":0}";
+    return open + last + close;
+}
+std::string nestedMixed(int n, bool emptyInnermost) {
+    std::string open, close;
+    for (int i = 0; i < n - 1; ++i) {
+        if (i % 2 == 0) {
+            open += "[";
+            close += "]";
+        } else {
+            open += "{\"k\":";
+            close += "}";
+        }
+    }
+    const bool lastIsObject = (n - 1) % 2 == 1;
+    std::string last;
+    if (lastIsObject) {
+        last = emptyInnermost ? "{}" : "{\"k\":0}";
+    } else {
+        last = emptyInnermost ? "[]" : "[0]";
+    }
+    return open + last + close;
+}
+
 }  // namespace
 
 TEST(CanonicalizationSortsMembersAndStripsWhitespace) {
@@ -86,6 +124,42 @@ TEST(MalformedJsonIsRejectedRatherThanRepaired) {
     CHECK(!canonicalize("{\"a\":1} trailing").ok);
     CHECK(!canonicalize("[\"\\ud800\"]").ok);
     CHECK(!canonicalize("").ok);
+}
+
+// Depth is bounded at container entry (kMaxDepth=200 in json.cpp), matching
+// the coordinator's Go parser, which checks immediately after incrementing
+// depth inside parseArray/parseObject. Only containers count, so 200 nested
+// containers must be accepted and 201 refused regardless of whether the
+// innermost container is empty or holds a scalar, and this must hold for
+// arrays, objects, and a chain that alternates between them (a suite that
+// only nests arrays would miss a bound applied to parseArray but not
+// parseObject).
+TEST(DepthBoundIsCheckedAtContainerEntryForArraysObjectsAndMixedChains) {
+    for (const auto& builder : {nestedArrays, nestedObjects, nestedMixed}) {
+        CHECK(canonicalize(builder(200, /*emptyInnermost=*/true)).ok);
+        CHECK(canonicalize(builder(200, /*emptyInnermost=*/false)).ok);
+        CHECK(!canonicalize(builder(201, /*emptyInnermost=*/true)).ok);
+        CHECK(!canonicalize(builder(201, /*emptyInnermost=*/false)).ok);
+        CHECK(!canonicalize(builder(202, /*emptyInnermost=*/true)).ok);
+        CHECK(!canonicalize(builder(202, /*emptyInnermost=*/false)).ok);
+    }
+}
+
+// Matches the coordinator's Go decoder: a lone continuation byte, a
+// truncated multi-byte sequence, and an over-long encoding are all refused
+// in both a string value and a member name, rather than passed through raw.
+TEST(InvalidUtf8IsRejectedInStringValuesAndMemberNames) {
+    CHECK(!canonicalize(std::string("{\"s\":\"bad\x80""byte\"}")).ok);   // lone continuation byte
+    CHECK(!canonicalize(std::string("{\"s\":\"trunc\xE2\x80\"}")).ok);   // truncated 3-byte sequence
+    CHECK(!canonicalize(std::string("{\"s\":\"over\xC0\x80\"}")).ok);    // over-long encoding of NUL
+    CHECK(!canonicalize(std::string("{\"bad\x80name\":1}")).ok);         // lone continuation byte in a member name
+    CHECK(!canonicalize(std::string("{\"trunc\xE2\x80\":1}")).ok);       // truncated sequence in a member name
+
+    // Positive control: a valid 2-byte sequence (e-acute) passes in both
+    // positions, so the refusals above are the decoder rejecting bad bytes,
+    // not rejecting every non-ASCII string.
+    CHECK_EQ(canonicalText(std::string("{\"caf\xC3\xA9\":\"caf\xC3\xA9\"}")),
+             std::string("{\"caf\xC3\xA9\":\"caf\xC3\xA9\"}"));
 }
 
 TEST(CanonicalizationIsIdempotent) {

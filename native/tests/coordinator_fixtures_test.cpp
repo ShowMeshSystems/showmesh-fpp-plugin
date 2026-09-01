@@ -50,7 +50,85 @@ const Value* findMember(const Value& object, const std::string& name) {
     return nullptr;
 }
 
+// Decodes lowercase hex bytes, as a fixture case's inputHex field carries a
+// byte sequence a JSON string cannot hold (invalid UTF-8). Returns false on
+// odd length or a non-hex digit, which a case must never hit: those failures
+// mean the fixture itself is malformed.
+bool hexDecode(const std::string& hex, std::string* out) {
+    if (hex.size() % 2 != 0) return false;
+    out->clear();
+    out->reserve(hex.size() / 2);
+    for (std::size_t i = 0; i < hex.size(); i += 2) {
+        int nibbles[2];
+        for (int k = 0; k < 2; ++k) {
+            const char c = hex[i + static_cast<std::size_t>(k)];
+            if (c >= '0' && c <= '9') {
+                nibbles[k] = c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+                nibbles[k] = c - 'a' + 10;
+            } else {
+                return false;
+            }
+        }
+        out->push_back(static_cast<char>((nibbles[0] << 4) | nibbles[1]));
+    }
+    return true;
+}
+
+// A case supplies exactly one of input or inputHex; inputHex exists because
+// a JSON string cannot carry a byte sequence that is not valid UTF-8.
+// Returns false, with *errorOut set, on neither/both present or malformed
+// hex, rather than silently resolving to an empty string: a misspelled
+// field name must fail loudly, not canonicalize nothing.
+bool resolveCaseInput(const Value& c, std::string* input, std::string* errorOut) {
+    const Value* inputField = findMember(c, "input");
+    const Value* inputHexField = findMember(c, "inputHex");
+    if ((inputField == nullptr) == (inputHexField == nullptr)) {
+        *errorOut = "must supply exactly one of input or inputHex";
+        return false;
+    }
+    if (inputField != nullptr) {
+        *input = inputField->string();
+        return true;
+    }
+    if (!hexDecode(inputHexField->string(), input)) {
+        *errorOut = "has malformed inputHex";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
+
+// Exercises resolveCaseInput directly against synthetic cases rather than
+// the vendored fixture, which is frozen and always well-formed: nothing in
+// it would ever call this guard, so a fixture-only suite would let the
+// guard rot away without any test noticing.
+TEST(FixtureCaseMustSupplyExactlyOneOfInputOrInputHex) {
+    std::string input, error;
+
+    Value neither = Value::makeObject({});
+    CHECK(!resolveCaseInput(neither, &input, &error));
+
+    std::vector<Value::Member> both;
+    both.emplace_back("input", Value::makeString("{}"));
+    both.emplace_back("inputHex", Value::makeString("7b7d"));
+    CHECK(!resolveCaseInput(Value::makeObject(std::move(both)), &input, &error));
+
+    std::vector<Value::Member> justInput;
+    justInput.emplace_back("input", Value::makeString("{}"));
+    CHECK(resolveCaseInput(Value::makeObject(std::move(justInput)), &input, &error));
+    CHECK_EQ(input, "{}");
+
+    std::vector<Value::Member> justHex;
+    justHex.emplace_back("inputHex", Value::makeString("7b7d"));
+    CHECK(resolveCaseInput(Value::makeObject(std::move(justHex)), &input, &error));
+    CHECK_EQ(input, "{}");
+
+    std::vector<Value::Member> badHex;
+    badHex.emplace_back("inputHex", Value::makeString("zz"));
+    CHECK(!resolveCaseInput(Value::makeObject(std::move(badHex)), &input, &error));
+}
 
 TEST(CppCanonicalizationMatchesCoordinatorFixtures) {
     std::string raw = readFileOrFail(kCanonicalizationFixturePath);
@@ -67,15 +145,35 @@ TEST(CppCanonicalizationMatchesCoordinatorFixtures) {
 
     for (const Value& c : cases->items()) {
         std::string name;
-        std::string input;
         std::string expectedCanonical;
         std::string expectedSha256;
         bool expectError = false;
         if (const Value* v = findMember(c, "name")) name = v->string();
-        if (const Value* v = findMember(c, "input")) input = v->string();
         if (const Value* v = findMember(c, "expectedCanonical")) expectedCanonical = v->string();
         if (const Value* v = findMember(c, "expectedSha256")) expectedSha256 = v->string();
         if (const Value* v = findMember(c, "expectError")) expectError = v->boolean();
+
+        // A case supplies exactly one of input or inputHex; inputHex exists
+        // because a JSON string cannot carry a byte sequence that is not
+        // valid UTF-8. Refusing neither-or-both here, rather than silently
+        // canonicalizing an empty string, is what stops a misspelled field
+        // name from passing quietly.
+        const Value* inputField = findMember(c, "input");
+        const Value* inputHexField = findMember(c, "inputHex");
+        if ((inputField == nullptr) == (inputHexField == nullptr)) {
+            ::showmesh_test::reportFailure(
+                __FILE__, __LINE__,
+                "canonicalization case \"" + name + "\" must supply exactly one of input or inputHex");
+            continue;
+        }
+        std::string input;
+        if (inputField != nullptr) {
+            input = inputField->string();
+        } else if (!hexDecode(inputHexField->string(), &input)) {
+            ::showmesh_test::reportFailure(
+                __FILE__, __LINE__, "canonicalization case \"" + name + "\" has malformed inputHex");
+            continue;
+        }
 
         CanonicalResult r = canonicalize(input);
         if (expectError) {

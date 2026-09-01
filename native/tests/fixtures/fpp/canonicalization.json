@@ -63,6 +63,56 @@
       "input": "{not valid json",
       "expectError": true,
       "errorKind": "malformed-json"
+    },
+    {
+      "name": "depth-200-nested-arrays-empty-innermost",
+      "description": "Exactly 200 nested arrays (the accepted boundary, pkg/fppidentity maxDepth=200), innermost array empty. Only container entry counts toward depth, so this must be accepted; the plugin's C++ parser (which checks the bound at the top of parseValue) never evaluates the check for an empty innermost container either, so this pins the half of the depth contract both implementations already agree on.",
+      "input": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+      "expectedCanonical": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+      "expectedSha256": "d4c5d966af55699404c24de399162a5bee9733888d2f5dd0ab41515cf3995df4"
+    },
+    {
+      "name": "depth-200-nested-arrays-scalar-innermost",
+      "description": "Exactly 200 nested arrays (the accepted boundary), with a scalar 0 in the innermost array so it is non-empty. Pins the same accepted boundary as depth-200-nested-arrays-empty-innermost under the variant where the innermost container's own parseValue call (as the plugin's C++ parser performs it) actually runs.",
+      "input": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+      "expectedCanonical": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+      "expectedSha256": "ab1c74fb5a6fe2350be523ae86f987de1b122ca700cf1a831a30e9621b24b587"
+    },
+    {
+      "name": "depth-201-nested-arrays-empty-innermost",
+      "description": "201 nested arrays, one past the accepted boundary, with the innermost array empty. The coordinator's Go parser checks the depth bound immediately on entering parseArray, so this must be refused even with an empty innermost container. This is the shape the recorded off-by-one divergence turns on: the plugin's C++ parser checks depth_ > kMaxDepth at the top of parseValue, so a container with no elements never has parseValue called for a first element, and the plugin accepts this shape. See docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md section 1.3.",
+      "input": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+      "expectError": true,
+      "errorKind": "nesting-too-deep"
+    },
+    {
+      "name": "depth-201-nested-arrays-scalar-innermost",
+      "description": "201 nested arrays, one past the accepted boundary, with a scalar 0 in the innermost array so it is non-empty. Both the coordinator and the plugin refuse this shape: the non-empty innermost container triggers the plugin's parseValue depth check on its first element. Pins the half of the depth contract that already agrees, which a future refactor could break silently if only the empty-innermost pair were pinned.",
+      "input": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+      "expectError": true,
+      "errorKind": "nesting-too-deep"
+    },
+    {
+      "name": "invalid-utf8-string-value",
+      "description": "A string value containing a single lone 0x80 continuation byte with no preceding lead byte, an invalid UTF-8 sequence. Carried as inputHex, not input: a JSON string cannot hold a byte that is not valid UTF-8 without an RFC 8259-compliant decoder silently replacing it with U+FFFD before this coordinator's canonicalizer ever sees it (see README.md). The coordinator refuses (contract section 1.3); the plugin's C++ parser accepts this and passes the raw bytes through, so the two sides diverge here until the plugin's own fix, which also needs inputHex support, lands.",
+      "inputHex": "7b2273223a226261648062797465227d",
+      "expectError": true,
+      "errorKind": "invalid-utf8"
+    },
+    {
+      "name": "invalid-utf8-member-name",
+      "description": "An object member name containing a single lone 0x80 continuation byte, an invalid UTF-8 sequence. Carried as inputHex for the same reason as invalid-utf8-string-value. The coordinator refuses (contract section 1.3); the plugin's C++ parser accepts this and passes the raw bytes through, so the two sides diverge here until the plugin's own fix, which also needs inputHex support, lands.",
+      "inputHex": "7b22626164806e616d65223a317d",
+      "expectError": true,
+      "errorKind": "invalid-utf8"
+    },
+    {
+      "name": "inputhex-valid-utf8-positive-control",
+      "description": "A positive control for the inputHex field itself: perfectly valid UTF-8 bytes (an ASCII member alongside a member whose string value is caf\u00e9, e with an acute accent, a 2-byte UTF-8 sequence) carried as inputHex and expected to succeed exactly like an equivalent input case would. Exists so a consumer that ignores inputHex entirely (and would therefore also silently pass invalid-utf8-string-value and invalid-utf8-member-name by treating them as empty input) is caught here first: an all-refusal inputHex suite proves nothing about whether inputHex is actually read.",
+      "inputHex": "7b2261223a312c2262223a22636166c3a9227d",
+      "expectedCanonical": "{\"a\":1,\"b\":\"caf\u00e9\"}",
+      "expectedSha256": "f7a52e662c92fc838cc3e18c060954d6b27190e0051d76e139b8bab26a2923bd"
     }
+
   ]
 }
