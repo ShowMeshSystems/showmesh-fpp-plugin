@@ -149,7 +149,6 @@ class Parser {
     }
 
     bool parseValue(Value* out) {
-        if (depth_ > kMaxDepth) return err("JSON nesting is too deep");
         if (pos_ >= text_.size()) return err("unexpected end of input");
         switch (text_[pos_]) {
             case 'n':
@@ -179,6 +178,7 @@ class Parser {
     bool parseArray(Value* out) {
         ++pos_;  // '['
         ++depth_;
+        if (depth_ > kMaxDepth) return err("JSON nesting is too deep");
         std::vector<Value> items;
         skipWhitespace();
         if (pos_ < text_.size() && text_[pos_] == ']') {
@@ -211,6 +211,7 @@ class Parser {
     bool parseObject(Value* out) {
         ++pos_;  // '{'
         ++depth_;
+        if (depth_ > kMaxDepth) return err("JSON nesting is too deep");
         std::vector<Value::Member> members;
         skipWhitespace();
         if (pos_ < text_.size() && text_[pos_] == '}') {
@@ -289,6 +290,51 @@ class Parser {
         return true;
     }
 
+    // Validates and copies one raw (unescaped) UTF-8 character starting at
+    // pos_, rejecting a lone continuation byte, a truncated multi-byte
+    // sequence, and an over-long encoding, matching the coordinator's
+    // Go decoder. \u-escapes bypass this: appendCodePoint always emits
+    // valid UTF-8 for a code point that has already passed surrogate
+    // pairing above.
+    bool appendValidUtf8Char(std::string* out) {
+        const unsigned char c = static_cast<unsigned char>(text_[pos_]);
+        std::size_t len;
+        unsigned char lo1 = 0x80, hi1 = 0xBF;
+        if (c <= 0x7F) {
+            out->push_back(static_cast<char>(c));
+            ++pos_;
+            return true;
+        } else if (c >= 0xC2 && c <= 0xDF) {
+            len = 2;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            len = 3;
+            if (c == 0xE0) {
+                lo1 = 0xA0;
+            } else if (c == 0xED) {
+                hi1 = 0x9F;
+            }
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            len = 4;
+            if (c == 0xF0) {
+                lo1 = 0x90;
+            } else if (c == 0xF4) {
+                hi1 = 0x8F;
+            }
+        } else {
+            return err("invalid UTF-8 byte in a string");
+        }
+        if (pos_ + len > text_.size()) return err("truncated UTF-8 sequence in a string");
+        const unsigned char b1 = static_cast<unsigned char>(text_[pos_ + 1]);
+        if (b1 < lo1 || b1 > hi1) return err("invalid UTF-8 continuation byte in a string");
+        for (std::size_t k = 2; k < len; ++k) {
+            const unsigned char bk = static_cast<unsigned char>(text_[pos_ + k]);
+            if (bk < 0x80 || bk > 0xBF) return err("invalid UTF-8 continuation byte in a string");
+        }
+        out->append(text_, pos_, len);
+        pos_ += len;
+        return true;
+    }
+
     bool parseString(std::string* out) {
         ++pos_;  // opening quote
         out->clear();
@@ -301,8 +347,7 @@ class Parser {
             }
             if (c < 0x20) return err("unescaped control character in a string");
             if (c != '\\') {
-                out->push_back(static_cast<char>(c));
-                ++pos_;
+                if (!appendValidUtf8Char(out)) return false;
                 continue;
             }
             ++pos_;
