@@ -38,7 +38,7 @@ jobs:
         run: make vet
 
       - name: Test
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
 
   lint:
     runs-on: ubuntu-latest
