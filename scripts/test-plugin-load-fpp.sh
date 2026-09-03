@@ -215,7 +215,7 @@ fi
 
 RESULTS_NAMES=()
 RESULTS_STATUS=()
-EXPECTED_ASSERTIONS=8
+EXPECTED_ASSERTIONS=9
 SUMMARY_PRINTED=0
 SUMMARY_FAILED=0
 
@@ -1046,6 +1046,125 @@ a6() {
 }
 
 # ---------------------------------------------------------------------------
+# A9: mid-show playlist mismatch notice
+#
+# The owner ruling for the pre-release: a mid-show playlist change with no
+# FPP restart ships a notice only. FPP keeps playing the in-memory copy it
+# already loaded; the plugin re-reads the playlist file fresh on every
+# observation and can see an operator's on-disk edit that FPP itself will
+# not act on until a restart or re-import. This drives that sequence for
+# real, through FPP's own "Start Playlist" / "Next Playlist Item" commands
+# and its own WarningHolder-backed GET /api/fppd/warnings_full -- not a
+# fake of either. No sequence or media file is needed: a "pause" playlist
+# entry is enough to make FPP fire playlistCallback and advance between
+# entries.
+# ---------------------------------------------------------------------------
+
+PLAYLIST_MISMATCH_NAME="showmesh-bench-mismatch"
+PLAYLIST_MISMATCH_PATH="/home/fpp/media/playlists/${PLAYLIST_MISMATCH_NAME}.json"
+# Verbatim: native/include/showmesh/runtime.h kPlaylistMismatchInstruction,
+# and the coordinator's own fppreconcile.OperatorMismatchInstruction.
+PLAYLIST_MISMATCH_MESSAGE="Restart FPP, or re-import the playlist so the coordinator's binding and FPP agree."
+
+write_mismatch_playlist() {
+    local desc="$1"
+    cat <<JSON | docker exec -i "$CONTAINER" sh -c "cat > '$PLAYLIST_MISMATCH_PATH'"
+{
+  "name": "${PLAYLIST_MISMATCH_NAME}",
+  "desc": "${desc}",
+  "repeat": 0,
+  "loopCount": 0,
+  "leadIn": [],
+  "mainPlaylist": [
+    {"type": "pause", "duration": 30},
+    {"type": "pause", "duration": 30},
+    {"type": "pause", "duration": 30}
+  ],
+  "leadOut": []
+}
+JSON
+}
+
+run_playlist_command() {
+    local name="$1" args="$2"
+    curl_retrying -sS -o "/tmp/showmesh-bench-invoke.$$" -w '%{http_code}' \
+        -H 'Content-Type: application/json' \
+        -d "{\"command\":\"${name}\",\"args\":${args},\"multisyncCommand\":false,\"multisyncHosts\":\"\"}" \
+        "${API}/command"
+}
+
+warnings_full_json() {
+    curl -fsS "${API}/fppd/warnings_full" 2>/dev/null || true
+}
+
+mismatch_notice_present() {
+    echo "$1" | jq -e --arg msg "$PLAYLIST_MISMATCH_MESSAGE" \
+        'any(.[]?; .message == $msg and .plugin == "fpp-showmesh")' >/dev/null 2>&1
+}
+
+a9() {
+    write_mismatch_playlist "original"
+
+    local code
+    code="$(run_playlist_command "Start Playlist" "[\"${PLAYLIST_MISMATCH_NAME}\"]")"
+    if [ "$code" != "200" ]; then
+        record "A9_playlist_mismatch_notice" "FAIL" "Start Playlist returned http=$code: $(invoke_command_body)"
+        return
+    fi
+    invoke_command_body >/dev/null
+    sleep 2
+
+    local before_edit
+    before_edit="$(warnings_full_json)"
+    if mismatch_notice_present "$before_edit"; then
+        record "A9_playlist_mismatch_notice" "FAIL" "notice already present right after Start Playlist, before any edit: $before_edit"
+        return
+    fi
+
+    # The operator edits the bound playlist on disk while it is playing.
+    # FPP keeps the in-memory copy it already loaded; only advancing the
+    # playlist causes a fresh observeCallback, which is what re-reads the
+    # file and notices the drift.
+    write_mismatch_playlist "edited mid-show"
+    code="$(run_playlist_command "Next Playlist Item" "[]")"
+    if [ "$code" != "200" ]; then
+        record "A9_playlist_mismatch_notice" "FAIL" "Next Playlist Item (after edit) returned http=$code: $(invoke_command_body)"
+        return
+    fi
+    invoke_command_body >/dev/null
+    sleep 2
+
+    local after_edit
+    after_edit="$(warnings_full_json)"
+    if ! mismatch_notice_present "$after_edit"; then
+        record "A9_playlist_mismatch_notice" "FAIL" "notice not present after the on-disk edit and a Next Playlist Item observation: $after_edit"
+        return
+    fi
+
+    # The operator restores the file to what FPP originally loaded.
+    write_mismatch_playlist "original"
+    code="$(run_playlist_command "Next Playlist Item" "[]")"
+    if [ "$code" != "200" ]; then
+        record "A9_playlist_mismatch_notice" "FAIL" "Next Playlist Item (after restore) returned http=$code: $(invoke_command_body)"
+        return
+    fi
+    invoke_command_body >/dev/null
+    sleep 2
+
+    local after_restore
+    after_restore="$(warnings_full_json)"
+    if mismatch_notice_present "$after_restore"; then
+        record "A9_playlist_mismatch_notice" "FAIL" "notice still present after the file was restored to what FPP loaded and a further observation was made: $after_restore"
+        return
+    fi
+
+    run_playlist_command "Stop Now" "[]" >/dev/null
+    invoke_command_body >/dev/null
+
+    record "A9_playlist_mismatch_notice" "PASS" "notice absent right after Start Playlist, present after the on-disk edit was observed, and cleared once the file matched the loaded baseline again"
+}
+
+# ---------------------------------------------------------------------------
 # A7: no second listener on UDP 32320, and the one listener is fppd
 # ---------------------------------------------------------------------------
 
@@ -1131,6 +1250,7 @@ a2
 a3
 a4_a5
 a6
+a9
 a7
 a8
 

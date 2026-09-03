@@ -6,8 +6,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "showmesh/brightness.h"
@@ -91,6 +93,48 @@ class ObservationSink {
     // allow.
     virtual void requestStop() {}
 };
+
+// PlaylistMismatchNotifier is where a mid-show playlist mismatch is
+// reported: the currently playing playlist's on-disk definition no
+// longer matches what it was the last time FPP (most likely) loaded it,
+// with no restart in between. Optional; nullptr keeps the previous
+// behavior (no notification), which every existing test relies on.
+//
+// id and message are supplied by the caller (see ShowMesh_PlaylistMismatch
+// and kPlaylistMismatchInstruction below) rather than fixed here, so there
+// is exactly one place in this repository that can make the raise and the
+// clear disagree, and it is not an implementation of this interface.
+class PlaylistMismatchNotifier {
+ public:
+    virtual ~PlaylistMismatchNotifier() = default;
+    // May be called more than once while the condition holds; this makes
+    // no promise about being called only once per transition, because an
+    // implementation backed by FPP's own WarningHolder already dedups an
+    // identical (id, message) pair.
+    virtual void raiseMismatch(int id, const std::string& message) = 0;
+    // Called only once every mismatched playlist has resolved. Must be
+    // given the identical id and message raiseMismatch() was given: an
+    // implementation backed by WarningHolder clears only on an exact
+    // (id, message, plugin) match, and FPP does not expire this notice on
+    // its own.
+    virtual void clearMismatch(int id, const std::string& message) = 0;
+};
+
+// The identity this notice is raised and cleared under, and the operator
+// instruction it carries. Defined once, here, so both FPP adapters and
+// this class's own tests reference identical values instead of each
+// holding their own copy that could drift apart.
+//
+// 0 rather than a curated FPP warning id: ShowMesh owns no entry in FPP's
+// own www/warnings-definitions.json, and WarningHolder's own
+// UNKNOWN_WARNING_ID is exactly this value, used the same way by FPP's
+// own ad hoc, plugin-sourced warnings. RemoveWarning's exact-triple match
+// (id, message, plugin) still makes this notice unambiguous.
+constexpr int ShowMesh_PlaylistMismatch = 0;
+// Verbatim, on purpose: the coordinator's own read routes carry the same
+// text via fppreconcile.OperatorMismatchInstruction. An operator standing
+// at either surface must be told the same thing.
+extern const char kPlaylistMismatchInstruction[];
 
 // PlaylistDefinitionSource resolves a playlist's complete definition. The
 // worker calls it, never the callback thread: on FPP this reads the
@@ -189,7 +233,8 @@ class ShowMeshRuntime {
     ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                     SequenceFileStore* sequenceStore = nullptr, DefinitionPublisher* definitions_publisher = nullptr,
                     BrightnessFileStore* brightnessStore = nullptr,
-                    int safeCeilingPercent = kDefaultSafeCeilingPercent);
+                    int safeCeilingPercent = kDefaultSafeCeilingPercent,
+                    PlaylistMismatchNotifier* mismatchNotifier = nullptr);
     ~ShowMeshRuntime();
 
     // Guarded engine access. The returned accessor holds engineMutex_ for
@@ -330,6 +375,13 @@ class ShowMeshRuntime {
 
  private:
     void workerLoop();
+    // Worker-thread only, called from drainOnce() for a resolved
+    // observation. Records the baseline at kStart, compares later
+    // observations of the same name against it, and raises or clears the
+    // notice through mismatchNotifier_ on a transition. See
+    // PlaylistMismatchNotifier for why a fixed id and message are used.
+    void updatePlaylistMismatchState(const std::string& playlistName, PlaylistAction action,
+                                     const std::string& currentHash);
 
     PlaylistDefinitionSource* definitions_;
     ObservationSink* sink_;
@@ -337,6 +389,7 @@ class ShowMeshRuntime {
     SequenceFileStore* sequenceStore_;
     DefinitionPublisher* definitionPublisher_;
     BrightnessFileStore* brightnessStore_;
+    PlaylistMismatchNotifier* mismatchNotifier_;
     // Set once in the constructor; see brightnessRestartTrust().
     BrightnessRestartTrust brightnessRestartTrust_ = BrightnessRestartTrust::kTrustedOrNoRecord;
 
@@ -392,6 +445,23 @@ class ShowMeshRuntime {
     // successful publish. It is carried forward rather than cleared, so a
     // failed publish does not erase the record of what was dropped.
     std::uint32_t unacknowledgedCoalesced_ = 0;
+
+    // Worker-thread only; see updatePlaylistMismatchState(). The on-disk
+    // definition hash recorded the last time each playlist name reported
+    // kStart -- the closest signal this plugin has to "FPP just (re)loaded
+    // this playlist" -- compared against on every later observation of
+    // the same name.
+    std::unordered_map<std::string, std::string> playlistStartHash_;
+    // Playlist names currently mismatched against their kStart baseline.
+    // The FPP notice is one process-wide warning, not one per playlist,
+    // so a set rather than a single flag: resolving one mismatched
+    // playlist must not clear the notice while another one is still
+    // mismatched.
+    std::set<std::string> mismatchedPlaylists_;
+    // Whether mismatchNotifier_ currently believes the notice is raised.
+    // raiseMismatch()/clearMismatch() are only called on a transition, so
+    // a caller counting calls sees exactly one per actual state change.
+    bool mismatchNoticeActive_ = false;
 };
 
 }  // namespace showmesh

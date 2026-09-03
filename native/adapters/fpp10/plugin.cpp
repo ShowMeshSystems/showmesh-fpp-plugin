@@ -23,6 +23,7 @@
 #include "channel_ranges.h"
 #include "coordinator_delivery.h"
 #include "fpp_definition_source.h"
+#include "playlist_mismatch_notifier.h"
 #include "safe_ceiling.h"
 #include "section_names.h"
 #include "showmesh/brightness_store.h"
@@ -76,7 +77,7 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
           delivery_(nowMillis),
           safeCeilingPercent_(showmesh::adapter::resolveSafeCeilingPercent()),
           runtime_(&definitions_, delivery_.client(), nowMillis, &sequenceStore_, delivery_.client(),
-                  &brightnessStore_, safeCeilingPercent_) {
+                  &brightnessStore_, safeCeilingPercent_, &mismatchNotifier_) {
         logBrightnessRestartTrust(runtime_.brightnessRestartTrust(), safeCeilingPercent_);
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
@@ -248,6 +249,9 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
     // "ShowMeshSafeCeilingPercent" setting once, here, before runtime_'s
     // constructor uses it to settle an untrusted restart.
     int safeCeilingPercent_;
+    // Declared before runtime_ for the same reason: runtime_ holds this
+    // pointer from construction onward.
+    showmesh::adapter::WarningHolderMismatchNotifier mismatchNotifier_;
     showmesh::ShowMeshRuntime runtime_;
     Command* command_ = nullptr;
     std::uint64_t publishedRevision_ = 0;

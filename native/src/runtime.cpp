@@ -16,6 +16,8 @@ const char* const kBrightnessCommandName = "ShowMesh: Set Brightness Ceiling";
 const char* const kTargetPercentArgument = "targetPercent";
 const char* const kFadeSecondsArgument = "fadeSeconds";
 const char* const kPluginName = "fpp-showmesh";
+const char kPlaylistMismatchInstruction[] =
+    "Restart FPP, or re-import the playlist so the coordinator's binding and FPP agree.";
 
 namespace {
 
@@ -60,13 +62,15 @@ bool playlistNameIsPathSafe(const std::string& name) {
 
 ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                                  SequenceFileStore* sequenceStore, DefinitionPublisher* definitionPublisher,
-                                 BrightnessFileStore* brightnessStore, int safeCeilingPercent)
+                                 BrightnessFileStore* brightnessStore, int safeCeilingPercent,
+                                 PlaylistMismatchNotifier* mismatchNotifier)
     : definitions_(definitions),
       sink_(sink),
       clock_(clock),
       sequenceStore_(sequenceStore),
       definitionPublisher_(definitionPublisher),
       brightnessStore_(brightnessStore),
+      mismatchNotifier_(mismatchNotifier),
       handoff_(16) {
     if (definitions_ != nullptr) {
         std::lock_guard<std::mutex> lock(engineMutex_);
@@ -272,6 +276,7 @@ bool ShowMeshRuntime::drainOnce() {
 
     observation.identity = resolution.identity;
     observation.entryKey = resolution.entryKey;
+    updatePlaylistMismatchState(resolution.identity.playlistName, evidence.action, resolution.identity.playlistHash);
     // Before the observation citing it, not after: an observation whose
     // definition has not arrived is still accepted, but Track H holds the
     // binding as having no definition until it does. The return value is
@@ -289,6 +294,40 @@ bool ShowMeshRuntime::drainOnce() {
         unacknowledgedCoalesced_ = 0;
     }
     return true;
+}
+
+void ShowMeshRuntime::updatePlaylistMismatchState(const std::string& playlistName, PlaylistAction action,
+                                                  const std::string& currentHash) {
+    if (action == PlaylistAction::kStart) {
+        // The closest signal this plugin has to "FPP just (re)loaded this
+        // playlist": rebuild the baseline from what is on disk right now.
+        // This name is resolved even if it was never separately observed
+        // matching again, because a fresh kStart is itself the resolve
+        // condition -- a restart or re-import both produce one.
+        playlistStartHash_[playlistName] = currentHash;
+        mismatchedPlaylists_.erase(playlistName);
+    } else {
+        const auto baseline = playlistStartHash_.find(playlistName);
+        // No kStart observed yet for this name in this process's
+        // lifetime: nothing to compare against, so this is not a
+        // mismatch, it is missing history.
+        if (baseline == playlistStartHash_.end()) return;
+        if (baseline->second == currentHash) {
+            mismatchedPlaylists_.erase(playlistName);
+        } else {
+            mismatchedPlaylists_.insert(playlistName);
+        }
+    }
+
+    if (mismatchNotifier_ == nullptr) return;
+    const bool shouldBeActive = !mismatchedPlaylists_.empty();
+    if (shouldBeActive == mismatchNoticeActive_) return;
+    mismatchNoticeActive_ = shouldBeActive;
+    if (shouldBeActive) {
+        mismatchNotifier_->raiseMismatch(ShowMesh_PlaylistMismatch, kPlaylistMismatchInstruction);
+    } else {
+        mismatchNotifier_->clearMismatch(ShowMesh_PlaylistMismatch, kPlaylistMismatchInstruction);
+    }
 }
 
 // sequence_ is otherwise only touched from the worker thread (inside
