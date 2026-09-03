@@ -1504,34 +1504,32 @@ TEST(StopReturnsPromptlyEvenWhileAPublishIsRetryingAgainstAnUnreachableCoordinat
 // real WarningHolder call is only reachable with FPP's own headers and is
 // proven by the container bench instead (see bench/fpp-plugin-load).
 
-TEST(PlaylistMismatchBaselineIsRecordedAtKStart) {
+TEST(PlaylistMismatchBaselineIsRecordedOnTheFirstObservation) {
     FakeDefinitions definitions;
     RecordingSink sink;
     RecordingMismatchNotifier notifier;
     ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
                             showmesh::kDefaultSafeCeilingPercent, &notifier);
 
-    // Before any kStart for this name, there is no baseline to compare
-    // against, so a "playing" observation must never read as a mismatch.
+    // The first observation of a name, whatever action FPP reports for it,
+    // becomes the baseline and must never itself read as a mismatch. FPP
+    // 10.0's own playlistCallback cannot be trusted to report "start" for
+    // a genuine fresh load (see the note in runtime.cpp), so this
+    // deliberately uses "playing" as the very first observation.
     runtime.observeCallback("Main Show", "playing", "mainPlaylist", 0, "a.fseq", "song.mp3");
-    CHECK(runtime.drainOnce());
-    CHECK(notifier.raised.empty());
-
-    // kStart records the baseline; it must not itself raise anything.
-    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "song.mp3");
     CHECK(runtime.drainOnce());
     CHECK(notifier.raised.empty());
     CHECK(notifier.cleared.empty());
 }
 
-TEST(PlaylistMismatchIsRaisedWhenTheHashChangesAfterStart) {
+TEST(PlaylistMismatchIsRaisedWhenTheHashChangesAfterTheFirstObservation) {
     FakeDefinitions definitions;
     RecordingSink sink;
     RecordingMismatchNotifier notifier;
     ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
                             showmesh::kDefaultSafeCeilingPercent, &notifier);
 
-    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "song.mp3");
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 0, "a.fseq", "song.mp3");
     CHECK(runtime.drainOnce());
     CHECK(notifier.raised.empty());
 
@@ -1561,7 +1559,7 @@ TEST(PlaylistMismatchIsNotRaisedWhenTheHashIsUnchanged) {
     ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
                             showmesh::kDefaultSafeCeilingPercent, &notifier);
 
-    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "song.mp3");
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 0, "a.fseq", "song.mp3");
     CHECK(runtime.drainOnce());
 
     // No edit: definitions.definition is unchanged.
@@ -1579,7 +1577,7 @@ TEST(PlaylistMismatchClearsWhenTheHashMatchesTheBaselineAgain) {
     ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
                             showmesh::kDefaultSafeCeilingPercent, &notifier);
 
-    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "song.mp3");
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 0, "a.fseq", "song.mp3");
     CHECK(runtime.drainOnce());
 
     const std::string original = definitions.definition;
@@ -1599,14 +1597,18 @@ TEST(PlaylistMismatchClearsWhenTheHashMatchesTheBaselineAgain) {
     CHECK_EQ(notifier.cleared[0].message, std::string(kPlaylistMismatchInstruction));
 }
 
-TEST(PlaylistMismatchClearsOnARestartEvenWithoutAMatchingObservation) {
+// The orchestrator's ruling for this design: nothing in the clear path may
+// depend on the "start" action, because FPP 10.0 cannot be relied on to
+// ever report it (see the note in runtime.cpp). A "start"-labeled
+// observation carries no special clearing power; only a hash match does.
+TEST(AStartLabeledObservationDoesNotClearAMismatchOnItsOwn) {
     FakeDefinitions definitions;
     RecordingSink sink;
     RecordingMismatchNotifier notifier;
     ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
                             showmesh::kDefaultSafeCeilingPercent, &notifier);
 
-    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "song.mp3");
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 0, "a.fseq", "song.mp3");
     CHECK(runtime.drainOnce());
 
     definitions.definition = "{\"name\":\"Main Show\",\"mainPlaylist\":[{\"sequenceName\":\"b.fseq\"}]}";
@@ -1614,16 +1616,12 @@ TEST(PlaylistMismatchClearsOnARestartEvenWithoutAMatchingObservation) {
     CHECK(runtime.drainOnce());
     CHECK_EQ(notifier.raised.size(), std::size_t{1});
 
-    // The operator re-imports the playlist, which produces a fresh
-    // kStart. The file was edited yet again in the meantime and never
-    // matches anything this plugin saw before, but the restart itself is
-    // the resolve condition: whatever is on disk now is the new baseline.
-    definitions.definition = "{\"name\":\"Main Show\",\"mainPlaylist\":[{\"sequenceName\":\"c.fseq\"}]}";
-    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "c.fseq", "song.mp3");
+    // A "start"-labeled observation arrives (an operator invoking Start
+    // Playlist again) while the file is still the edited, mismatched
+    // content. This must not clear the notice: only a hash match does.
+    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "b.fseq", "song.mp3");
     CHECK(runtime.drainOnce());
-
-    CHECK_EQ(notifier.raised.size(), std::size_t{1});
-    CHECK_EQ(notifier.cleared.size(), std::size_t{1});
+    CHECK(notifier.cleared.empty());
 }
 
 TEST(AMismatchOnOnePlaylistIsNotClearedByAnotherPlaylistResolving) {
@@ -1634,9 +1632,9 @@ TEST(AMismatchOnOnePlaylistIsNotClearedByAnotherPlaylistResolving) {
                             showmesh::kDefaultSafeCeilingPercent, &notifier);
 
     // Both playlists load with the same content and establish a baseline.
-    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "song.mp3");
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 0, "a.fseq", "song.mp3");
     CHECK(runtime.drainOnce());
-    runtime.observeCallback("Side Loop", "start", "mainPlaylist", 0, "a.fseq", "song.mp3");
+    runtime.observeCallback("Side Loop", "playing", "mainPlaylist", 0, "a.fseq", "song.mp3");
     CHECK(runtime.drainOnce());
 
     // Both are edited to the same new content and both go mismatched; the
@@ -1648,15 +1646,18 @@ TEST(AMismatchOnOnePlaylistIsNotClearedByAnotherPlaylistResolving) {
     CHECK(runtime.drainOnce());
     CHECK_EQ(notifier.raised.size(), std::size_t{1});
 
-    // "Side Loop" is restarted (re-imported) and resolves on its own, but
-    // "Main Show" is still mismatched: the process-wide notice must stay
-    // up, not clear just because one of the two playlists recovered.
-    runtime.observeCallback("Side Loop", "start", "mainPlaylist", 0, "b.fseq", "song.mp3");
+    // "Side Loop" is edited back to its own original content and resolves
+    // on its own, but "Main Show" is still mismatched: the process-wide
+    // notice must stay up, not clear just because one of the two
+    // playlists recovered.
+    definitions.definition = "{\"name\":\"Main Show\",\"mainPlaylist\":[{\"sequenceName\":\"a.fseq\"}]}";
+    runtime.observeCallback("Side Loop", "playing", "mainPlaylist", 0, "a.fseq", "song.mp3");
     CHECK(runtime.drainOnce());
     CHECK(notifier.cleared.empty());
 
     // Now "Main Show" resolves too, and only now does the notice clear.
-    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "b.fseq", "song.mp3");
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 0, "a.fseq", "song.mp3");
     CHECK(runtime.drainOnce());
     CHECK_EQ(notifier.cleared.size(), std::size_t{1});
 }
+

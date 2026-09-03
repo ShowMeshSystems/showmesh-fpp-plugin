@@ -1103,6 +1103,10 @@ mismatch_notice_present() {
 }
 
 a9() {
+    # The baseline is founded on this playlist's first observation in this
+    # process's lifetime; kStart is never trustworthy on FPP 10 (see
+    # runtime.cpp), so the very first Start Playlist here is what founds
+    # it, not a special case.
     write_mismatch_playlist "original"
 
     local code

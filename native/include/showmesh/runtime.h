@@ -376,12 +376,15 @@ class ShowMeshRuntime {
  private:
     void workerLoop();
     // Worker-thread only, called from drainOnce() for a resolved
-    // observation. Records the baseline at kStart, compares later
-    // observations of the same name against it, and raises or clears the
-    // notice through mismatchNotifier_ on a transition. See
-    // PlaylistMismatchNotifier for why a fixed id and message are used.
-    void updatePlaylistMismatchState(const std::string& playlistName, PlaylistAction action,
-                                     const std::string& currentHash);
+    // observation. Records the baseline on the first observation of this
+    // name in the process's lifetime, compares every later observation
+    // against it, and raises or clears the notice through mismatchNotifier_
+    // on a transition. Deliberately takes no PlaylistAction: FPP's own
+    // action string cannot be trusted to mark a fresh load (see the note
+    // in runtime.cpp), so the only clear condition is a later hash
+    // matching the baseline again. See PlaylistMismatchNotifier for why a
+    // fixed id and message are used.
+    void updatePlaylistMismatchState(const std::string& playlistName, const std::string& currentHash);
 
     PlaylistDefinitionSource* definitions_;
     ObservationSink* sink_;
@@ -447,12 +450,12 @@ class ShowMeshRuntime {
     std::uint32_t unacknowledgedCoalesced_ = 0;
 
     // Worker-thread only; see updatePlaylistMismatchState(). The on-disk
-    // definition hash recorded the last time each playlist name reported
-    // kStart -- the closest signal this plugin has to "FPP just (re)loaded
-    // this playlist" -- compared against on every later observation of
-    // the same name.
+    // definition hash recorded the first time each playlist name was
+    // observed in this process's lifetime -- the closest signal this
+    // plugin has to "what FPP has loaded" -- compared against on every
+    // later observation of the same name.
     std::unordered_map<std::string, std::string> playlistStartHash_;
-    // Playlist names currently mismatched against their kStart baseline.
+    // Playlist names currently mismatched against their recorded baseline.
     // The FPP notice is one process-wide warning, not one per playlist,
     // so a set rather than a single flag: resolving one mismatched
     // playlist must not clear the notice while another one is still

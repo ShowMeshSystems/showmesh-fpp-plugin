@@ -276,7 +276,7 @@ bool ShowMeshRuntime::drainOnce() {
 
     observation.identity = resolution.identity;
     observation.entryKey = resolution.entryKey;
-    updatePlaylistMismatchState(resolution.identity.playlistName, evidence.action, resolution.identity.playlistHash);
+    updatePlaylistMismatchState(resolution.identity.playlistName, resolution.identity.playlistHash);
     // Before the observation citing it, not after: an observation whose
     // definition has not arrived is still accepted, but Track H holds the
     // binding as having no definition until it does. The return value is
@@ -296,27 +296,40 @@ bool ShowMeshRuntime::drainOnce() {
     return true;
 }
 
-void ShowMeshRuntime::updatePlaylistMismatchState(const std::string& playlistName, PlaylistAction action,
-                                                  const std::string& currentHash) {
-    if (action == PlaylistAction::kStart) {
-        // The closest signal this plugin has to "FPP just (re)loaded this
-        // playlist": rebuild the baseline from what is on disk right now.
-        // This name is resolved even if it was never separately observed
-        // matching again, because a fresh kStart is itself the resolve
-        // condition -- a restart or re-import both produce one.
+// FPP's playlistCallback action string cannot be trusted to distinguish a
+// fresh load from continued playback: on the pinned FPP 10.0
+// (370e62ed7e8c8318da6ee5b01312b8b75082d952), Playlist::PlayImpl()
+// (src/playlist/Playlist.cpp:1822) sets m_status to PLAYING immediately
+// before calling Start(), so Start()'s own "capture the pre-start status"
+// read (src/playlist/Playlist.cpp:896) always sees PLAYING already and
+// never reports "start". FPP 9.5.3 does not have this defect (it
+// distinguishes on a separate m_currentState field Play() never touches),
+// but this function does not rely on the action string on either major:
+// the baseline is the first hash observed for a name in this process's
+// lifetime, and the only clear condition is a later hash matching it.
+//
+// A kStop-keyed re-baseline (ending a run, so the next run founds fresh
+// from whatever was re-imported) was attempted and dropped: bench
+// evidence on the pinned FPP 10.0 showed a real, non-idle Stop Now
+// genuinely running StopNowImpl, yet zero "stop" observations ever
+// reached this function across two full runs, only "playing". FPP 10
+// does not deliver a stop observation this design can rely on, so the
+// residual below is accepted rather than worked around.
+void ShowMeshRuntime::updatePlaylistMismatchState(const std::string& playlistName, const std::string& currentHash) {
+    const auto baseline = playlistStartHash_.find(playlistName);
+    if (baseline == playlistStartHash_.end()) {
+        // First observation of this name in this process's lifetime: the
+        // closest signal available to "what FPP has loaded right now".
+        // Never itself a mismatch, since nothing exists yet to compare it
+        // against; a genuine mismatch already true at this exact moment is
+        // an accepted residual (see the PR body).
         playlistStartHash_[playlistName] = currentHash;
+        return;
+    }
+    if (baseline->second == currentHash) {
         mismatchedPlaylists_.erase(playlistName);
     } else {
-        const auto baseline = playlistStartHash_.find(playlistName);
-        // No kStart observed yet for this name in this process's
-        // lifetime: nothing to compare against, so this is not a
-        // mismatch, it is missing history.
-        if (baseline == playlistStartHash_.end()) return;
-        if (baseline->second == currentHash) {
-            mismatchedPlaylists_.erase(playlistName);
-        } else {
-            mismatchedPlaylists_.insert(playlistName);
-        }
+        mismatchedPlaylists_.insert(playlistName);
     }
 
     if (mismatchNotifier_ == nullptr) return;
