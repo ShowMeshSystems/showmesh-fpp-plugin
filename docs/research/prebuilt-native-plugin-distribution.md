@@ -2,7 +2,7 @@
 
 [Distribution research](../upstream/showmesh/docs/research/RES-015-fpp-plugin-distribution-model.md) · [Brightness/plugin runtime research](../upstream/showmesh/docs/research/RES-018-fpp-brightness-control.md) · [Pinned FPP versions](../../native/adapters/FPP-PINS.md)
 
-Status: research, no design change proposed yet · Verification: L1 source reads against the pinned FPP commits and this repository's own release tooling, for every answer except item 5, which is an emulated compile measurement labelled separately below. No dlopen was observed on any FPP build, no install was run on a real or emulated host except the emulated compile, and nothing here has been installed on a real player.
+Status: research, no design change proposed yet · Verification: L1 source reads against the pinned FPP commits and this repository's own release tooling, for every answer except item 5, which reports one emulated ARMv7 compile under QEMU on an x86_64 build VM, labelled as emulated throughout and not a real-host result. No dlopen was observed on any FPP build, no install was run on any host, and nothing here has been installed on a real player.
 
 ## Recommendation
 
@@ -60,12 +60,27 @@ The Go helper's existing discipline, read from `Makefile`, `scripts/write-releas
 
 ## 5. On-host compile time and peak memory on the slowest supported ARMv7 host
 
-**PLACEHOLDER.** This measurement is being taken by the task's manager in a QEMU armv7 container on the build VM, not by this record's author, and will be labelled explicitly as an emulated result (emulating host and load stated) when it lands, not as a real-host measurement. It is not blocking the rest of this record.
+**Emulated result, not a real-host measurement.** Taken on `showmesh-dev-01` (x86_64, 4 vCPU, 7.9 GB RAM) under QEMU user-mode emulation of `linux/arm/v7` in a Debian trixie container, `uname` reporting `armv7l`, g++ (Debian 14.2.0-19) 14.2.0, running `make -C native/adapters fpp10 FPP_SRC=/tmp/fpp/src` (single job, no `-j`) against FPP 10.0 at the pinned commit `370e62ed7e8c8318da6ee5b01312b8b75082d952`, plugin source at this repository's main branch commit `6ddd9b7`. This measurement was taken by the task's manager, not by this record's author.
+
+- Emulated ARMv7: wall clock 8 min 55.70 s (535.70 s), user time 523.49 s, system time 7.68 s, 99% of one CPU, peak RSS 334088 kB (about 326 MB), exit 0, producing `libshowmesh-fpp10.so` at 250368 bytes.
+- Native amd64 reference, same host, same commit, same invocation, taken for scale: wall clock 42.23 s, user time 38.99 s, system time 3.02 s, 99% of one CPU, peak RSS 275244 kB (about 269 MB).
+- Emulated-to-native wall-clock ratio on this box: about 12.7x.
+
+**The wall-clock figure does not predict a real ARMv7 player's compile time.** A 12.7x slowdown is a property of QEMU's instruction-by-instruction translation on this x86_64 host, not a property of ARMv7 silicon; QEMU user-mode emulation does not model a real ARM core's pipeline, cache, or memory bandwidth, so there is no arithmetic that turns an emulated wall-clock ratio into a real-device one. The real-host ARMv7 compile time RES-018 §8 calls its highest-risk unmeasured assumption is therefore still unmeasured after this result.
+
+**Peak memory is the half of this measurement that carries useful signal**, because compile-time memory use tracks the compiler and the size of the translation units being compiled, not clock speed, and QEMU's user-mode emulation does not materially change how much memory the compiler itself allocates to hold ASTs, symbol tables, and codegen state. The emulated guest here is 32-bit, matching real ARMv7's address width, and the 326 MB figure already includes QEMU's own emulation overhead on top of the compiler's usage, so a real ARMv7 host plausibly lands at or below that number, not above it.
+
+**Consequence.** A 512 MB ARMv7 player would spend roughly two thirds of its RAM at the compile peak, with `fppd` potentially still running on the same host during that window; a 1 GB host is comfortable at this peak. That is an independent argument for the prebuilt path on FPP 10 alongside the ABI-check argument in the Recommendation above: a compile that can OOM a low-memory player is a second reason to prefer a prebuilt object where FPP 10's own load-time check makes that object safe to prefer.
+
+**Contention note.** Another lane's Go test gate was running on the same VM during part of this emulated run, and load average on the 4-vCPU host moved between roughly 2.7 and 5.4 while it ran. The emulated run nevertheless held 99% of one CPU throughout, and its user time (523.49 s) accounts for nearly all of its 535.70 s wall time, so the overlap did not materially distort the result; both facts, that the overlap happened and that the run held a full core regardless, are recorded here rather than one standing in for the other.
+
+**Not measured.** The FPP 9 adapter's compile time and memory were not measured; it additionally requires `libhttpserver` built from source before the adapter itself compiles, which this run did not include. No install, no `dlopen`, and no run of the compiled object on any host, real or emulated, was performed.
 
 ## What this record does not prove
 
 - No dlopen was observed on any real FPP build; §1's load-portability conclusion is inference from source, stated as such.
-- No install, upgrade, or uninstall was run on a real or emulated FPP host of any kind (the one emulated result covers compile time only, once received).
+- No install, upgrade, or uninstall was run on a real or emulated FPP host of any kind; §5's emulated result covers compile time and peak memory only, and only for the FPP 10 adapter.
+- Real-host ARMv7 compile time remains unmeasured. §5's 12.7x emulated ratio is a QEMU property, not evidence about real ARM silicon, so RES-018 §8's highest-risk unmeasured assumption is still open.
 - No fleet evidence: nothing here has been tried against `fpp-player`, `fpp-remote-a`, or `fpp-remote-b`.
 - The prebuilt shape in §3 is a design description, not an implementation. No release manifest, artifact, or installer change described here has been built.
 
