@@ -4,6 +4,7 @@
 #include <string>
 
 #include "curl_http_transport.h"
+#include "playlist_mismatch_notifier.h"
 #include "showmesh/coordinator_client.h"
 #include "showmesh/coordinator_config.h"
 #include "showmesh/sequence_store.h"
@@ -23,7 +24,8 @@ class CoordinatorDelivery {
         : stateDir_(resolveSequenceStateDir()),
           statusSink_(stateDir_),
           credentials_(),
-          client_(&transport_, &credentials_, resolveBaseUrl(stateDir_, &configurationError_), clock, &statusSink_) {
+          client_(&transport_, &credentials_, resolveBaseUrl(stateDir_, &configurationError_), clock, &statusSink_,
+                  sleepMillis, RetryPolicy(), &mismatchNotifier_) {
         // A host with no coordinator URL yet still loads the plugin and
         // still runs the show; every post then fails visibly in the local
         // status record rather than silently doing nothing.
@@ -47,6 +49,10 @@ class CoordinatorDelivery {
     CurlHttpTransport transport_;
     FileStatusSink statusSink_;
     FileCredentialSource credentials_;
+    // Declared before client_: client_ holds this pointer from
+    // construction onward, and member initialization follows declaration
+    // order regardless of the initializer list's order.
+    WarningHolderMismatchNotifier mismatchNotifier_;
     CoordinatorClient client_;
 };
 

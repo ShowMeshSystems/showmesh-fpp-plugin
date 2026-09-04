@@ -22,6 +22,35 @@ bool isSuccess(int statusCode) { return statusCode >= 200 && statusCode < 300; }
 // it, so repeating it only spends the show LAN and the audit log.
 bool isRetryable(int statusCode) { return statusCode == 429 || statusCode >= 500; }
 
+// Reads reconciliation (and, if present, operatorInstruction) out of an
+// accepted observation receipt. Returns false when the receipt carries no
+// reconciliation field at all -- the coordinator's best-effort lookup
+// failed -- which the caller must treat as "unknown", never as "resolved".
+bool parseReconciliationVerdict(const std::string& body, std::string* reconciliation,
+                                std::string* operatorInstruction) {
+    json::ParseResult parsed = json::parse(body);
+    if (!parsed.ok || parsed.value.type() != json::Type::kObject) return false;
+    bool found = false;
+    for (const auto& member : parsed.value.members()) {
+        if (member.first == "reconciliation" && member.second.type() == json::Type::kString) {
+            *reconciliation = member.second.string();
+            found = true;
+        } else if (member.first == "operatorInstruction" && member.second.type() == json::Type::kString) {
+            *operatorInstruction = member.second.string();
+        }
+    }
+    return found;
+}
+
+// The four outcomes api/openapi.yaml documents as carrying an
+// operatorInstruction. identity-unavailable and unbound are neither a
+// mismatch nor a resolution, so a verdict of either leaves whatever
+// notice state already stands, exactly like an absent verdict.
+bool isMismatchOutcome(const std::string& reconciliation) {
+    return reconciliation == "stale-import" || reconciliation == "unknown-entry" ||
+           reconciliation == "evidence-mismatch" || reconciliation == "cross-show";
+}
+
 void addString(std::vector<json::Value::Member>* members, const char* name, const std::string& value) {
     members->emplace_back(name, json::Value::makeString(value));
 }
@@ -83,14 +112,16 @@ FileStatusSink::FileStatusSink(std::string stateDir) : path_(joinPath(stateDir, 
 void FileStatusSink::writeStatus(const std::string& json) { writeFileAtomically(path_, json); }
 
 CoordinatorClient::CoordinatorClient(HttpTransport* transport, CredentialSource* credentials, std::string baseUrl,
-                                     Clock clock, StatusSink* statusSink, Sleeper sleeper, RetryPolicy policy)
+                                     Clock clock, StatusSink* statusSink, Sleeper sleeper, RetryPolicy policy,
+                                     PlaylistMismatchNotifier* mismatchNotifier)
     : transport_(transport),
       credentials_(credentials),
       baseUrl_(std::move(baseUrl)),
       clock_(clock),
       statusSink_(statusSink),
       sleeper_(sleeper == nullptr ? sleepMillis : sleeper),
-      policy_(policy) {
+      policy_(policy),
+      mismatchNotifier_(mismatchNotifier) {
     status_.configured = transport_ != nullptr && credentials_ != nullptr && !baseUrl_.empty();
     if (!status_.configured && status_.configurationError.empty()) {
         status_.configurationError = "no coordinator base URL or credential source is configured";
@@ -182,7 +213,55 @@ bool CoordinatorClient::sendObservation(const PlaylistEntryObservation& observat
         }
     }
     publishStatus();
+    if (mismatchNotifier_ != nullptr) {
+        // Every accepted receipt carries this instance's current
+        // reconciliation verdict, including on an idempotent replay, so
+        // the plugin's polling model (each FPP callback re-posts) is
+        // never blind between genuine state changes.
+        if (outcome.accepted) {
+            applyMismatchVerdict(outcome.body, clock_());
+        } else {
+            checkMismatchAgeOut(clock_());
+        }
+    }
     return outcome.accepted;
+}
+
+void CoordinatorClient::applyMismatchVerdict(const std::string& body, TimeMillis now) {
+    // The coordinator answered, whatever it said: this is the reachability
+    // signal the age-out clock runs against, not the verdict itself.
+    lastVerdictAtMillis_ = now;
+
+    std::string reconciliation;
+    std::string operatorInstruction;
+    if (!parseReconciliationVerdict(body, &reconciliation, &operatorInstruction)) return;
+
+    if (isMismatchOutcome(reconciliation)) {
+        raiseMismatchNotice(operatorInstruction);
+    } else if (reconciliation == "resolved") {
+        clearMismatchNotice();
+    }
+}
+
+void CoordinatorClient::checkMismatchAgeOut(TimeMillis now) {
+    if (!mismatchActive_) return;
+    if (now - lastVerdictAtMillis_ < kMismatchVerdictAgeOutMillis) return;
+    clearMismatchNotice();
+}
+
+void CoordinatorClient::raiseMismatchNotice(const std::string& instruction) {
+    if (mismatchActive_ && lastRaisedMessage_ == instruction) return;
+    if (mismatchActive_) mismatchNotifier_->clearMismatch(ShowMesh_PlaylistMismatch, lastRaisedMessage_);
+    mismatchNotifier_->raiseMismatch(ShowMesh_PlaylistMismatch, instruction);
+    lastRaisedMessage_ = instruction;
+    mismatchActive_ = true;
+}
+
+void CoordinatorClient::clearMismatchNotice() {
+    if (!mismatchActive_) return;
+    mismatchNotifier_->clearMismatch(ShowMesh_PlaylistMismatch, lastRaisedMessage_);
+    mismatchActive_ = false;
+    lastRaisedMessage_.clear();
 }
 
 bool CoordinatorClient::publishDefinition(const std::string& instanceUuid, const std::string& playlistName,
@@ -315,6 +394,7 @@ CoordinatorClient::Outcome CoordinatorClient::postWithRetry(const char* path, co
             outcome.statusCode = response.statusCode;
             outcome.label = "accepted";
             outcome.error.clear();
+            outcome.body = response.body;
             break;
         } else {
             outcome.statusCode = response.statusCode;

@@ -16,9 +16,12 @@ using showmesh::HttpRequest;
 using showmesh::HttpResponse;
 using showmesh::HttpTransport;
 using showmesh::IdentityUnavailable;
+using showmesh::kMismatchVerdictAgeOutMillis;
 using showmesh::PlaylistAction;
 using showmesh::PlaylistEntryObservation;
+using showmesh::PlaylistMismatchNotifier;
 using showmesh::RetryPolicy;
+using showmesh::ShowMesh_PlaylistMismatch;
 using showmesh::StatusSink;
 using showmesh::TimeMillis;
 
@@ -68,6 +71,13 @@ class FakeTransport : public HttpTransport {
         r.body = std::move(body);
         return r;
     }
+    static HttpResponse okWithBody(std::string body, int statusCode = 200) {
+        HttpResponse r;
+        r.transportOk = true;
+        r.statusCode = statusCode;
+        r.body = std::move(body);
+        return r;
+    }
     static HttpResponse unreachable(std::string error) {
         HttpResponse r;
         r.transportOk = false;
@@ -105,6 +115,44 @@ class RecordingStatusSink : public StatusSink {
     void writeStatus(const std::string& json) override { writes.push_back(json); }
     std::vector<std::string> writes;
 };
+
+// Records every raise/clear call, exact id and message included, so a
+// test can assert this repository's own identity constant and the
+// coordinator's own instruction text reached the notifier rather than
+// merely that something was raised.
+class RecordingMismatchNotifier : public PlaylistMismatchNotifier {
+ public:
+    struct Call {
+        int id;
+        std::string message;
+    };
+
+    void raiseMismatch(int id, const std::string& message) override { raised.push_back(Call{id, message}); }
+    void clearMismatch(int id, const std::string& message) override { cleared.push_back(Call{id, message}); }
+
+    std::vector<Call> raised;
+    std::vector<Call> cleared;
+};
+
+// A minimal observation receipt body, standing in for the coordinator's
+// own PlaylistEntryObservationReceipt: reconciliation and
+// operatorInstruction are additive and optional per api/openapi.yaml, so
+// a script can omit either to exercise the absent-verdict path.
+std::string receiptBody(const char* reconciliation, const char* operatorInstruction) {
+    std::string body = "{\"schemaVersion\":1,\"accepted\":true,\"replay\":false";
+    if (reconciliation != nullptr) {
+        body += ",\"reconciliation\":\"";
+        body += reconciliation;
+        body += "\"";
+    }
+    if (operatorInstruction != nullptr) {
+        body += ",\"operatorInstruction\":\"";
+        body += operatorInstruction;
+        body += "\"";
+    }
+    body += "}";
+    return body;
+}
 
 bool contains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
@@ -508,4 +556,132 @@ TEST(AnObservationWithNoInstanceUuidIsRefusedLocallyRatherThanSent) {
     CHECK(!client.publish(observation));
     CHECK(transport.requests.empty());
     CHECK_EQ(client.status().lastOutcome, std::string("payload-refused-locally"));
+}
+
+// This client decides nothing about a mismatch itself: it mirrors
+// whatever reconciliation verdict the coordinator's own observation
+// receipt carries. These tests exercise that mirroring directly through
+// RecordingMismatchNotifier; the real WarningHolder call is only
+// reachable with FPP's own headers and is proven by the container bench
+// instead (see scripts/test-plugin-load-fpp.sh assertion A9).
+
+TEST(TheNoticeIsRaisedWithTheCoordinatorsOwnOperatorInstructionWhileTheVerdictIsAMismatch) {
+    FakeTransport transport;
+    transport.responses.push_back(
+        FakeTransport::okWithBody(receiptBody("stale-import", "Re-import the playlist in the coordinator.")));
+    FakeCredentials credentials;
+    RecordingMismatchNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             &notifier);
+
+    CHECK(client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+    CHECK_EQ(notifier.raised[0].id, ShowMesh_PlaylistMismatch);
+    CHECK_EQ(notifier.raised[0].message, std::string("Re-import the playlist in the coordinator."));
+    CHECK(notifier.cleared.empty());
+}
+
+TEST(TheNoticeClearsWhenTheVerdictSaysResolved) {
+    FakeTransport transport;
+    transport.responses.push_back(
+        FakeTransport::okWithBody(receiptBody("stale-import", "Re-import the playlist in the coordinator.")));
+    transport.responses.push_back(FakeTransport::okWithBody(receiptBody("resolved", nullptr)));
+    FakeCredentials credentials;
+    RecordingMismatchNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             &notifier);
+
+    CHECK(client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+
+    CHECK(client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.cleared.size(), std::size_t{1});
+    CHECK_EQ(notifier.cleared[0].id, ShowMesh_PlaylistMismatch);
+    CHECK_EQ(notifier.cleared[0].message, std::string("Re-import the playlist in the coordinator."));
+}
+
+// THE TRAP: reconciliation and operatorInstruction are both best effort
+// and are omitted, with the receipt still a 200, whenever the
+// coordinator's own lookup fails. Absent must never read as resolved: a
+// client that cleared here would silently drop a warning that should
+// still stand.
+TEST(AnAbsentVerdictDoesNotClearAStandingMismatchNotice) {
+    FakeTransport transport;
+    transport.responses.push_back(
+        FakeTransport::okWithBody(receiptBody("stale-import", "Re-import the playlist in the coordinator.")));
+    transport.responses.push_back(FakeTransport::okWithBody(receiptBody(nullptr, nullptr)));
+    FakeCredentials credentials;
+    RecordingMismatchNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             &notifier);
+
+    CHECK(client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+
+    CHECK(client.publish(resolvedObservation()));
+    CHECK(notifier.cleared.empty());
+}
+
+TEST(TheNoticeAgesOutOnceTheCoordinatorHasBeenUnreachableLongEnough) {
+    FakeTransport transport;
+    transport.responses.push_back(
+        FakeTransport::okWithBody(receiptBody("stale-import", "Re-import the playlist in the coordinator.")));
+    FakeCredentials credentials;
+    RecordingMismatchNotifier notifier;
+    gNow = 1'800'000'000'000;
+    RetryPolicy policy;
+    policy.maxAttempts = 1;  // one attempt per publish() call below, so each advances gNow deterministically
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, policy, &notifier);
+
+    CHECK(client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+
+    // The coordinator goes unreachable; every further attempt fails, but
+    // not enough time has passed yet.
+    transport.responses.clear();
+    gNow += kMismatchVerdictAgeOutMillis - 1;
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK(notifier.cleared.empty());
+
+    // Now it has.
+    gNow += 2;
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.cleared.size(), std::size_t{1});
+    CHECK_EQ(notifier.cleared[0].id, ShowMesh_PlaylistMismatch);
+    CHECK_EQ(notifier.cleared[0].message, std::string("Re-import the playlist in the coordinator."));
+
+    gNow = 1'800'000'000'000;  // restore the shared clock for later tests
+}
+
+// THE SECOND TRAP: WarningHolder matches the exact (id, message, plugin)
+// triple. If the coordinator's operatorInstruction text ever differs
+// between the raise and the clear, clearing with the newly received
+// string would silently fail against the real WarningHolder and leave a
+// permanent notice. This client must always clear with the message it
+// itself raised.
+TEST(TheNoticeClearsWithTheRaisedMessageEvenWhenTheInstructionTextChangedInBetween) {
+    FakeTransport transport;
+    transport.responses.push_back(
+        FakeTransport::okWithBody(receiptBody("stale-import", "Re-import the playlist in the coordinator.")));
+    // Still mismatched, but the coordinator now describes it differently
+    // (a different reconciliation outcome, still one that carries an
+    // instruction).
+    transport.responses.push_back(
+        FakeTransport::okWithBody(receiptBody("cross-show", "Restart FPP so its binding matches this show.")));
+    FakeCredentials credentials;
+    RecordingMismatchNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             &notifier);
+
+    CHECK(client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised[0].message, std::string("Re-import the playlist in the coordinator."));
+
+    CHECK(client.publish(resolvedObservation()));
+    // The old message is cleared before the new one is raised, so a
+    // WarningHolder-backed notifier never shows two differently worded
+    // notices for the same mismatch.
+    CHECK_EQ(notifier.cleared.size(), std::size_t{1});
+    CHECK_EQ(notifier.cleared[0].message, std::string("Re-import the playlist in the coordinator."));
+    CHECK_EQ(notifier.raised.size(), std::size_t{2});
+    CHECK_EQ(notifier.raised[1].message, std::string("Restart FPP so its binding matches this show."));
 }
