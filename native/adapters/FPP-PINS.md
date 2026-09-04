@@ -47,3 +47,5 @@ that the shared object exports the symbols the loader looks up. It is not
 evidence that the plugin loads into a running `fppd`, that the action
 appears in the FPP UI, or that the callback boundary meets its latency
 budget on real hardware. Those need a real host.
+
+See [`docs/research/prebuilt-native-plugin-distribution.md`](../../docs/research/prebuilt-native-plugin-distribution.md) for whether the compiled adapter could ship prebuilt instead of building on the host.
