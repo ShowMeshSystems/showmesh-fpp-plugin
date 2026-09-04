@@ -91,6 +91,13 @@ build_once() {
     local out="$1" build_tag="$2"
     mkdir -p "$out"
 
+    # --pull: docker's local image store keys FROM debian:trixie by name,
+    # not by platform, so a single-platform image already cached under that
+    # name (from an unrelated build) is reused as-is even when --platform
+    # asks for a different one, with only a buildx warning, no failure. A
+    # local debian:trixie cached for the wrong platform was observed to
+    # produce a wrong-architecture object this way; --pull forces the
+    # manifest-list resolution that picks the correct platform's image.
     docker buildx build \
         --platform "$PLATFORM" \
         -f "$REPO_ROOT/native/adapters/prebuilt/Dockerfile" \
@@ -99,6 +106,7 @@ build_once() {
         --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
         --build-arg "PREBUILT_CXXFLAGS=$PREBUILT_CXXFLAGS" \
         --no-cache \
+        --pull \
         -t "$build_tag" \
         --load \
         "$REPO_ROOT"
@@ -109,6 +117,22 @@ build_once() {
     docker cp "$cid:/opt/build-compiler.txt" "$out/.compiler-${ARCH}.txt"
     docker rm "$cid" >/dev/null
     docker image rm "$build_tag" >/dev/null 2>&1 || true
+
+    # The single hazard --pull does not fully close by itself: confirm the
+    # object's own ELF header, not just the image's platform label, since
+    # that is the thing that actually determines whether fppd can load it.
+    local file_desc want_substr
+    file_desc="$(file "$out/libshowmesh-fpp10-${ARCH}.so")"
+    case "$ARCH" in
+        amd64) want_substr="x86-64" ;;
+        arm64) want_substr="ARM aarch64" ;;
+        armv7) want_substr="ARM, EABI5" ;;
+    esac
+    if ! echo "$file_desc" | grep -q "$want_substr"; then
+        echo "build-prebuilt-fpp10: FATAL: the object built for --arch $ARCH does not look like $want_substr: $file_desc" >&2
+        exit 1
+    fi
+    echo "build-prebuilt-fpp10: confirmed $out/libshowmesh-fpp10-${ARCH}.so is $file_desc"
 
     local compiler_line
     compiler_line="$(head -1 "$out/.compiler-${ARCH}.txt" | sed 's/"/\\"/g')"
