@@ -7,3 +7,9 @@
 # scripts/test-plugin-load-fpp.sh prepares as build contexts. Not committed:
 # each is fetched fresh, and verified against its pinned commit, on demand.
 .fpp-src/
+
+# The local, commit-pinned ShowMeshSystems/fpp-showmesh (packaging repository)
+# checkout scripts/test-plugin-load-fpp-installer.sh prepares to drive that
+# repository's real installer. Not committed: fetched fresh, and verified
+# against its pinned commit, on demand.
+.fpp-showmesh-src/
