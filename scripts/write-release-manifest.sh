@@ -5,9 +5,16 @@
 # so two builds of one commit produce the same manifest.
 set -euo pipefail
 
-dist="${1:?usage: write-release-manifest.sh <dist-dir> <version> <commit>}"
+dist="${1:?usage: write-release-manifest.sh <dist-dir> <version> <commit> [--with-prebuilt-fpp10]}"
 version="${2:?missing version}"
 commit="${3:?missing commit}"
+
+with_prebuilt_fpp10=0
+case "${4:-}" in
+    --with-prebuilt-fpp10) with_prebuilt_fpp10=1 ;;
+    "") ;;
+    *) echo "write-release-manifest: unknown argument '$4'" >&2; exit 2 ;;
+esac
 
 pins="native/adapters/FPP-PINS.md"
 [ -f "$pins" ] || { echo "write-release-manifest: $pins does not exist" >&2; exit 1; }
@@ -108,5 +115,10 @@ emit "showmesh-fpp-plugin_${version}_linux_amd64.tar.gz" amd64 "go-helper"
 emit "showmesh-fpp-plugin_${version}_linux_arm64.tar.gz" arm64 "go-helper"
 emit "showmesh-fpp-plugin_${version}_linux_armv7.tar.gz" armv7 "go-helper"
 emit "showmesh-fpp-plugin-native_${version}.tar.gz" any "native-source"
+if [ "$with_prebuilt_fpp10" -eq 1 ]; then
+    emit "libshowmesh-fpp10-amd64.so" amd64 "native-prebuilt-fpp10"
+    emit "libshowmesh-fpp10-arm64.so" arm64 "native-prebuilt-fpp10"
+    emit "libshowmesh-fpp10-armv7.so" armv7 "native-prebuilt-fpp10"
+fi
 printf '\n  ]\n'
 printf '}\n'
