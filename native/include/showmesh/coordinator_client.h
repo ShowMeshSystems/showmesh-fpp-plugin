@@ -42,6 +42,15 @@ using Sleeper = void (*)(int millis, const std::atomic<bool>* stopRequested);
 
 void sleepMillis(int millis, const std::atomic<bool>* stopRequested);
 
+// How long an active mismatch notice survives with no further word from
+// the coordinator before this client clears it on its own. A genuine
+// mismatch's notice then disappears while the coordinator is unreachable,
+// rather than standing forever on stale evidence; an operator who checks
+// FPP's own warnings list during a long outage sees the notice go away
+// even though nothing was actually fixed. The next observation that
+// reaches the coordinator re-evaluates and can re-raise it.
+constexpr TimeMillis kMismatchVerdictAgeOutMillis = 300000;
+
 // What an operator can see locally without the coordinator's help. A
 // 401, a 403, a schema refusal, and an unreachable coordinator are four
 // different problems with four different fixes, so they are counted
@@ -109,9 +118,15 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // baseUrl empty, or a null credential source, is a configured-wrong
     // client rather than a crash: every post then fails visibly with the
     // configuration error, which is what an operator needs to see.
+    // mismatchNotifier is where the coordinator's own reconciliation
+    // verdict on this instance is mirrored; nullptr keeps the previous
+    // behavior (no notification). See applyMismatchVerdict() below for
+    // why this lives here rather than in ShowMeshRuntime: the verdict
+    // arrives on the observation POST's own response body, which only
+    // this client ever sees.
     CoordinatorClient(HttpTransport* transport, CredentialSource* credentials, std::string baseUrl, Clock clock,
                       StatusSink* statusSink = nullptr, Sleeper sleeper = sleepMillis,
-                      RetryPolicy policy = RetryPolicy());
+                      RetryPolicy policy = RetryPolicy(), PlaylistMismatchNotifier* mismatchNotifier = nullptr);
 
     // Records why the client cannot post, for a configuration failure the
     // caller detected (a config.json that would not load, for instance).
@@ -142,11 +157,39 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
         int statusCode = 0;
         std::string label;
         std::string error;
+        // The raw response body, captured only on acceptance: that is
+        // the only case the observation-receipt schema (and its
+        // reconciliation/operatorInstruction fields) applies to.
+        std::string body;
     };
 
     bool sendObservation(const PlaylistEntryObservation& observation);
     Outcome postWithRetry(const char* path, const std::string& body);
     void publishStatus();
+
+    // Called once per accepted observation receipt. Parses reconciliation
+    // and operatorInstruction out of body and raises, clears, or leaves
+    // the notice untouched. Absent is not resolved: a receipt the
+    // coordinator could not compute a verdict for (a failed lookup,
+    // reported best effort by an otherwise-successful 200) must never be
+    // read as "mismatch cleared", so a missing or unrecognized
+    // reconciliation value leaves whatever notice state already stands.
+    void applyMismatchVerdict(const std::string& body, TimeMillis now);
+    // Called once per refused or unreachable post attempt. The notice
+    // ages out only from here, never from applyMismatchVerdict(): an
+    // accepted receipt with no verdict already proves the coordinator is
+    // reachable, so it must not itself count toward the age-out clock.
+    void checkMismatchAgeOut(TimeMillis now);
+    // Clears the previous raised message first if it differs from
+    // instruction, so a WarningHolder-backed notifier is never left
+    // holding two differently worded notices for the same triple.
+    void raiseMismatchNotice(const std::string& instruction);
+    // Always clears with lastRaisedMessage_, the text this client itself
+    // raised, never with any newly received text: an implementation
+    // backed by WarningHolder's exact-triple match would otherwise leave
+    // a permanent notice if the coordinator's wording ever changed
+    // between the raise and the clear.
+    void clearMismatchNotice();
 
     HttpTransport* transport_;
     CredentialSource* credentials_;
@@ -174,6 +217,23 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // Set by requestStop(), read by postWithRetry() and the sleeper. See
     // requestStop() above.
     std::atomic<bool> stopRequested_{false};
+
+    // Worker-thread only, like everything else in this class: publish()
+    // and publishUnavailable() are only ever called from ShowMeshRuntime's
+    // resident worker thread.
+    PlaylistMismatchNotifier* mismatchNotifier_;
+    // Whether mismatchNotifier_ currently believes the notice is raised.
+    bool mismatchActive_ = false;
+    // The exact message last given to raiseMismatch(); clearMismatch()
+    // must always be called with this, not with any later text. See
+    // clearMismatchNotice().
+    std::string lastRaisedMessage_;
+    // The last time an observation POST reached the coordinator and got
+    // an accepted receipt back, whatever the receipt said. Age-out
+    // compares against this, not against the last time a verdict field
+    // was actually present, so a reachable coordinator whose own verdict
+    // lookup keeps failing does not itself trigger an age-out clear.
+    TimeMillis lastVerdictAtMillis_ = 0;
 };
 
 }  // namespace showmesh

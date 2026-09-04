@@ -92,6 +92,38 @@ class ObservationSink {
     virtual void requestStop() {}
 };
 
+// PlaylistMismatchNotifier is where a mid-show playlist mismatch is
+// reported: the coordinator's own reconciliation verdict on the plugin's
+// last observation says the currently playing playlist no longer matches
+// what the coordinator has bound. The plugin decides nothing about this
+// itself; it mirrors whatever the coordinator's response said. Optional;
+// nullptr keeps the previous behavior (no notification).
+class PlaylistMismatchNotifier {
+ public:
+    virtual ~PlaylistMismatchNotifier() = default;
+    // Called only on a transition into the mismatched state, or when the
+    // instruction text itself changes while already mismatched. message
+    // is the coordinator's own operatorInstruction for this verdict.
+    virtual void raiseMismatch(int id, const std::string& message) = 0;
+    // Called only on a transition out of the mismatched state (resolved,
+    // or aged out). Always given the identical id and message the most
+    // recent raiseMismatch() call gave: an implementation backed by
+    // WarningHolder clears only on an exact (id, message, plugin) match.
+    virtual void clearMismatch(int id, const std::string& message) = 0;
+};
+
+// The identity this notice is raised and cleared under. Defined once,
+// here, so both FPP adapters and this repository's own tests reference
+// the identical value instead of each holding their own copy that could
+// drift apart.
+//
+// 0 rather than a curated FPP warning id: ShowMesh owns no entry in FPP's
+// own www/warnings-definitions.json, and WarningHolder's own
+// UNKNOWN_WARNING_ID is exactly this value, used the same way by FPP's
+// own ad hoc, plugin-sourced warnings. RemoveWarning's exact-triple match
+// (id, message, plugin) still makes this notice unambiguous.
+constexpr int ShowMesh_PlaylistMismatch = 0;
+
 // PlaylistDefinitionSource resolves a playlist's complete definition. The
 // worker calls it, never the callback thread: on FPP this reads the
 // playlist-definition API, and in a test it returns a fixture.
