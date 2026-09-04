@@ -268,15 +268,49 @@ release: release-amd64 release-arm64 release-armv7 release-native-bundle
 # manifest. Written to a temp file and renamed into place only once the
 # writer succeeds, so a failed run cannot leave a truncated manifest
 # sitting at the path callers trust.
+#
+# WITH_PREBUILT_FPP10=1 (set by release-with-prebuilt-fpp10 below) tells
+# both the writer and the verifier to expect the three prebuilt FPP 10
+# objects too, so the verifier's expected-filenames set stays an explicit
+# list for whichever release shape actually ran, rather than becoming
+# conditional on what the manifest happens to contain.
 .PHONY: release-manifest
 release-manifest:
 	@tmp="$(DIST)/.release-manifest.json.tmp"; \
-	if ! scripts/write-release-manifest.sh "$(DIST)" "$(DIST_VERSION)" "$(COMMIT)" > "$$tmp"; then \
+	if ! scripts/write-release-manifest.sh "$(DIST)" "$(DIST_VERSION)" "$(COMMIT)" $(if $(WITH_PREBUILT_FPP10),--with-prebuilt-fpp10) > "$$tmp"; then \
 		rm -f "$$tmp"; \
 		exit 1; \
 	fi; \
 	mv "$$tmp" $(DIST)/release-manifest.json
-	@scripts/verify-release-manifest.sh "$(DIST)" "$(DIST_VERSION)"
+	@scripts/verify-release-manifest.sh "$(DIST)" "$(DIST_VERSION)" $(if $(WITH_PREBUILT_FPP10),--with-prebuilt-fpp10)
+
+# Copies the three prebuilt FPP 10 objects and their build.json sidecars
+# from PREBUILT_FPP10_DIR into $(DIST), alongside the Go helper tarballs
+# and native bundle, so the manifest and checksums file can name them the
+# same way they name every other release artifact. The sidecars ship as
+# informational companions: they are not hashed into SHA256SUMS or the
+# manifest, since the sidecar for each object already records that
+# object's own sha256 plus its build provenance (FPP tag/commit, compiler,
+# compile flags, source date epoch).
+.PHONY: release-prebuilt-fpp10
+release-prebuilt-fpp10: check-clean-tree prebuilt-fpp10-all
+	mkdir -p $(DIST)
+	cp $(PREBUILT_FPP10_DIR)/libshowmesh-fpp10-amd64.so $(PREBUILT_FPP10_DIR)/libshowmesh-fpp10-amd64.so.build.json $(DIST)/
+	cp $(PREBUILT_FPP10_DIR)/libshowmesh-fpp10-arm64.so $(PREBUILT_FPP10_DIR)/libshowmesh-fpp10-arm64.so.build.json $(DIST)/
+	cp $(PREBUILT_FPP10_DIR)/libshowmesh-fpp10-armv7.so $(PREBUILT_FPP10_DIR)/libshowmesh-fpp10-armv7.so.build.json $(DIST)/
+
+# Release-time only, same reason as prebuilt-fpp10-all above: arm64 and
+# armv7 build under QEMU emulation, so this never runs on every pull
+# request, only when cutting a release that should carry the prebuilt FPP
+# 10 objects. `make release` and CI's per-PR release-artifacts job are
+# unchanged by this target's existence.
+.PHONY: release-with-prebuilt-fpp10
+release-with-prebuilt-fpp10: release-amd64 release-arm64 release-armv7 release-native-bundle release-prebuilt-fpp10
+	cd $(DIST) && sha256sum showmesh-fpp-plugin_$(DIST_VERSION)_linux_*.tar.gz $(NATIVE_BUNDLE) libshowmesh-fpp10-*.so > showmesh-fpp-plugin_$(DIST_VERSION)_SHA256SUMS
+	cd $(DIST) && sha256sum -c showmesh-fpp-plugin_$(DIST_VERSION)_SHA256SUMS
+	scripts/verify-artifact-arch.sh "$(DIST)" "$(DIST_VERSION)"
+	$(MAKE) release-manifest WITH_PREBUILT_FPP10=1
+	@echo "release-with-prebuilt-fpp10: built and self-verified $(DIST)/showmesh-fpp-plugin_$(DIST_VERSION)_SHA256SUMS"
 
 # The stronger claim `release`'s own sha256sum -c cannot make: two
 # independent builds of the same commit, both under the pinned release

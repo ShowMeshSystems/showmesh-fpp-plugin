@@ -5,9 +5,16 @@
 # produced rather than trusted because it was just written.
 set -euo pipefail
 
-dist="${1:?usage: verify-release-manifest.sh <dist-dir> <version>}"
+dist="${1:?usage: verify-release-manifest.sh <dist-dir> <version> [--with-prebuilt-fpp10]}"
 version="${2:?missing version}"
 manifest="$dist/release-manifest.json"
+
+with_prebuilt_fpp10=0
+case "${3:-}" in
+    --with-prebuilt-fpp10) with_prebuilt_fpp10=1 ;;
+    "") ;;
+    *) echo "verify-release-manifest: unknown argument '$3'" >&2; exit 2 ;;
+esac
 
 [ -f "$manifest" ] || { echo "verify-release-manifest: $manifest does not exist" >&2; exit 1; }
 
@@ -56,6 +63,12 @@ showmesh-fpp-plugin_${version}_linux_armv7.tar.gz
 showmesh-fpp-plugin-native_${version}.tar.gz
 EOF
 )
+if [ "$with_prebuilt_fpp10" -eq 1 ]; then
+    expected="$expected
+libshowmesh-fpp10-amd64.so
+libshowmesh-fpp10-arm64.so
+libshowmesh-fpp10-armv7.so"
+fi
 if [ "$(printf '%s\n' "$filenames" | sort)" != "$(printf '%s\n' "$expected" | sort)" ]; then
     echo "verify-release-manifest: manifest names [$(printf '%s ' $filenames)], expected exactly [$(printf '%s ' $expected)]" >&2
     exit 1
