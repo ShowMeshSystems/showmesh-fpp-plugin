@@ -237,7 +237,14 @@ void CoordinatorClient::applyMismatchVerdict(const std::string& body, TimeMillis
     if (!parseReconciliationVerdict(body, &reconciliation, &operatorInstruction)) return;
 
     if (isMismatchOutcome(reconciliation)) {
-        raiseMismatchNotice(operatorInstruction);
+        // The contract pairs a mismatch outcome with a non-empty
+        // operatorInstruction; both are omitted together otherwise. A
+        // receipt that violates that (a mismatch outcome with no
+        // instruction text) is treated the same as an absent verdict
+        // rather than raised: FPP's own notification centre would show a
+        // blank notice, which is visible, alarming, and tells the
+        // operator nothing they can act on.
+        if (!operatorInstruction.empty()) raiseMismatchNotice(operatorInstruction);
     } else if (reconciliation == "resolved") {
         clearMismatchNotice();
     }

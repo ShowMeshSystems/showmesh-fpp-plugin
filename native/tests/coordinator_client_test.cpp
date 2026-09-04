@@ -685,3 +685,21 @@ TEST(TheNoticeClearsWithTheRaisedMessageEvenWhenTheInstructionTextChangedInBetwe
     CHECK_EQ(notifier.raised.size(), std::size_t{2});
     CHECK_EQ(notifier.raised[1].message, std::string("Restart FPP so its binding matches this show."));
 }
+
+// The contract pairs a mismatch outcome with a non-empty
+// operatorInstruction and omits both together otherwise, so this should
+// not happen. But a receipt is operator-visible surface: raising with an
+// empty message would be a blank, unexplained entry in FPP's own
+// notification centre, worse than not raising at all.
+TEST(AMismatchOutcomeWithNoOperatorInstructionIsNotRaised) {
+    FakeTransport transport;
+    transport.responses.push_back(FakeTransport::okWithBody(receiptBody("stale-import", "")));
+    FakeCredentials credentials;
+    RecordingMismatchNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             &notifier);
+
+    CHECK(client.publish(resolvedObservation()));
+    CHECK(notifier.raised.empty());
+    CHECK(notifier.cleared.empty());
+}
