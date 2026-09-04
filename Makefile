@@ -66,6 +66,46 @@ native-test:
 .PHONY: check
 check: fmt-check vet lint test native-test
 
+# ---------------------------------------------------------------------------
+# Prebuilt FPP 10 adapter objects
+#
+# FPP 10 checks an API-version integer and four ABI probe sizes at dlopen
+# (docs/research/prebuilt-native-plugin-distribution.md), so a `.so` built
+# once against the pinned FPP 10 headers can ship instead of compiling on
+# every host. Built inside a debian:trixie container, the same base
+# FalconChristmas/fpp's own Docker/Dockerfile uses, via
+# scripts/build-prebuilt-fpp10.sh, which owns the actual compile flags.
+# amd64 is native and cheap and runs in CI; arm64 and armv7 run under QEMU
+# emulation and are a release-time build only, not a per-PR one.
+# ---------------------------------------------------------------------------
+PREBUILT_FPP10_DIR := dist/prebuilt/fpp10
+
+.PHONY: prebuilt-fpp10-amd64
+prebuilt-fpp10-amd64:
+	scripts/build-prebuilt-fpp10.sh --arch amd64 --out-dir $(PREBUILT_FPP10_DIR)
+
+.PHONY: prebuilt-fpp10-arm64
+prebuilt-fpp10-arm64:
+	scripts/build-prebuilt-fpp10.sh --arch arm64 --out-dir $(PREBUILT_FPP10_DIR)
+
+.PHONY: prebuilt-fpp10-armv7
+prebuilt-fpp10-armv7:
+	scripts/build-prebuilt-fpp10.sh --arch armv7 --out-dir $(PREBUILT_FPP10_DIR)
+
+# Release-time only. NOT part of `make check` or the per-PR CI matrix: arm64
+# and armv7 build under QEMU emulation, measured at about 9 minutes for
+# armv7 on a 4 vCPU x86_64 box (docs/research/prebuilt-native-plugin-distribution.md).
+.PHONY: prebuilt-fpp10-all
+prebuilt-fpp10-all: prebuilt-fpp10-amd64 prebuilt-fpp10-arm64 prebuilt-fpp10-armv7
+
+# Builds one architecture (default amd64, the one CI checks) twice and
+# fails loudly if the two objects are not byte-identical. Proves the build
+# is reproducible on this one machine, in this one docker buildx instance;
+# it does not prove a different machine or docker version would agree.
+.PHONY: verify-prebuilt-fpp10-reproducible
+verify-prebuilt-fpp10-reproducible:
+	scripts/build-prebuilt-fpp10.sh --arch $(or $(ARCH),amd64) --out-dir $(PREBUILT_FPP10_DIR)/.verify --verify-reproducible
+
 # Bench scaffolding, not the product: stands up a containerized fppd (FPP 9
 # or FPP 10; pass MAJOR=fpp10) and runs bench/fpp-plugin-load's assertions
 # against it. Requires Docker; not part of `make check` because it needs a
