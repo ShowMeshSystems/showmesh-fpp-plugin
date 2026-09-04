@@ -22,6 +22,11 @@ BENCH_HTTP_PORT="${BENCH_HTTP_PORT:-8190}"
 BENCH_FPP_MAJOR="${BENCH_FPP_MAJOR:-fpp9}"
 BENCH_CPU="${BENCH_CPU:-amd64}"
 BENCH_USE_PREBUILT="${BENCH_USE_PREBUILT:-0}"
+# Installs a prebuilt ADAPTER OBJECT (the .so scripts/build-prebuilt-fpp10.sh
+# produces) instead of compiling one in-container. Distinct from --prebuilt
+# above on purpose: --prebuilt already names a prebuilt FPP FIXTURE IMAGE
+# (FPP 9 only), an unrelated thing.
+ADAPTER_OBJECT=""
 DOWN=0
 
 usage() {
@@ -44,6 +49,12 @@ Usage: $(basename "$0") [options]
                  bench/fpp-plugin-load/.env.example. Refused for fpp10:
                  there is no fixture image for it. Refused for --cpu arm64:
                  the fixture is amd64 only.
+  --adapter-object PATH
+                 Install this prebuilt adapter .so (from
+                 scripts/build-prebuilt-fpp10.sh) instead of compiling one
+                 in-container. Only valid with --major fpp10. Runs a single
+                 assertion, that fppd's ABI gate accepts the object and
+                 loads the plugin; skips the rest of the assertion suite.
   --down         Tear this run down and exit. Removes the container, the
                  network AND the named media volume (docker compose down -v),
                  so the next run with this --id starts from a clean fppd
@@ -63,6 +74,7 @@ while [ $# -gt 0 ]; do
         --major) BENCH_FPP_MAJOR="$2"; shift 2 ;;
         --cpu) BENCH_CPU="$2"; shift 2 ;;
         --prebuilt) BENCH_USE_PREBUILT=1; shift ;;
+        --adapter-object) ADAPTER_OBJECT="$2"; shift 2 ;;
         --down) DOWN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -127,6 +139,17 @@ fi
 if [ "$BENCH_USE_PREBUILT" = "1" ] && [ "$BENCH_CPU" = "arm64" ]; then
     echo "test-plugin-load-fpp: --prebuilt has no arm64 fixture image; the fixture is amd64 only" >&2
     exit 2
+fi
+
+if [ -n "$ADAPTER_OBJECT" ]; then
+    if [ "$BENCH_FPP_MAJOR" != "fpp10" ]; then
+        echo "test-plugin-load-fpp: --adapter-object is only valid with --major fpp10 (FPP 9 performs no ABI check, so this bench mode has nothing to prove there)" >&2
+        exit 2
+    fi
+    if [ ! -f "$ADAPTER_OBJECT" ]; then
+        echo "test-plugin-load-fpp: --adapter-object path does not exist: $ADAPTER_OBJECT" >&2
+        exit 2
+    fi
 fi
 
 # Normalizes both docker's image-architecture vocabulary (amd64/arm64) and
@@ -215,7 +238,16 @@ fi
 
 RESULTS_NAMES=()
 RESULTS_STATUS=()
-EXPECTED_ASSERTIONS=8
+# --adapter-object narrows this run to the one assertion decision 3 of this
+# task scopes: that the prebuilt object dlopens and fppd's ABI gate accepts
+# it. The rest of the suite (command vocabulary, invoke, DDP output, unload,
+# teardown, restart) says nothing new about a prebuilt object versus a
+# compiled one and is deliberately not run here.
+if [ -n "$ADAPTER_OBJECT" ]; then
+    EXPECTED_ASSERTIONS=1
+else
+    EXPECTED_ASSERTIONS=8
+fi
 SUMMARY_PRINTED=0
 SUMMARY_FAILED=0
 
@@ -356,25 +388,32 @@ fi
 PLUGIN_DIR="/home/fpp/media/plugins/fpp-showmesh"
 
 install_plugin() {
-    echo "test-plugin-load-fpp: installing (bench-owned, not the real installer)"
-    docker exec "$CONTAINER" rm -rf /tmp/showmesh-native
-    docker exec "$CONTAINER" cp -r /opt/showmesh-native-src /tmp/showmesh-native
     docker exec "$CONTAINER" mkdir -p "$PLUGIN_DIR"
 
-    local start_ns end_ns duration_ms
-    start_ns=$(date +%s%N)
-    docker exec "$CONTAINER" make -C /tmp/showmesh-native/adapters "$ADAPTER_TARGET" \
-        FPP_SRC=/opt/fpp/src \
-        CXXFLAGS="-std=c++20 -O2 -fPIC -Wall -Wextra -Werror ${EXTRA_CXXFLAGS}"
-    end_ns=$(date +%s%N)
-    duration_ms=$(( (end_ns - start_ns) / 1000000 ))
-    if [ "${EMULATED:-0}" = "1" ]; then
-        echo "test-plugin-load-fpp: in-container adapter compile took ${duration_ms}ms (measured under emulation, container image architecture '$IMAGE_ARCH' on host arch '$HOST_ARCH', NOT representative of a real host and not a basis for a packaging time estimate)"
+    if [ -n "$ADAPTER_OBJECT" ]; then
+        echo "test-plugin-load-fpp: installing (bench-owned, not the real installer) a PREBUILT adapter object: $ADAPTER_OBJECT"
+        docker cp "$ADAPTER_OBJECT" "${CONTAINER}:${PLUGIN_DIR}/${SO_NAME}"
     else
-        echo "test-plugin-load-fpp: in-container adapter compile took ${duration_ms}ms"
+        echo "test-plugin-load-fpp: installing (bench-owned, not the real installer)"
+        docker exec "$CONTAINER" rm -rf /tmp/showmesh-native
+        docker exec "$CONTAINER" cp -r /opt/showmesh-native-src /tmp/showmesh-native
+
+        local start_ns end_ns duration_ms
+        start_ns=$(date +%s%N)
+        docker exec "$CONTAINER" make -C /tmp/showmesh-native/adapters "$ADAPTER_TARGET" \
+            FPP_SRC=/opt/fpp/src \
+            CXXFLAGS="-std=c++20 -O2 -fPIC -Wall -Wextra -Werror ${EXTRA_CXXFLAGS}"
+        end_ns=$(date +%s%N)
+        duration_ms=$(( (end_ns - start_ns) / 1000000 ))
+        if [ "${EMULATED:-0}" = "1" ]; then
+            echo "test-plugin-load-fpp: in-container adapter compile took ${duration_ms}ms (measured under emulation, container image architecture '$IMAGE_ARCH' on host arch '$HOST_ARCH', NOT representative of a real host and not a basis for a packaging time estimate)"
+        else
+            echo "test-plugin-load-fpp: in-container adapter compile took ${duration_ms}ms"
+        fi
+
+        docker exec "$CONTAINER" cp "/tmp/showmesh-native/adapters/build/${ADAPTER_TARGET}/${SO_NAME}" "${PLUGIN_DIR}/${SO_NAME}"
     fi
 
-    docker exec "$CONTAINER" cp "/tmp/showmesh-native/adapters/build/${ADAPTER_TARGET}/${SO_NAME}" "${PLUGIN_DIR}/${SO_NAME}"
     docker exec "$CONTAINER" cp /opt/showmesh-plugin-src/callbacks "${PLUGIN_DIR}/callbacks"
     docker exec "$CONTAINER" chmod 0755 "${PLUGIN_DIR}/callbacks"
 
@@ -1127,12 +1166,14 @@ a8() {
 # ---------------------------------------------------------------------------
 
 a1
-a2
-a3
-a4_a5
-a6
-a7
-a8
+if [ -z "$ADAPTER_OBJECT" ]; then
+    a2
+    a3
+    a4_a5
+    a6
+    a7
+    a8
+fi
 
 print_summary
 if [ "$SUMMARY_FAILED" -ne 0 ]; then
