@@ -241,7 +241,7 @@ If the ceiling cannot be observed or the control path exposes only one destructi
 
 Resting audio is a ShowMesh `background` playback session. It uses node-local assets, loop behavior, gain, and the Audio Engine's fade machinery. Configuration includes source or playlist, loop policy, fade curve, per-transition offsets, maximum resting gain, and whether a source resumes or restarts where that distinction applies. A multi-item playlist follows `AUDIO-ENGINE.md` §3: it pins an ordered revision and exact item assets, advances each item once, and never guesses after a stale bookmark or missing next item.
 
-Announcements are separate higher-priority sessions. A normal transition announcement is placed after the configured background fade or uses an explicitly configured duck/interrupt policy. Public-safety interruption of all playout is a separate future safety design; this document does not represent ShowMesh as an emergency-alert receiver.
+Announcements are separate higher-priority sessions. Policy is configurable per announcement as `duck`, `mix`, or `interrupt`, with a configured default; interrupt uses the Audio Engine's resume/restart policy. This includes manually triggered alert-style announcements. Automated public-safety interruption of all playout remains a separate future safety design; this document does not represent ShowMesh as an emergency-alert receiver.
 
 The generic asset store remains codec-agnostic. Every output validates its own supported-format and mix capabilities without narrowing formats available to other outputs. The first synchronized-third-party compatibility corpus uses the formats FPP recognizes as audio, but that is an L0 owner assumption rather than evidence that a destination accepts them. Advance provisioning, absent-readiness behavior, and open integration questions are recorded in [RES-016](../research/RES-016-third-party-synchronized-audio-output.md).
 
@@ -334,6 +334,13 @@ An ordinary `immediate` policy is valid only for targets explicitly attested saf
 For the reference installation, the existing MQTT/Node-RED response-contract action is sufficient. A full Home Assistant control provider may replace the binding later without changing the lifecycle contract. A direct FPP/Home Assistant hard cutoff may exist as an installation-specific final fallback, scheduled beyond its configured maximum show and cooldown window.
 
 ## 11. Persistence, restart, and loss of coordination
+
+ADR-048 adds one bounded exception for an already scheduled show: a verified
+FPP fallback program may continue the package's pre-resolved Cue map after
+confirmed coordinator loss.  FPP remains the scheduler and playlist authority.
+The fallback program ends at its declared cutoff and recovery waits for the
+next normal scheduled-show boundary.  It does not authorize a new session,
+make a calendar decision, or allow arbitrary FPP commands.
 
 The night-session record persists at minimum:
 

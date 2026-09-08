@@ -1,6 +1,6 @@
 # RES-018: FPP Brightness, Playlist Identity, and Plugin Runtime
 
-[Architecture](../architecture/RESTING-MODE.md) · [Distribution research](RES-015-fpp-plugin-distribution-model.md) · [Track F](../build/TRACK-F-resting-mode.md) · [Track H](../build/TRACK-H-cues-and-playlists.md) · [SM-63 handoff](../build/SM-63-FPP-PLUGIN-HANDOFF.md) · [Tracker](README.md)
+[Architecture](../architecture/RESTING-MODE.md) · [Distribution research](RES-015-fpp-plugin-distribution-model.md) · [Track F](../build/TRACK-F-resting-mode.md) · [Track H](../build/TRACK-H-cues-and-playlists.md) · [SM-63 handoff](../build/SM-63-FPP-PLUGIN-HANDOFF.md) · [Frozen contracts](../build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md) · [Tracker](README.md)
 
 Status: planned · Risk: **high** · Verification: **L1 source evidence** for the FPP plugin mechanisms and **L2 bench evidence** for the absence of a stock FPP brightness command; no ShowMesh brightness component has been built or installed on an FPP host
 
@@ -58,7 +58,7 @@ All three repositories now exist under `ShowMeshSystems`, but only `showmesh` ho
 
 Current reality as of 2026-08-20:
 
-- **`showmesh-fpp-plugin` is created and private**, bootstrapped at commit `a94de7f`. It holds its Apache-2.0 license, a README, a canonical `CLAUDE.md` execution contract with an `AGENTS.md` pointing every other agent at it, and provenance-stamped snapshots of the eleven governing records under `docs/upstream/showmesh/`, pinned to `showmesh` commit `883e94a`. **It contains no runtime code**: the Go helper has not been extracted, the `internal/version` dependency has not been replaced, the `CoordinatorClient` seam does not exist, the C++ component has not been started, and no cross-build has been produced.
+- **`showmesh-fpp-plugin` is created and private**, bootstrapped at commit `a94de7f`. It holds its Apache-2.0 license, a README, a public cross-agent `AGENTS.md` contract with a short Claude-specific supplement, and provenance-stamped snapshots of the eleven governing records under `docs/upstream/showmesh/`, pinned to `showmesh` commit `883e94a`. **It contains no runtime code**: the Go helper has not been extracted, the `internal/version` dependency has not been replaced, the `CoordinatorClient` seam does not exist, the C++ component has not been started, and no cross-build has been produced.
 - **The Go helper still remains under `showmesh/cmd/showmesh-fpp-plugin`** and is still the only implementation. Extraction is the remaining half of the bootstrap and was deliberately deferred so it happens from inside the new repository rather than across two checkouts.
 - **`fpp-showmesh` exists as a private repository** rather than only a local sibling. Its locked-artifact packaging has not been rebuilt.
 - Nothing in any of the three has been installed on a real FPP host, and no release, public or private, has been published.
@@ -138,6 +138,8 @@ The common entry key is derived from instance UUID, playlist name, canonical pla
 The coordinator authenticates before parsing the full body, applies a strict size bound, validates schema version and instance identity, and accepts an observation only when its sequence is newer than the last accepted sequence for that instance. Repeating the same sequence and identical body is idempotent. A reused sequence with different content, a regression, an unsupported version, or a body whose derived entry key disagrees with its fields is refused and audited.
 
 The endpoint stores the latest full observation and publishes one observation/change-stream update. Track H performs Show, Playlist, Cue, and active-show authorization after ingestion. Accepting plugin evidence is not permission to execute the referenced content.
+
+The exact wire bytes for this section, and for the coordinator-facing brightness transition gain in section 1, are frozen in [FPP plugin coordinator contracts](../build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md). That record fixes the endpoint, payload, refusal vocabulary, unavailable spellings, and the persistent-sequence requirement so the coordinator and the plugin can be built independently and still meet. It does not raise this record's verification level: nothing in it has run against a real FPP host.
 
 ## 7. Build sequence
 

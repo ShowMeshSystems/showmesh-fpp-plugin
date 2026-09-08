@@ -784,6 +784,86 @@ Fail-closed is kept where it is right, which is `config:write` and
 `principal:write`. Changing who may act, with no record of who changed it, is
 the case the audit log exists for.
 
+**AMENDED 2026-08-26, owner ruling: audit-store unavailability never blocks
+an action, on any request path, not only the three-member safety class
+above.** The ruling, in the owner's own words: "Audit log database becoming
+unavailable SHOULD NOT STOP ANY ACTIONS, rather than stopping it should be
+LOUD in the UI and non-audit logs about it. Audit logging is NOT a show
+stopping issue, hopefully its loud enough in logs and UI that the operators
+know to fix it before the next show, but again it should NOT stop the show
+or any actions from running. If the audit log being down currently blocks
+actions, that must be corrected."
+
+This exemption is scoped to the `ErrAuditWrite` class specifically: an
+audit_log append that itself failed. A `BeginTx`-class failure (the
+store's one connection could not even open a transaction) or an
+audit-params marshal failure still returns a 500 on all five paths below,
+because neither is the sentinel each path's fallback recognizes. This is
+defensible rather than an oversight: `InsertCommand` shares the identical
+SQLite file, so nothing could have been durably recorded either way, and
+a fallback for a failure this narrow amendment's own mechanism cannot
+even detect is not the same claim as the `ErrAuditWrite` fallback makes.
+
+Five request paths still failed closed on the pre-dispatch write, contrary
+to that rule: `POST /api/v1/actions/{id}/invocations` (direct show.action
+invoke) for an action whose stored `safetyClass` was `"none"`, the audio
+session command dispatch behind `POST /api/v1/nodes/{nodeId}/audio/sessions/{sessionId}/*`
+for an action outside this subsystem's own blackout-equivalent set
+(`audio.session.stop`, `audio.session.clear`, `audio.output.mute`),
+`POST /api/v1/fpp/{instanceId}/commands` for a primitive outside decision
+11's own named safety class, `POST /api/v1/resolume/actions` for an action
+other than `blackout`/`clearLayer`, and the four night-session
+admission-opening commands (`prepare-site`, `run-readiness`,
+`start-preshow`, `start-night`) behind `POST /api/v1/night/session`. This
+amendment removes the refusal on all five. Every command dispatch on every
+one of those paths now proceeds regardless of `safetyClass`, using the
+identical fallback the safety-class exemption above already established:
+the pre-dispatch write is redone through a plain, non-transactional
+insert (or, for the two night-session commands whose own decision runs
+inside the failed transaction, a non-transactional redo of that
+transaction's already-computed persist step alone), the command
+dispatches normally, and the outcome is the ordinary one dispatch would
+have produced with a healthy audit store. The distinction this record's
+own safety class used to carry (exempt vs. refused) survives only as a
+distinction in *why* attribution is reported degraded, not in *whether*
+the command runs. This covers every request path ADR-024 decision 11
+itself governs; it does not touch `config:write` or `principal:write`,
+which decision 11 already keeps fail-closed for an unrelated reason (see
+below).
+
+This is a widening of the exemption, not a second mechanism next to it.
+The same stderr line and the same wire flag (`attributionDegraded`) that
+already report a safety-class exemption's degraded attribution now report
+every other command's degraded attribution too, with a reason string
+naming which of the three justifications applies (the named safety class,
+a macro run's own decision under ADR-035, or this amendment) so an
+investigator can still tell them apart in the record.
+
+**A per-action `attributionDegraded` flag answers a narrower question than
+the one this amendment exists to make loud.** It says "was this one action
+unaudited," which only an operator who has just issued a command can read.
+It does not say "is the audit store down right now," which is what an
+operator needs to learn *before* deciding whether to trust the log later,
+without having to act first to find out. So the coordinator also carries a
+standing, coordinator-wide signal on `GET /api/v1/snapshot`
+(`auditStore.state` / `auditStore.reason`, shipped in
+IDENTIFIER-REGISTER.md as `coordinator.audit.store.state` /
+`coordinator.audit.store.reason`), computed fresh on every request via a
+real probe write to audit_log (an INSERT inside a transaction always
+rolled back, never committed), not read from a latch fed by whatever
+command traffic happened to pass through recently: `"usable"` if that
+probe just now succeeded, `"unusable"` with a reason if it did not. There
+is no third state; a probe always produces a definitive answer, so a
+coordinator that has made no real audit write since startup still reports
+its true state rather than a placeholder for one. That is the surface an
+operator can see without touching a control at all, matching decision 9's
+identical "loud and persistent" requirement for an unclaimed bootstrap
+state.
+
+`config:write` and `principal:write` are unaffected: the paragraph above
+keeping them fail-closed is not one of the five paths this amendment
+names, and this amendment does not extend the exemption to either one.
+
 ### 12. Authorization is expressed server-side, returned to the client, and carries freshness
 
 `GET /api/v1/session` returns the current principal, its role, and its effective
