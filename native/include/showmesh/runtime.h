@@ -16,6 +16,7 @@
 #include "showmesh/callback_handoff.h"
 #include "showmesh/playlist_identity.h"
 #include "showmesh/sequence_store.h"
+#include "showmesh/transition_gain.h"
 
 // The adapter-facing runtime. Everything here is shared by the FPP 9 and
 // FPP 10 adapters and knows nothing about either one's plugin lifecycle or
@@ -235,6 +236,14 @@ class ShowMeshRuntime {
     // plugin takes down more than the command.
     CommandOutcome applyBrightnessCommand(const std::string& targetPercent, const std::string& fadeSeconds);
 
+    // Serves one contract section 2.2 transition-gain write. Called from
+    // fppd's own web thread, and synchronous by requirement rather than by
+    // convenience: on FPP 10 the route is withdrawn with
+    // unregisterPluginApi(), whose guarantee covers inbound HTTP only, so
+    // a handler that handed this work to another thread would step outside
+    // it and make the plugin unsafe to unload. Keep this synchronous.
+    TransitionGainResponse applyTransitionGain(const std::string& body);
+
     // Called from FPP's own callback thread. Bounded work only: copy and
     // return.
     // playlistLoop is FPP's mainPlaylist pass counter when the callback
@@ -379,6 +388,13 @@ class ShowMeshRuntime {
     BrightnessRestartTrust brightnessRestartTrust_ = BrightnessRestartTrust::kTrustedOrNoRecord;
 
     std::mutex engineMutex_;
+    // The transition-gain route's idempotency memory, guarded by
+    // engineMutex_ alongside the engine it gates writes to, so the seen
+    // check and the write it guards cannot interleave with another
+    // request. In memory only: a restart forgets it, which is correct
+    // rather than a gap, because a restart has already lost the fade the
+    // key was protecting.
+    std::string lastTransitionGainRequestId_;
     BrightnessEngine engine_;
     CallbackHandoff handoff_;
     SequenceState sequence_;

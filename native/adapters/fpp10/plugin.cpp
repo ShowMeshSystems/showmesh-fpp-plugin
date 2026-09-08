@@ -15,6 +15,7 @@
 
 #include "Plugin.h"
 #include "Plugins.h"
+#include "fpphttp.h"
 #include "Sequence.h"
 #include "commands/Commands.h"
 
@@ -27,6 +28,7 @@
 #include "section_names.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
+#include "showmesh/transition_gain.h"
 
 namespace {
 
@@ -147,6 +149,38 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         return [this] { return quiesceDone_.load(); };
     }
 
+    // Contract section 2.2's transition-gain write. Registered through
+    // FPPPlugins::registerPluginApi(), never drogon::app().registerHandler():
+    // drogon has no route removal, so a handler registered straight with it
+    // is a function pointer into this .so that can never be withdrawn, which
+    // pins the library for the life of the process and makes the plugin
+    // impossible to unload or to upgrade in place.
+    void registerApis() override {
+        FPPPlugins::registerPluginApi(
+            showmesh::kTransitionGainPath,
+            [this](const HttpRequestPtr& req, HttpCallback&& callback) {
+                // Synchronous by requirement, not convenience.
+                // unregisterPluginApi() guarantees it does not return until
+                // no request is executing inside this handler and the
+                // handler itself is destroyed, and that guarantee covers
+                // inbound HTTP only. Handing this write to another thread
+                // would step outside it and make the .so unsafe to unmap.
+                const showmesh::TransitionGainResponse result =
+                    runtime_.applyTransitionGain(getRequestContent(req));
+                callback(makeStringResponse(result.body, result.status, "application/json"));
+            },
+            { drogon::Post });
+    }
+
+    // FPP calls this before shutdown() on both teardown paths
+    // (PluginManager::unloadPlugin and PluginManager::Cleanup), and
+    // unregisterPluginApi() does not return until no request is inside the
+    // handler and the handler object is destroyed. That is the ordering
+    // that makes the later dlclose() safe: destroy while still mapped,
+    // then unmap. Safe to call for an unregistered path and safe to call
+    // twice, so it needs no guard of its own.
+    void unregisterApis() override { FPPPlugins::unregisterPluginApi(showmesh::kTransitionGainPath); }
+
     void playlistCallback(const Json::Value& playlist, const std::string& action, const std::string& section,
                           int item) override {
         const std::string name = showmesh::adapter::playlistNameOf(playlist);
@@ -261,9 +295,14 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
 }  // namespace
 
 // This plugin stops and joins its worker in shutdown(), withdraws its
-// settings listener and the command it registered, registers no HTTP
-// route, and hands nothing to a drogon event loop, so it is safe to
-// unmap. Its outbound client links libcurl and calls curl_global_init()
+// settings listener and the command it registered, registers its one HTTP
+// route through FPPPlugins::registerPluginApi() and never through
+// drogon::app().registerHandler(), and hands nothing else to a drogon
+// event loop, so it is safe to unmap. The route is the rule rather than an
+// exception to it: Plugin.h's unload checklist requires routes to go
+// through registerPluginApi() precisely so they can be withdrawn, and
+// drogon has no route removal, so a handler registered directly with
+// drogon would pin this .so for the life of the process. Its outbound client links libcurl and calls curl_global_init()
 // but deliberately never calls curl_global_cleanup(): libcurl's own state
 // lives in libcurl.so, which fppd holds open regardless of this library,
 // and tearing it down here would tear it down underneath fppd.
