@@ -179,6 +179,11 @@ void ShowMeshRuntime::observeCallback(const char* playlistName, const char* acti
     wake_.notify_one();
 }
 
+TransitionGainResponse ShowMeshRuntime::applyTransitionGain(const std::string& body) {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    return applyTransitionGainRequest(body, &engine_, &lastTransitionGainRequestId_, clock_());
+}
+
 void ShowMeshRuntime::modifyChannelData(std::uint8_t* channelData, std::size_t channelCount) {
     std::lock_guard<std::mutex> lock(engineMutex_);
     engine_.applyToFrame(channelData, channelCount, clock_());

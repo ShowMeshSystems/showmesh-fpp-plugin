@@ -147,6 +147,34 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             g++ make pkg-config binutils git ca-certificates gawk libjsoncpp-dev libcurl4-openssl-dev
 
+      # FPP 10's plugin HTTP registration surface (fpphttp.h) includes
+      # drogon's own headers, so an adapter that serves a route cannot
+      # compile without them.
+      #
+      # Taken from the distribution, NOT pinned to a source build, and that
+      # is the opposite treatment from libhttpserver in the next step. The
+      # difference is not inconsistency: it follows how each dependency
+      # actually reaches a real FPP host. FPP 10's own installer apt-installs
+      # libdrogon-dev (FPP_Install.sh), so the distribution package IS what a
+      # real host compiles against. Debian packages no libhttpserver at all,
+      # so FPP builds 0.19.0 from source and this job pins and builds the
+      # identical commit, because fpp-pch.h decides HTTP_RESPONSE_CONST from
+      # the installed version. Same goal in both cases, compile against what
+      # the host has.
+      - name: Install drogon
+        if: matrix.major == 'fpp10'
+        run: |
+          set -eux
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libdrogon-dev
+          # Proves the header RESOLVES through the compiler, not merely that
+          # a package installed. Those are two different claims and apt
+          # reports only the second. Printing the version the compiler
+          # actually reached puts the first one in this job's log.
+          printf '#include <drogon/version.h>\nconst char* v = DROGON_VERSION;\n' > /tmp/drogon-probe.cpp
+          g++ -std=c++20 -fsyntax-only -isystem /usr/include/jsoncpp /tmp/drogon-probe.cpp
+          printf '#include <drogon/version.h>\nDROGON_VERSION\n' > /tmp/drogon-version.cpp
+          echo "drogon header resolves; version $(g++ -E -P -x c++ /tmp/drogon-version.cpp | tail -1)"
+
       # FPP 9 headers reach for libhttpserver, which Debian does not
       # package. FPP installs 0.19.0 from source and so does this job, so
       # the HTTP_RESPONSE_CONST decision fpp-pch.h makes from the installed

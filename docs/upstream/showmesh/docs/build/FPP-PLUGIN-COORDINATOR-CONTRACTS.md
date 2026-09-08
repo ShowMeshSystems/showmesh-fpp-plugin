@@ -74,7 +74,8 @@ true when either side ships.
 
 ## 1. Playlist-entry observation ingestion
 
-**Status: SHIPPED.** Both sides are built.
+**Status: SHIPPED,** except §1.8, which carries its own status: both sides are
+built for everything else in this section.
 
 ### 1.1 Endpoint and authorization
 
@@ -351,10 +352,18 @@ In order:
 2. Check `fpp:observe`; refuse `403` naming the scope.
 3. Bound the body at 16384 bytes; refuse `413` on overflow.
 4. Decode, and canonicalize the raw body. Refuse `400` on malformed JSON,
-   unknown fields, trailing content after the object, or a duplicate member
-   name. A duplicate member name matters here and not merely as pedantry: a
-   permissive decoder keeps the last `sequence` while a reader of the same
-   bytes sees the first.
+   trailing content after the object, or a duplicate member name. A duplicate
+   member name matters here and not merely as pedantry: a permissive decoder
+   keeps the last `sequence` while a reader of the same bytes sees the first.
+   A member the coordinator does not know is **ignored**, not refused. Its
+   name is returned in the response's `ignoredFields` array, sorted, capped at
+   eight, and absent when there were none. Refusing an unknown member made
+   upgrade order fatal rather than merely wrong: a plugin sending a field its
+   coordinator predates had every observation rejected, so the coordinator saw
+   no entries and fired no Cues, and the symptom looked like a broken plugin.
+   Reporting the names keeps what strict decoding bought, which is that a
+   misspelled member is visible rather than silently dropped. **A plugin must
+   not treat `ignoredFields` as a failure**: the observation was accepted.
 5. Refuse `400` when `schemaVersion` is not `1`.
 6. Refuse `400` when `instanceUuid` is absent or empty.
 7. Refuse `400` when `action` is outside the fixed vocabulary, when
@@ -402,7 +411,7 @@ non-active show must never activate anything.
 | No credential | 401 | `unauthorized` |
 | Missing `fpp:observe` | 403 | `forbidden` |
 | Body over 16384 bytes | 413 | `payload-too-large` |
-| Malformed body, unknown field | 400 | `invalid-parameter` |
+| Malformed body, trailing content, duplicate member | 400 | `invalid-parameter` |
 | Unsupported `schemaVersion` | 400 | `unsupported-observation-schema-version` |
 | Missing `instanceUuid` | 400 | `invalid-parameter` |
 | Invalid enum, hash, or position | 400 | `invalid-parameter` |
@@ -413,6 +422,11 @@ non-active show must never activate anything.
 | Sequence regression | 409 | `conflict` |
 
 ### 1.8 Entry occurrence and `playlistLoop`
+
+**Status: coordinator SHIPPED, plugin NOT BUILT.** The coordinator accepts
+`playlistLoop` and uses it as the third term of the occurrence rule. No plugin
+sends it yet, so §1's blanket "both sides are built" does not cover this
+section.
 
 An entry OCCURRENCE is one visit to one playlist entry. Repeat ticks inside a
 visit belong to the same occurrence; a later visit to the same entry is a new
@@ -450,13 +464,21 @@ Three properties of that rule are load bearing:
   because another one now covers the common case would break the major the
   fleet currently runs.
 
-**Upgrade order is not free: the coordinator goes first.** §1.6 step 4 refuses a
-body carrying an unknown field, and that refusal rejects the whole observation
-rather than ignoring the member. So a plugin that sends `playlistLoop` to a
-coordinator that predates this section has every observation refused with `400`,
-and a coordinator receiving no observations activates no Cues at all. Upgrading
+**Upgrade order is not free: the coordinator goes first.** A coordinator that
+predates this section refuses a body carrying an unknown field, and that
+refusal rejects the whole observation rather than ignoring the member. So a
+plugin that sends `playlistLoop` to such a coordinator has every observation
+refused with `400`, and a coordinator receiving no observations activates no
+Cues at all. Measured rather than argued: the identical body posts `200` without
+the member and `400` with it, `json: unknown field "playlistLoop"`. Upgrading
 the coordinator first is safe in both directions, because the field is optional
 and an older plugin simply never sends it.
+
+§1.6 step 4 no longer refuses an unknown member: it ignores it and names it in
+the response's `ignoredFields`. That does **not** retire the ordering above for
+this field. It changes what a coordinator carrying that change accepts, and
+every coordinator built before it still refuses, so the coordinator-first order
+stands until no coordinator predating that change is left in the fleet.
 
 ## 2. Brightness transition gain
 
@@ -481,15 +503,45 @@ Adding any second writer to it defeats the seam.
 ### 2.2 The coordinator-facing write
 
 The night-session controller writes the transition gain by POSTing to the
-resident plugin component, on the FPP host, at the plugin's own HTTP path:
+resident plugin component, on the FPP host, at:
 
 ```text
-POST /api/plugin/showmesh/brightness/transition-gain
+POST /api/plugin-apis/showmesh/brightness/transition-gain
 ```
 
-The plugin opens no listening socket of its own to serve this. The route
-registers on fppd's own web server: on FPP 10 through Plugin API 6's
-`registerPluginApi`, on FPP 9 through the libhttpserver adapter. See section
+**That is the address. It is not the path the plugin registers**, and the two
+are different strings on purpose. The plugin registers
+`/showmesh/brightness/transition-gain` with its own major's web server; the
+`/api/plugin-apis` prefix is what FPP's Apache requires to reach it.
+
+The distinction is load bearing rather than cosmetic, because a route can
+register successfully, appear in the host's own route table, and still answer
+`404` to every real caller. Three facts make the single address above
+trustworthy on both majors:
+
+- **The plugin's server is unreachable from the LAN.** FPP 10's drogon binds
+  `127.0.0.1:32322`. FPP 9's libhttpserver binds the same way, and
+  `APIServer::Init` says so in its own comment ("so we only allow access via
+  127.0.0.1"). Apache is not optional; it is the only way in.
+- **Apache proxies plugin routes under exactly one prefix, and both majors
+  carry the identical rule.** `RewriteRule ^plugin-apis/(.*)$
+  http://localhost:32322/$1 [P]`. Everything else under `/api/` falls through
+  to FPP's own PHP API, which answers `404` for an unknown path. A registered
+  path that itself begins with `/api` still works, but only at an address
+  carrying `/api` twice.
+- **Both majors register on the server that prefix reaches**, despite sharing
+  no registration API. FPP 10 uses Plugin API 6's `registerPluginApi()`. FPP 9
+  uses `registerApis(httpserver::webserver*)`, and FPP calls it with the same
+  `m_ws` that carries `/fppd`, `/commands` and `/models`. Two registration
+  APIs, one address, and that is a fact about where each one lands rather than
+  a coincidence of matching rewrite rules.
+
+FPP 10 additionally forbids the internal namespace through the proxy
+(`RewriteRule ^plugin-apis/internal(/.*)?$ - [F,L]`); FPP 9 has no such rule.
+Nothing here goes near `internal`, but the difference is recorded so it is not
+read as universal.
+
+The plugin opens no listening socket of its own to serve this. See section
 3.1 for the general rule this instance of a plugin-served route follows.
 
 **This route is unauthenticated.** It accepts any caller reachable on the

@@ -8,19 +8,27 @@ repository's implementation. They are evidence, not working documents.
 | Field | Value |
 |---|---|
 | Source repository | https://github.com/ShowMeshSystems/showmesh |
-| Source commit | `156d3a4d3e9f6f5b7dc6562d9cfaef96e3f07b54` |
+| Source commit | `a7c3209469ee0bd0e8df2172dbf312582caa208f` |
 | Commit date | 2026-09-08 |
 | Snapshot date | 2026-09-08 |
-| Snapshot taken by | Refresh for the playlist-loop re-entry work |
+| Snapshot taken by | Refresh for the transition-gain route |
 
 ### Records pinned to a different upstream commit
 
-One record is not yet on upstream `main` and is pinned to the commit that
-carries it. The table above still governs every other file here.
+None. Every file here is at the Source commit above.
 
-| Upstream path | Pinned commit | Commit date | Note |
-|---|---|---|---|
-| `docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md` | `2e094bb24e7b58ff43a25cd73260b63111447f14` | 2026-09-08 | On the upstream branch that adds section 1.8 (entry occurrence and `playlistLoop`), open as pull request 385. This repository's playlist-loop work is built against that section, so the pin is deliberate rather than a lag. Re-pin to the merge commit when it lands on `main`. |
+**A pin must name a commit reachable from the source repository's `main`,
+never a branch tip.** Upstream squash merges, so a branch tip becomes
+unreachable the moment it lands and the branch is swept: the pin then names a
+commit that resolves nowhere, and it fails silently at exactly the moment
+someone needs it to check a divergence. Until a record is on `main`, either
+wait for it or record what is missing in prose; do not pin to the branch that
+carries it.
+
+This section carried two such pins during 2026-09-08 and both were branch
+tips. Retired rather than corrected, because the record they pointed at is now
+on `main` and the mechanism was producing the defect faster than it was being
+caught.
 
 ## Why copies rather than links
 

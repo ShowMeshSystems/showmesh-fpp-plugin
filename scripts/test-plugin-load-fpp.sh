@@ -246,7 +246,7 @@ RESULTS_STATUS=()
 if [ -n "$ADAPTER_OBJECT" ]; then
     EXPECTED_ASSERTIONS=1
 else
-    EXPECTED_ASSERTIONS=8
+    EXPECTED_ASSERTIONS=9
 fi
 SUMMARY_PRINTED=0
 SUMMARY_FAILED=0
@@ -646,6 +646,7 @@ a3() {
 # ---------------------------------------------------------------------------
 
 A4_NAME="A4_channel_output_scaled"
+A9_NAME="A9_route_reachable_at_the_lan_address"
 A5_NAME="A5_fade_monotonic_exact_and_immediate"
 
 CO_UNIVERSES_START_CHANNEL=1
@@ -1161,6 +1162,78 @@ a8() {
     record "A8_restart_survival" "PASS" "command present again after a container recreate, and the restart's own log tail carries the load line with no load-failure line"
 }
 
+# A9: the route answers at the address a coordinator actually posts to.
+#
+# This assertion exists because every other signal lied. The transition-gain
+# route registered successfully, appeared in fppd's own route table at
+# /internal/pluginApiRoutes, and all eight assertions above passed, while a
+# POST to the URL the coordinator would really use returned 404 from FPP's
+# PHP API. Registration success is not reachability: the assertions above ask
+# the plugin about itself, and this one asks the way a client asks.
+#
+# Both majors bind their own HTTP server to 127.0.0.1 (FPP 10's drogon on
+# 32322, FPP 9's libhttpserver with the same restriction stated in
+# APIServer::Init), so every LAN caller arrives through Apache, which
+# proxies plugin routes under exactly one prefix on both majors:
+#   RewriteRule ^plugin-apis/(.*)$ http://localhost:32322/$1 [P]
+a9() {
+    local url="http://localhost:${BENCH_HTTP_PORT}/api/plugin-apis/showmesh/brightness/transition-gain"
+    local out="/tmp/showmesh-bench-gain.$$"
+    local code
+    code=$(curl_retrying -sS -o "$out" -w '%{http_code}' \
+        -X POST "$url" -H 'Content-Type: application/json' \
+        -d '{"schemaVersion":1,"targetPercent":75,"fadeSeconds":0,"requestId":"bench-a9-1"}' || true)
+    local body
+    body=$(cat "$out" 2>/dev/null || true)
+
+    if [ "$code" != "200" ]; then
+        rm -f "$out"
+        record "$A9_NAME" "FAIL" "POST $url returned $code, not 200; the route is registered but unreachable at the address a coordinator uses. Body: $(printf '%s' "$body" | head -c 200)"
+        return
+    fi
+    # The applied state, not a bare 200: contract section 2.2 requires the
+    # response to carry evidence, and a 200 with an empty body would pass a
+    # status-only check while telling a caller nothing.
+    case "$body" in
+        *'"applied":true'*'"gainTarget":75'*) ;;
+        *)
+            rm -f "$out"
+            record "$A9_NAME" "FAIL" "the route answered 200 but not with the applied state: $(printf '%s' "$body" | head -c 200)"
+            return
+            ;;
+    esac
+
+    # The caller-minted idempotency key, exercised on a real host rather
+    # than only in a unit test: a repeat of the same id must apply nothing.
+    local repeat_body
+    repeat_body=$(curl_retrying -sS \
+        -X POST "$url" -H 'Content-Type: application/json' \
+        -d '{"schemaVersion":1,"targetPercent":75,"fadeSeconds":0,"requestId":"bench-a9-1"}' || true)
+    case "$repeat_body" in
+        *'"applied":false'*) ;;
+        *)
+            rm -f "$out"
+            record "$A9_NAME" "FAIL" "a repeated requestId was applied again rather than ignored: $(printf '%s' "$repeat_body" | head -c 200)"
+            return
+            ;;
+    esac
+
+    # An out-of-range value is refused rather than clamped, which section
+    # 2.2 requires so a mistyped value stays visible.
+    local refused
+    refused=$(curl_retrying -sS -o /dev/null -w '%{http_code}' \
+        -X POST "$url" -H 'Content-Type: application/json' \
+        -d '{"schemaVersion":1,"targetPercent":101,"fadeSeconds":0,"requestId":"bench-a9-2"}' || true)
+    if [ "$refused" != "400" ]; then
+        rm -f "$out"
+        record "$A9_NAME" "FAIL" "an out-of-range targetPercent returned $refused, not 400"
+        return
+    fi
+
+    rm -f "$out"
+    record "$A9_NAME" "PASS" "POST to the LAN address returned the applied state, a repeated requestId applied nothing, and an out-of-range value was refused 400"
+}
+
 # ---------------------------------------------------------------------------
 # Run all assertions, then report
 # ---------------------------------------------------------------------------
@@ -1173,6 +1246,7 @@ if [ -z "$ADAPTER_OBJECT" ]; then
     a6
     a7
     a8
+    a9
 fi
 
 print_summary
