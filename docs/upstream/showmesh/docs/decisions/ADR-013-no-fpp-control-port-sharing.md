@@ -61,3 +61,35 @@ Using the FPP plugin callback boundary for co-located hosts was not rejected. It
 ## Related research
 
 [FPP MultiSync](../research/RES-002-fpp-multisync-compatibility.md) · [Failure testing](../research/RES-009-failure-mode-testing.md)
+
+## 2026-08-23 note: the unicast hazard this decision guards against is now the FPP 10 default
+
+Not a supersession — the decision above and its consequences stand
+unchanged. Recorded because [RES-002](../research/RES-002-fpp-multisync-compatibility.md)'s
+SM-209 amendment found something this decision's original reasoning did not
+anticipate and that strengthens rather than weakens it.
+
+This decision's Context section describes unicast MultiSync interception as
+"exactly the mode deployments use where multicast is unavailable or
+blocked" — an edge case, not the common path. On a fresh FPP 10 install,
+that framing no longer holds: `MultiSyncUnicast` defaults to on and
+`MultiSyncMulticast` carries no default at all (read directly at the `10.0`
+tag, `370e62ed7e8c8318da6ee5b01312b8b75082d952`). Unicast is now the
+*default* MultiSync transport on a fresh FPP 10 player, not a fallback for
+unusual networks.
+
+This does not change the port-sharing analysis above — the `SO_REUSEPORT`
+load-balancing hazard this decision documents is about two sockets sharing
+UDP 32320 on the same host, which is orthogonal to which transport carries
+the traffic. It sharpens the stakes of the decision already made: had
+ShowMesh ever shared the port with a running `fppd` on an FPP 10 host, the
+traffic a co-located ShowMesh listener would silently steal is now the
+transport an FPP 10 fleet uses by default, not an edge case. The decision
+to keep ShowMesh off the FPP host entirely, made before this was known,
+turns out to have been the right call for a reason that did not yet exist
+when it was written.
+
+This note does not itself close any of RES-002's open items; it is recorded
+here only because ADR-013's own Context materially undersold how common the
+unicast case is, and a reader relying on this ADR for risk framing should
+not be left with the pre-FPP-10 picture.

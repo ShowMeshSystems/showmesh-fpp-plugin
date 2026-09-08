@@ -2,7 +2,7 @@
 
 [Architecture](../architecture/ARCHITECTURE.md) · [ADR-013](../decisions/ADR-013-no-fpp-control-port-sharing.md) · [ADR-024](../decisions/ADR-024-identity-authorization-and-audit.md) · [Tracker](README.md)
 
-Status: planned · Risk: **high** (raised from medium, see §1) · Verification: **L1, source-verified** against FPP `9.4`, `9.5.3`, and `master`; every acceptance criterion still needs the bench Pi
+Status: planned · Risk: **high** (raised from medium, see §1) · Verification: **L1, source-verified** against FPP `9.4`, `9.5.3`, `master`, and the tagged `10.0` release; every acceptance criterion still needs the bench Pi
 
 Researched 2026-08-12 by three parallel source-verification passes: plugin-manager and packaging mechanics, plugin callback hooks and FPP's command-invocation path, and a corpus survey of the other 56 plugins in FPP's official list. Nothing was executed and no FPP instance was touched. **L1 means read in the source, not observed running.**
 
@@ -22,6 +22,7 @@ The scope is therefore broadened from "how the plugin is packaged" to **"how Sho
 | `FalconChristmas/fpp` `9.5.3` | `4d347be2f89dc9ada265c731bc2bb01966463689` (what `bench/fpp-multisync/` pins) |
 | `FalconChristmas/fpp` `9.4` | `02aebb9c8ebefdd56ef19e028e6b9a515408760c` (deployed fleet) |
 | `FalconChristmas/fpp` `v10.0-beta` | `64875e8d202aba1224d28fd91b41e9fccaaf03a3` |
+| `FalconChristmas/fpp` `10.0` (tag, 2026-08-24 re-check) | `3798ac891b5493cb092664d34c6a7089d1bf48d3` |
 | `FalconChristmas/fpp-data` master | `6f64995194896daddea84e4b84edec5cdc2a57d2` |
 | `FalconChristmas/fpp-plugin-Template` master | `5c0dc73545f5e032902135d8770b1599d489eabe` |
 | `KulpLights/fpp-FPPMon` master | `6da873f5da19e64632f7e0deb2459a1df827acec` |
@@ -34,6 +35,8 @@ All web access 2026-08-12. The corpus survey in §6 covered 56 repositories, 3,9
 **Two implementation regimes, not three.** `scripts/install_plugin` and `scripts/uninstall_plugin` are byte-identical between FPP 8.4.2 and `9.4`, and `master` is byte-identical to `v10.0-beta`. The approved ShowMesh support range is narrower: **FPP 9.4 through 9.x and FPP 10.x**. FPP 8 is not supported. The fleet is in the first regime and is expected to cross into the second.
 
 **Independently re-verified during fold-in**, because it is the single most load-bearing finding in the record: `src/commands/MediaCommands.cpp` was fetched at all three refs and checked directly. `CURLINFO_RESPONSE_CODE` appears zero times on every ref. `CURLOPT_HTTPHEADER` appears zero times on every ref. On `9.4` and `9.5.3`, line 154 reads `virtual bool isError() override { return m_curl == nullptr || m_curlm == nullptr; }`. FPP's own master comment at line 122 states the consequence: "isError()/isDone() below only look at handle setup and CURLMSG_DONE, not the HTTP status or transfer result."
+
+**Re-checked 2026-08-24 against the tagged `10.0` release, by fetching `src/commands/MediaCommands.cpp` from that tag directly.** `CURLOPT_HTTPHEADER` and `CURLINFO_RESPONSE_CODE` are still absent on `10.0`, unchanged from every earlier ref. `isError()` is not unchanged, though: at `10.0` line 181 it reads `virtual bool isError() override { return m_curl == nullptr || m_curlm == nullptr || m_transferFailed; }`, and `m_transferFailed` is set at line 201 when the libcurl transfer itself fails (DNS, timeout, connection refused). This is source reading against the tagged release, not a bench or running-instance observation, so it stands at the same **L1** level as the rest of this record; §7.2 restates what it changes and what it does not.
 
 ## 3. Questions, and where each is now answered
 
@@ -175,19 +178,21 @@ This section is outside the record's original scope and is the reason for §1.
 
 **Direct answer to the ADR-013 question.** The hooks are sufficient for playlist and media lifecycle without a second socket, and insufficient for sequence-level lifecycle on a standalone player. Sequence *identity* is reachable, because the `playing` callbacks carry playlist JSON including sequence names; sequence *lifecycle timing* is not.
 
-### 7.2 FPP cannot detect a failed outbound call, and this corrects an ADR-024 argument
+### 7.2 FPP cannot classify a failed outbound call, and this corrects an ADR-024 argument
 
 **Fact, re-verified personally during fold-in.** Three native outbound command types exist: `URL`, `MQTT`, and `Run Script`. The `URL` command takes exactly three arguments, url, method, and post data, and **`CURLOPT_HTTPHEADER` is set zero times on every ref**. There is no way to send an `Authorization` header.
 
 **Fact.** The HTTP status code is never read. `CURLINFO_RESPONSE_CODE` appears zero times in the file on every ref. A `401` is `CURLE_OK` and is indistinguishable from a `200` by any code in FPP.
 
-**Fact.** On `9.4` and `9.5.3`, which is the deployed fleet, `isError()` tests handle setup only. **A URL command that hits DNS failure, a timeout, or connection refused reports success.** Master added a transfer-failure flag which catches transport failure but still not HTTP status.
+**Fact.** On `9.4` and `9.5.3`, which is the deployed fleet, `isError()` tests handle setup only. **A URL command that hits DNS failure, a timeout, or connection refused reports success on those refs.**
+
+**Correction, 2026-08-24.** This section previously concluded that FPP's native `URL` command cannot detect a transport failure at all. That is no longer accurate. **FPP 10.0 added transport-failure detection**: `isError()` at `src/commands/MediaCommands.cpp:181` (tagged `10.0` release) now also returns true when `m_transferFailed` is set, and the surrounding code sets that flag on a libcurl-level transport failure (DNS, timeout, connection refused). This is confirmed by reading the tagged `10.0` source directly, not by exercising a running FPP instance, so it carries the same **L1, source-verified** weight as the rest of §7.2 and is not elevated to bench-verified. The deployed fleet (`9.4`, `9.5.3`) still has none of this; the gap is FPP-version-dependent, not universal.
 
 **Fact.** On the scheduler and preset paths the returned `Result` is discarded outright, so there is nowhere to put a check even if the status were readable. A failed command is also invisible to a playlist: an unresolvable command marks the item finished exactly as a success, which FPP's own source comment says lets "a show silently skip this step forever with nothing but a log line to show for it."
 
 **This corrects an argument in ADR-024, and the correction has the same shape as the error that record was written to fix.** Decision 7 reasons from an asymmetry: a coordinator outage is a transport failure, *which is what an ADR-004 fallback detects and fires on*, whereas a `403` is a successful conversation that fires nothing, making the refusal case "strictly worse than the genuine outage."
 
-Through FPP's native `URL` command, **neither case fires anything, because FPP can detect neither.** The record assumed a detection capability that does not exist. Its conclusion survives untouched, `401` and `403` must be defined fallback triggers, but the asymmetry it argued from is not real at the mechanism level, and the true consequence is larger than the record states: **all of it, including transport-failure detection, must live in ShowMesh-authored code on the FPP host.**
+Through FPP's native `URL` command, **neither case reaches a defined fallback trigger, but the reason is not the same for both, and it is not "FPP can detect neither."** A genuine transport failure is, as of FPP 10.0, internally detectable (`m_transferFailed`, above); a `401` or `403` is not, on any ref including `10.0`, and for a narrower, structural reason: `CURLOPT_HTTPHEADER` is set zero times on every ref, so a native `URL` command has never had a way to attach an `Authorization` header in the first place, and `CURLINFO_RESPONSE_CODE` is never read, so even a cleanly-completed `401` response is invisible to FPP's own code. No header to send and no status code to inspect means FPP cannot classify what it received, independent of whether the transfer itself succeeded. The record's conclusion survives: `401` and `403` must be defined fallback triggers, and native FPP still cannot discharge that obligation. What changes is the reason, from "FPP detects neither failure mode" to "FPP has no header support and no status-code visibility to classify a completed request", and the practical consequence narrows to match: **auth-failure classification must live in ShowMesh-authored code on the FPP host; bare transport-failure detection no longer has to, on FPP 10, though nothing here surfaces it as an actionable trigger, since the scheduler and preset paths discard the `Result` outright either way (above).**
 
 The generalizable shape is worth carrying, because it is a third variant of a defect this project keeps meeting. ADR-024 corrected an argument made against the wrong failure *direction*. This is an argument made against a failure-detection *capability that was assumed rather than checked*. In both cases the conclusion happened to survive and the reasoning did not.
 
@@ -222,7 +227,7 @@ ADR-024 is written around a `scheduler` machine token living on the FPP host. On
 **Owner decisions, 2026-08-12, which turn this from a finding into a constraint.**
 
 - **Cleartext on the show LAN is accepted for commands, macros, status, and telemetry, and is not accepted for a credential.** The reasoning is recorded in `SECURITY.md`: this is a holiday light display on an isolated network, and a leaked secret is the one failure the VLAN does not contain, because it outlives the packet that carried it and can be replayed by anyone who captured it once.
-- **Therefore FPP's native `URL` command is unusable for an authenticated call**, and not merely inferior to a plugin. It can set no header on any version, so the only place a credential can go is the URL, and §7.4's first fact then publishes it in the clear on every invocation. Combined with §7.2, which shows the native command cannot detect a failure either, **the ShowMesh-authored plugin is required on two independent grounds**. The script-plugin form in §7.2 remains the lighter option.
+- **Therefore FPP's native `URL` command is unusable for an authenticated call**, and not merely inferior to a plugin. It can set no header on any version, so the only place a credential can go is the URL, and §7.4's first fact then publishes it in the clear on every invocation. Combined with §7.2, which shows the native command cannot classify a `401`/`403` response either, for the same missing-header, no-status-visibility reason, **the ShowMesh-authored plugin is required on two independent grounds**. The script-plugin form in §7.2 remains the lighter option.
 - **Improving FPP's own posture is out of scope.** It is upstream work and is not worth taking on now. The exposures are documented here and in `SECURITY.md`'s out-of-scope list, and ShowMesh designs around them rather than filing them as its own defects. What remains ShowMesh's defect, and is worth reporting as one, is ShowMesh putting a secret somewhere FPP will expose it.
 - The `scheduler` principal's scope bundle stays as narrow as ADR-024 decision 4 permits, with a credential cheap to rotate, because the host it lives on cannot keep it secret.
 
