@@ -154,7 +154,8 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         const std::string sequenceFilename = showmesh::adapter::sequenceFilenameOf(playlist);
         const std::string mediaFilename = showmesh::adapter::mediaFilenameOf(playlist);
         runtime_.observeCallback(name.c_str(), action.c_str(), canonicalSection.c_str(), item,
-                                 sequenceFilename.c_str(), mediaFilename.c_str());
+                                 sequenceFilename.c_str(), mediaFilename.c_str(),
+                                 showmesh::adapter::playlistLoopOf(playlist));
     }
 
     void modifyChannelData(int, uint8_t* seqData) override {

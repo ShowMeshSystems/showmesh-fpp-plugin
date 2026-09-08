@@ -118,3 +118,86 @@ TEST(ADefinitionBodyWithoutAnIdentityFieldIsRefusedRatherThanSentIncomplete) {
     CHECK(!buildDefinitionBody("M4-7840", "Halloween", std::string(64, 'a'), "not json", 1).ok);
     CHECK(!buildDefinitionBody("M4-7840", "Halloween", std::string(64, 'a'), "[1,2,3]", 1).ok);
 }
+
+TEST(PlaylistLoopIsOmittedWhenTheCallbackReportedNone) {
+    PlaylistEntryObservation observation;
+    observation.identity.instanceUuid = "M4-7840e12f81da4191c0d00fbb6a889314";
+    observation.identity.playlistName = "Halloween";
+    observation.identity.playlistHash = std::string(64, 'a');
+    observation.identity.position = 0;
+    observation.entryKey = std::string(64, 'b');
+    observation.action = PlaylistAction::kPlaying;
+    observation.sequence = 1;
+
+    PayloadResult result = buildObservationBody(observation);
+    CHECK(result.ok);
+    // Not "playlistLoop":0. A plugin reporting nothing must not compare
+    // equal to one reporting its first pass, and the coordinator decides a
+    // loop re-entry by comparing exactly this member.
+    CHECK(!contains(result.body, "playlistLoop"));
+}
+
+TEST(PlaylistLoopZeroTravelsAsARealValue) {
+    PlaylistEntryObservation observation;
+    observation.identity.instanceUuid = "M4-7840e12f81da4191c0d00fbb6a889314";
+    observation.identity.playlistName = "Halloween";
+    observation.identity.playlistHash = std::string(64, 'a');
+    observation.identity.position = 0;
+    observation.entryKey = std::string(64, 'b');
+    observation.action = PlaylistAction::kPlaying;
+    observation.sequence = 1;
+    observation.playlistLoop = 0;
+
+    PayloadResult result = buildObservationBody(observation);
+    CHECK(result.ok);
+    CHECK(contains(result.body, "\"playlistLoop\":0"));
+}
+
+TEST(PlaylistLoopTravelsAsANumberAndOnAnUnavailableObservationToo) {
+    PlaylistEntryObservation observation;
+    observation.identity.instanceUuid = "M4-7840e12f81da4191c0d00fbb6a889314";
+    observation.identity.playlistName = "Halloween";
+    observation.action = PlaylistAction::kPlaying;
+    observation.sequence = 7;
+    observation.unavailable = IdentityUnavailable::kMissingDefinition;
+    observation.playlistLoop = 3;
+
+    PayloadResult result = buildObservationBody(observation);
+    CHECK(result.ok);
+    // A number, never a string, and present even with no identity: the
+    // pass counter is corroborating evidence, not identity, so an
+    // unavailable observation does not have to withhold it.
+    CHECK(contains(result.body, "\"playlistLoop\":3"));
+    CHECK(!contains(result.body, "\"playlistLoop\":\""));
+}
+
+TEST(PlaylistLoopIsNotAnInputToTheEntryKey) {
+    // Contract section 1.8: corroborating evidence, never identity. If the
+    // pass counter ever reached deriveEntryKey, a loop's second visit
+    // would derive a different key and the coordinator's entry-key term
+    // would fire on its own, making the whole playlistLoop term dead code
+    // that still looked like it worked.
+    const std::string definition = "{\"mainPlaylist\":[{\"type\":\"sequence\"}],\"loop\":4}";
+    showmesh::IdentityResolution first =
+        resolveEntryIdentity("M4-7840e12f81da4191c0d00fbb6a889314", "Halloween", definition, "", 0);
+    CHECK(first.ok);
+
+    PlaylistEntryObservation a;
+    a.identity = first.identity;
+    a.entryKey = first.entryKey;
+    a.action = PlaylistAction::kPlaying;
+    a.sequence = 1;
+    a.playlistLoop = 0;
+
+    PlaylistEntryObservation b = a;
+    b.sequence = 2;
+    b.playlistLoop = 1;
+
+    CHECK_EQ(a.entryKey, b.entryKey);
+    PayloadResult ra = buildObservationBody(a);
+    PayloadResult rb = buildObservationBody(b);
+    CHECK(ra.ok);
+    CHECK(rb.ok);
+    CHECK(contains(ra.body, "\"entryKey\":\"" + a.entryKey + "\""));
+    CHECK(contains(rb.body, "\"entryKey\":\"" + a.entryKey + "\""));
+}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "showmesh/fading_value.h"
@@ -101,6 +102,11 @@ struct PlaylistEntryObservation {
     std::uint64_t sequence = 0;
     TimeMillis observedAtMillis = 0;
     std::uint32_t coalescedSincePreviousAcknowledged = 0;
+    // FPP's own mainPlaylist pass counter, `loop` in the callback's
+    // playlist object, 0 on the first pass. Absent means the callback did
+    // not supply one; the contract makes absent and 0 different values
+    // (section 1.8), so this is never defaulted to zero.
+    std::optional<int> playlistLoop;
     IdentityUnavailable unavailable = IdentityUnavailable::kNone;
 };
 

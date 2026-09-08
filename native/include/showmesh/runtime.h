@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -236,8 +237,13 @@ class ShowMeshRuntime {
 
     // Called from FPP's own callback thread. Bounded work only: copy and
     // return.
+    // playlistLoop is FPP's mainPlaylist pass counter when the callback
+    // reported one, and std::nullopt when it did not. It defaults to
+    // nullopt so a caller that has no counter (a test, or an FPP whose
+    // callback JSON lacks the member) states absence by saying nothing.
     void observeCallback(const char* playlistName, const char* action, const char* section, int item,
-                         const char* sequenceFilename, const char* mediaFilename);
+                         const char* sequenceFilename, const char* mediaFilename,
+                         std::optional<int> playlistLoop = std::nullopt);
 
     // Scales one output frame. Called on FPP's output thread.
     void modifyChannelData(std::uint8_t* channelData, std::size_t channelCount);

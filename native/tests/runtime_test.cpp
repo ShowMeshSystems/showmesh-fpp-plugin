@@ -1476,3 +1476,47 @@ TEST(StopReturnsPromptlyEvenWhileAPublishIsRetryingAgainstAnUnreachableCoordinat
     // rather than the bound being trivially satisfied by nothing running.
     CHECK(!transport.requests.empty());
 }
+
+TEST(ThePassCounterCrossesTheCallbackBoundaryAndKeepsAbsenceDistinctFromZero) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+
+    // The FPP 10 shape this field exists for: a playlist looping back into
+    // an entry it already visited. Same action, same section, same
+    // position, so the derived entry key is identical on both laps and the
+    // pass counter is the only thing that changed.
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 0, "a.fseq", "", 0);
+    CHECK(runtime.drainOnce());
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 0, "a.fseq", "", 1);
+    CHECK(runtime.drainOnce());
+    // A callback that reported no counter at all, which is every FPP whose
+    // playlist object lacks the member.
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 0, "a.fseq", "");
+    CHECK(runtime.drainOnce());
+
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(3));
+    CHECK(sink.published[0].playlistLoop.has_value());
+    CHECK_EQ(*sink.published[0].playlistLoop, 0);
+    CHECK(sink.published[1].playlistLoop.has_value());
+    CHECK_EQ(*sink.published[1].playlistLoop, 1);
+    CHECK(!sink.published[2].playlistLoop.has_value());
+
+    // The entry key really is identical across the two laps, or this test
+    // would prove nothing: it would be passing because the key changed.
+    CHECK_EQ(sink.published[0].entryKey, sink.published[1].entryKey);
+}
+
+TEST(ThePassCounterRidesAnUnavailableObservationToo) {
+    FakeDefinitions definitions;
+    definitions.definition = "";
+    RecordingSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 2, "a.fseq", "", 4);
+    CHECK(runtime.drainOnce());
+
+    CHECK_EQ(sink.unavailable.size(), static_cast<std::size_t>(1));
+    CHECK(sink.unavailable[0].playlistLoop.has_value());
+    CHECK_EQ(*sink.unavailable[0].playlistLoop, 4);
+}

@@ -12,6 +12,7 @@
 // 10's callback object. Both are exercised below against the frozen
 // coordinator fixture and against FPP 10's actual GetInfo() shape.
 
+#include <optional>
 #include <string>
 
 #include "callback_fields.h"
@@ -23,6 +24,7 @@ using showmesh::EntryIdentity;
 using showmesh::deriveEntryKey;
 using showmesh::adapter::canonicalPlaylistSection;
 using showmesh::adapter::mediaFilenameOf;
+using showmesh::adapter::playlistLoopOf;
 using showmesh::adapter::sequenceFilenameOf;
 
 namespace {
@@ -101,4 +103,60 @@ TEST(MissingCurrentEntryMemberYieldsNoFilename) {
 
     CHECK_EQ(sequenceFilenameOf(playlist), std::string(""));
     CHECK_EQ(mediaFilenameOf(playlist), std::string(""));
+}
+
+// --- mainPlaylist pass counter --------------------------------------------
+
+TEST(PlaylistLoopReadsLoopAndNeverLoopCount) {
+    // This is the whole trap. Playlist::GetInfo() writes both members, and
+    // the names invite reading the wrong one: `loop` is the running pass
+    // counter (m_loop, incremented in Process()) and `loopCount` is the
+    // configured repeat LIMIT it is compared against (m_loopCount, read
+    // from the playlist config). Verified identical on FPP 9.5.3 and
+    // 10.0. Reading loopCount would report a fixed limit as a lap number,
+    // and for the common unlimited-repeat playlist it is 0 on every tick,
+    // so the coordinator would never see it change and the loop re-entry
+    // this field exists for would still be invisible.
+    Json::Value playlist;
+    playlist["currentState"] = "playing";
+    playlist["loop"] = 2;
+    playlist["loopCount"] = 0;  // unlimited repeat, the common show setting
+
+    const std::optional<int> loop = playlistLoopOf(playlist);
+    CHECK(loop.has_value());
+    CHECK_EQ(*loop, 2);
+}
+
+TEST(PlaylistLoopZeroOnAPlayingPlaylistIsARealFirstPass) {
+    Json::Value playlist;
+    playlist["currentState"] = "playing";
+    playlist["loop"] = 0;
+
+    const std::optional<int> loop = playlistLoopOf(playlist);
+    CHECK(loop.has_value());
+    CHECK_EQ(*loop, 0);
+}
+
+TEST(PlaylistLoopIsAbsentWhileIdle) {
+    // GetInfo()'s idle branch writes result["loop"] = 0 unconditionally.
+    // That 0 means "no playlist is running", not "the running playlist is
+    // on its first pass", and the two must not travel as the same value.
+    Json::Value playlist;
+    playlist["currentState"] = "idle";
+    playlist["loop"] = 0;
+
+    CHECK(!playlistLoopOf(playlist).has_value());
+}
+
+TEST(PlaylistLoopIsAbsentWhenTheMemberIsMissingOrNotAnInteger) {
+    Json::Value missing;
+    missing["currentState"] = "playing";
+    CHECK(!playlistLoopOf(missing).has_value());
+
+    Json::Value wrongType;
+    wrongType["currentState"] = "playing";
+    wrongType["loop"] = "2";
+    CHECK(!playlistLoopOf(wrongType).has_value());
+
+    CHECK(!playlistLoopOf(Json::Value()).has_value());
 }

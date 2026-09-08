@@ -103,6 +103,15 @@ PayloadResult buildObservationBody(const PlaylistEntryObservation& observation) 
         addString(&members, "mediaFilename", observation.mediaFilename);
     }
 
+    // Omitted rather than sent as 0 when the callback reported no pass
+    // counter. Contract section 1.8: a plugin reporting its first pass and
+    // a plugin reporting nothing must not compare equal, because the
+    // coordinator uses a change in this value to decide that a playlist
+    // looped back into an entry it had already visited.
+    if (observation.playlistLoop.has_value()) {
+        addNumber(&members, "playlistLoop", *observation.playlistLoop);
+    }
+
     return serialize(std::move(members));
 }
 
