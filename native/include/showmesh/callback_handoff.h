@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include "showmesh/fading_value.h"
@@ -29,6 +30,12 @@ struct CallbackEvidence {
     int position = 0;
     PlaylistAction action = PlaylistAction::kUnknown;
     TimeMillis observedAtMillis = 0;
+    // FPP's mainPlaylist pass counter, absent when the callback did not
+    // report one. std::optional<int> rather than an int plus a flag: it is
+    // trivially copyable, so this struct stays allocation-free on the
+    // callback thread, and it cannot be read without deciding what absence
+    // means. Absent and 0 are different (contract section 1.8).
+    std::optional<int> playlistLoop;
 
     // True when the copy lost bytes off the end of the source. playlistName
     // and section determine entry identity: two different values that

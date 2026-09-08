@@ -156,7 +156,8 @@ CommandOutcome ShowMeshRuntime::applyBrightnessCommand(const std::string& target
 }
 
 void ShowMeshRuntime::observeCallback(const char* playlistName, const char* action, const char* section, int item,
-                                      const char* sequenceFilename, const char* mediaFilename) {
+                                      const char* sequenceFilename, const char* mediaFilename,
+                                      std::optional<int> playlistLoop) {
     CallbackEvidence evidence;
     evidence.setPlaylistName(playlistName);
     evidence.setSection(section);
@@ -165,6 +166,7 @@ void ShowMeshRuntime::observeCallback(const char* playlistName, const char* acti
     evidence.position = item;
     evidence.action = playlistActionFromName(action == nullptr ? std::string() : std::string(action));
     evidence.observedAtMillis = clock_();
+    evidence.playlistLoop = playlistLoop;
     handoff_.offer(evidence);
     // hasWork_ is set under wakeMutex_ before notifying so the worker's
     // wait predicate observes it even if this notify lands before the
@@ -210,6 +212,10 @@ bool ShowMeshRuntime::drainOnce() {
     observation.mediaFilenameTruncated = evidence.mediaFilenameTruncated;
     observation.action = evidence.action;
     observation.observedAtMillis = evidence.observedAtMillis;
+    // Carried on every observation, including the unavailable ones below:
+    // the pass counter is corroborating evidence, never identity, so it
+    // stays true even when identity could not be resolved.
+    observation.playlistLoop = evidence.playlistLoop;
     observation.sequence = sequence_.next();
     observation.coalescedSincePreviousAcknowledged = unacknowledgedCoalesced_;
     // Persisted for every drained event, whether or not identity

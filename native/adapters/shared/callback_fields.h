@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 
 #include "fpp-json-compat.h"
@@ -55,6 +56,29 @@ inline std::string sequenceFilenameOf(const Json::Value& playlist) {
 inline std::string mediaFilenameOf(const Json::Value& playlist) {
     const Json::Value* entry = currentEntryOf(playlist);
     return entry == nullptr ? std::string() : jsonString(*entry, "mediaFilename");
+}
+
+// FPP's own mainPlaylist pass counter. `loop` is the counter and
+// `loopCount` is the configured LIMIT the counter is compared against:
+// Playlist::Process() does `m_loop++` and then tests
+// `!m_loopCount || (m_loop < m_loopCount)`, identically on FPP 9.5.3 and
+// FPP 10.0. Reading `loopCount` here would report a repeat limit as if it
+// were a lap number, and for the common unlimited-repeat playlist it is 0
+// forever, which is a value that never changes and therefore never
+// separates one visit from the next.
+//
+// Absent while the playlist is idle, even though GetInfo() does write a
+// `loop` of 0 in that branch: that 0 is a placeholder for "no playlist is
+// running", not the running playlist's first pass, and the contract makes
+// absent and 0 different values. Absent when the member is missing or is
+// not an integer, for the same reason: a guess here would be
+// corroborating evidence that corroborates nothing.
+inline std::optional<int> playlistLoopOf(const Json::Value& playlist) {
+    if (!playlist.isObject() || !playlist.isMember("loop")) return std::nullopt;
+    if (jsonString(playlist, "currentState") == "idle") return std::nullopt;
+    const Json::Value& loop = playlist["loop"];
+    if (!loop.isIntegral()) return std::nullopt;
+    return loop.asInt();
 }
 
 }  // namespace adapter
