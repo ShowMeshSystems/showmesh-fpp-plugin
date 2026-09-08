@@ -15,11 +15,19 @@ ARG FPP_COMMIT
 ARG SOURCE_DATE_EPOCH
 ARG PREBUILT_CXXFLAGS
 
+# libdrogon-dev is here because FPP 10's plugin HTTP registration surface
+# (fpphttp.h) includes drogon's own headers, so an adapter serving a route
+# cannot compile without them. From the distribution rather than a pinned
+# source build, because FPP 10's own installer apt-installs the same package,
+# so this compiles against what a real host has.
 RUN apt-get update -o Acquire::Retries=2 \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     g++ make pkg-config binutils git ca-certificates gawk \
     libjsoncpp-dev libcurl4-openssl-dev libdrogon-dev \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && printf '#include <drogon/version.h>\nconst char* v = DROGON_VERSION;\n' > /tmp/drogon-probe.cpp \
+ && g++ -std=c++20 -fsyntax-only -isystem /usr/include/jsoncpp /tmp/drogon-probe.cpp \
+ && rm -f /tmp/drogon-probe.cpp
 
 RUN git clone --depth 1 --branch "$FPP_TAG" https://github.com/FalconChristmas/fpp.git /opt/fpp \
  && actual="$(git -C /opt/fpp rev-parse HEAD)" \
