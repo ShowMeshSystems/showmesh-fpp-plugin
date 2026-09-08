@@ -18,7 +18,7 @@ ARG PREBUILT_CXXFLAGS
 RUN apt-get update -o Acquire::Retries=2 \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     g++ make pkg-config binutils git ca-certificates gawk \
-    libjsoncpp-dev libcurl4-openssl-dev \
+    libjsoncpp-dev libcurl4-openssl-dev libdrogon-dev \
  && rm -rf /var/lib/apt/lists/*
 
 RUN git clone --depth 1 --branch "$FPP_TAG" https://github.com/FalconChristmas/fpp.git /opt/fpp \

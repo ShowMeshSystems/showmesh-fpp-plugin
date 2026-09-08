@@ -147,6 +147,19 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             g++ make pkg-config binutils git ca-certificates gawk libjsoncpp-dev libcurl4-openssl-dev
 
+      # FPP 10's plugin HTTP registration surface (fpphttp.h) includes
+      # drogon's own headers, so an adapter that serves a route cannot
+      # compile without them. Taken from the distribution rather than pinned
+      # to a source build, because FPP 10's own installer does the same
+      # (FPP_Install.sh installs libdrogon-dev), so this matches what a real
+      # host compiles against. Unlike libhttpserver below, which Debian does
+      # not package at all.
+      - name: Install drogon
+        if: matrix.major == 'fpp10'
+        run: |
+          set -eux
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libdrogon-dev
+
       # FPP 9 headers reach for libhttpserver, which Debian does not
       # package. FPP installs 0.19.0 from source and so does this job, so
       # the HTTP_RESPONSE_CONST decision fpp-pch.h makes from the installed
