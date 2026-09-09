@@ -114,15 +114,41 @@ endef
 # headers under test only pull in fpp-json-compat.h, never an FPP header,
 # so this runs on a plain dev machine, unlike fpp9/fpp10 above.
 TEST_CORE_SOURCES := $(CORE_DIR)/src/json.cpp $(CORE_DIR)/src/sha256.cpp $(CORE_DIR)/src/playlist_identity.cpp
+TEST_SOURCES       := shared/tests/adapter_shared_test.cpp $(CORE_DIR)/tests/main.cpp $(TEST_CORE_SOURCES)
+TEST_OBJDIR        := $(BUILD)/test-obj
+TEST_OBJECTS       := $(addprefix $(TEST_OBJDIR)/,$(notdir $(TEST_SOURCES:.cpp=.o)))
 TEST_BINARY        := $(BUILD)/adapter_shared_tests
+
+vpath %.cpp shared/tests $(CORE_DIR)/tests $(CORE_DIR)/src
+
+# Objects are named by basename only, not by path, because the sources live
+# under $(CORE_DIR) (..) and native/Makefile's path-preserving pattern would
+# place objects outside $(BUILD) (e.g. $(BUILD)/../src/json.o). Flattening
+# means two test sources with the same basename in different directories
+# would silently overwrite one object with the other, so that collision is
+# turned into a parse-time error instead.
+ifneq ($(words $(TEST_OBJECTS)),$(words $(sort $(TEST_OBJECTS))))
+$(error two test sources share a basename, so the flattened object directory would silently drop one)
+endif
 
 .PHONY: test
 test: $(TEST_BINARY)
 	$(TEST_BINARY)
 
-$(TEST_BINARY): shared/tests/adapter_shared_test.cpp $(CORE_DIR)/tests/main.cpp $(TEST_CORE_SOURCES)
+# Each source compiles to its own object with -MMD -MP so make learns the
+# header set from the compiler instead of a hand-listed prerequisite: a
+# hand-listed one goes stale the moment a source gains a new #include and
+# nothing notices, which let $(TEST_BINARY) below go stale for years
+# against shared/callback_fields.h and shared/section_names.h.
+$(TEST_OBJDIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -I$(CORE_DIR)/include -I$(CORE_DIR)/tests -Ishared $(JSONCPP_INCLUDE) $^ $(JSONCPP_LIBS) -o $@
+	$(CXX) $(CXXFLAGS) -I$(CORE_DIR)/include -I$(CORE_DIR)/tests -Ishared $(JSONCPP_INCLUDE) -MMD -MP -c $< -o $@
+
+$(TEST_BINARY): $(TEST_OBJECTS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ $(JSONCPP_LIBS) -o $@
+
+-include $(TEST_OBJECTS:.o=.d)
 
 .PHONY: clean
 clean:

@@ -116,6 +116,26 @@ jobs:
           make -C native test CXX=${{ matrix.compiler }} \
             CXXFLAGS="-std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=thread"
 
+  adapter-shared-tests:
+    # Unit tests for the adapter-shared headers (native/adapters/shared),
+    # which need jsoncpp but no FPP source tree. This is a separate job
+    # rather than a step in fpp-adapters below because that job is a
+    # matrix over FPP majors and this test is major-independent: running
+    # it in both matrix arms would duplicate it, and running it in only
+    # one would be an arbitrary choice between them.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install jsoncpp
+        run: |
+          sudo apt-get update -o Acquire::Retries=2
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libjsoncpp-dev
+
+      - name: Build and test
+        run: make -C native/adapters test
+
   fpp-adapters:
     # Each adapter is compiled against the FPP major it is for, at a pinned
     # tag and commit recorded in native/adapters/FPP-PINS.md. FPP 10
