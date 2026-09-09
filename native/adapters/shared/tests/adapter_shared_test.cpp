@@ -559,6 +559,50 @@ TEST(FetchTreatsValidJsonThatIsNotASignedProgramAsMalformedAndDoesNotInstall) {
     CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
 }
 
+TEST(FetchTreatsAProgramThatIsNotAnObjectAsMalformedNeverAsAForgery) {
+    // The bug this guards against: reaching VerifyFallbackProgram with a
+    // "program" that is a string, not an object, gets refused THERE, and
+    // an earlier version of this file acknowledged that refusal as
+    // "signature-invalid": a forgery report for a forgery that never
+    // happened, no signature ever having been checked. The outcome kind
+    // alone does not catch a regression back to that: it must never be
+    // acknowledgeable.
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse =
+        okResponse("{\"published\":true,\"program\":\"not an object\",\"signatureBase64\":\"AAAA\"}");
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const std::string previousDocument = readFixtureOrFail("valid.json");
+    showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kMalformedEnvelope);
+    CHECK(!showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+    CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+}
+
+TEST(FetchTreatsANonStringSignatureBase64AsMalformedNeverAsAForgery) {
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = okResponse("{\"published\":true,\"program\":{\"packageId\":\"x\"},\"signatureBase64\":12345}");
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const std::string previousDocument = readFixtureOrFail("valid.json");
+    showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kMalformedEnvelope);
+    CHECK(!showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+    CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+}
+
 TEST(FetchTreatsANonJsonBodyAsMalformedAndDoesNotInstall) {
     const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
     ScriptedTransport transport;

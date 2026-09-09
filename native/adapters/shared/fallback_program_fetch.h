@@ -512,6 +512,28 @@ inline FallbackFetchOutcome FetchAndInstallFallbackProgram(HttpTransport* transp
         return outcome;
     }
 
+    // Checked against the already-parsed envelope BEFORE the raw-span
+    // extraction below, not after: extractRawRootMember only locates
+    // program's bytes, it does not know or care what JSON type they are,
+    // so a "program" that is a string, a number, or an array would
+    // otherwise reach VerifyFallbackProgram, get refused there for a
+    // reason that has nothing to do with the signature, and then be
+    // acknowledged to the coordinator as "signature-invalid": a forgery
+    // report for a forgery that never happened. This is the identical
+    // false-forgery mistake kInstanceMismatch/kExpired exist to avoid
+    // for a wrong host or an expired program, one layer further out.
+    bool haveProgramObject = false;
+    for (const auto& member : envelope.value.members()) {
+        if (member.first == "program" && member.second.type() == showmesh::json::Type::kObject) {
+            haveProgramObject = true;
+        }
+    }
+    if (!haveProgramObject) {
+        outcome.kind = FallbackFetchOutcomeKind::kMalformedEnvelope;
+        outcome.detail = "fallback: program field is missing or is not a JSON object";
+        return outcome;
+    }
+
     std::string rawProgram;
     std::string signatureBase64;
     bool haveSignature = false;
