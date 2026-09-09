@@ -43,6 +43,18 @@ ifeq ($(strip $(CURL_LIBS)),)
 CURL_LIBS := -lcurl
 endif
 
+# Ed25519 verification for the ADR-048 fallback program
+# (fallback_program_verifier.h). libcrypto's runtime shared object is
+# already on an FPP host regardless of this package, pulled in
+# transitively by libcurl4-openssl-dev's own dependency on libcurl4;
+# named here so the adapter links it explicitly rather than relying on
+# whatever happens to already be loaded.
+OPENSSL_INCLUDE := $(shell pkg-config --cflags-only-I libcrypto 2>/dev/null | sed 's/-I/-isystem /g')
+OPENSSL_LIBS := $(shell pkg-config --libs libcrypto 2>/dev/null)
+ifeq ($(strip $(OPENSSL_LIBS)),)
+OPENSSL_LIBS := -lcrypto
+endif
+
 # The FPP 10 adapter declares FPP_PLUGIN_SUPPORTS_UNLOAD(), and that
 # declaration is only honest if the library can actually be unmapped. glibc
 # permanently marks the first object defining an STB_GNU_UNIQUE symbol
@@ -109,11 +121,13 @@ define require_symbols
 endef
 
 # Unit tests for the adapter-shared headers that need nothing but jsoncpp
-# (section_names.h, callback_fields.h), plus the host-neutral entry-key
-# derivation they feed. Deliberately does not need FPP_SRC: the shared
-# headers under test only pull in fpp-json-compat.h, never an FPP header,
-# so this runs on a plain dev machine, unlike fpp9/fpp10 above.
-TEST_CORE_SOURCES := $(CORE_DIR)/src/json.cpp $(CORE_DIR)/src/sha256.cpp $(CORE_DIR)/src/playlist_identity.cpp
+# and libcrypto (section_names.h, callback_fields.h,
+# fallback_program_verifier.h, fallback_program_installer.h), plus the
+# host-neutral entry-key derivation they feed. Deliberately does not need
+# FPP_SRC: the shared headers under test never pull in an FPP header, so
+# this runs on a plain dev machine, unlike fpp9/fpp10 above.
+TEST_CORE_SOURCES := $(CORE_DIR)/src/json.cpp $(CORE_DIR)/src/sha256.cpp $(CORE_DIR)/src/playlist_identity.cpp \
+                      $(CORE_DIR)/src/atomic_write.cpp
 TEST_SOURCES       := shared/tests/adapter_shared_test.cpp $(CORE_DIR)/tests/main.cpp $(TEST_CORE_SOURCES)
 TEST_OBJDIR        := $(BUILD)/test-obj
 TEST_OBJECTS       := $(addprefix $(TEST_OBJDIR)/,$(notdir $(TEST_SOURCES:.cpp=.o)))
@@ -142,11 +156,11 @@ test: $(TEST_BINARY)
 # against shared/callback_fields.h and shared/section_names.h.
 $(TEST_OBJDIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -I$(CORE_DIR)/include -I$(CORE_DIR)/tests -Ishared $(JSONCPP_INCLUDE) -MMD -MP -c $< -o $@
+	$(CXX) $(CXXFLAGS) -I$(CORE_DIR)/include -I$(CORE_DIR)/tests -Ishared $(JSONCPP_INCLUDE) $(OPENSSL_INCLUDE) -MMD -MP -c $< -o $@
 
 $(TEST_BINARY): $(TEST_OBJECTS)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $^ $(JSONCPP_LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $^ $(JSONCPP_LIBS) $(OPENSSL_LIBS) -o $@
 
 -include $(TEST_OBJECTS:.o=.d)
 

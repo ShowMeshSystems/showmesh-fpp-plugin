@@ -1,0 +1,5 @@
+{
+  "coordinatorPublicKeyBase64": "xkD8e9i7CFGTsOzWt7m5fOdxY2acpVDcmrvqAoXghF0=",
+  "note": "throwaway ed25519 keypairs generated only for these fixtures, never a real coordinator signing key",
+  "wrongPublicKeyBase64": "3tQq+YdChyt66MSSo3hMUbvG7Cgehr1RL7+eJQ10snw="
+}
