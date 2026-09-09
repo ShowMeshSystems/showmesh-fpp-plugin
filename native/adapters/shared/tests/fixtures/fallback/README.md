@@ -35,6 +35,14 @@ real coordinator signing key is used or represented here.
   ADR-048 treats a fresh or currently-showless host as.
 - `keys.json`: the fixture keypair's public key and the wrong keypair's
   public key, both base64. No private key material is stored here.
+- `resolver-edge-cases.json`: a validly signed program (same fixture key)
+  whose entries exercise shapes the wire format permits but the
+  coordinator's own compiler never emits: two entries sharing an
+  entryKey (`entry-dup`), an entry with an empty targets list
+  (`entry-empty`), an entry whose one target names neither render nor
+  audio (`entry-no-activation`), and an entry with one live target
+  alongside one inert target (`entry-mixed-activation`). For
+  `fallback_activation_resolver.h`'s tests.
 
 ## Regenerating
 

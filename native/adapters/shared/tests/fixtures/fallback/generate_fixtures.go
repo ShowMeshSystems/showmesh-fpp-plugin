@@ -68,6 +68,66 @@ func buildProgram(packageID, revision, show string) fallbackprogram.Program {
 	}
 }
 
+// buildResolverEdgeCasesProgram is a validly-signed program exercising
+// shapes the wire format permits but the coordinator's own compiler
+// never emits (fallbackprogram.go's NodeTarget doc comment: "a compiler
+// that resolved neither for a node does not include that node as a
+// target at all"; nothing stops two EntryMapping values sharing an
+// EntryKey either). It exists only for the FPP plugin's local resolver
+// tests (Lane A), which must treat these as an untrusted document could
+// realistically arrive shaped this way regardless of what today's
+// compiler happens to produce.
+func buildResolverEdgeCasesProgram() fallbackprogram.Program {
+	p := buildProgram("55555555-5555-4555-8555-555555555555", "test-revision-0004", "Resolver Edge Cases")
+	p.Entries = []fallbackprogram.EntryMapping{
+		{
+			EntryKey:    "entry-dup",
+			CueID:       "cue-dup-a",
+			CueRevision: 1,
+			Targets: []fallbackprogram.NodeTarget{
+				{NodeID: "node-a", Render: &fallbackprogram.RenderActivation{Sequence: "seq-a", Filename: "seq-a.fseq"}},
+			},
+		},
+		{
+			EntryKey:    "entry-dup",
+			CueID:       "cue-dup-b",
+			CueRevision: 1,
+			Targets: []fallbackprogram.NodeTarget{
+				{NodeID: "node-a", Render: &fallbackprogram.RenderActivation{Sequence: "seq-b", Filename: "seq-b.fseq"}},
+			},
+		},
+		{
+			EntryKey:    "entry-empty",
+			CueID:       "cue-empty",
+			CueRevision: 1,
+			Targets:     []fallbackprogram.NodeTarget{},
+		},
+		{
+			EntryKey:    "entry-no-activation",
+			CueID:       "cue-no-activation",
+			CueRevision: 1,
+			Targets: []fallbackprogram.NodeTarget{
+				{NodeID: "node-b"},
+			},
+		},
+		{
+			// One live target alongside one inert target: a real match
+			// (node-c gets an activation) that must survive with
+			// node-d's inertness copied through verbatim, distinct from
+			// entry-no-activation above where inertness is the WHOLE
+			// match.
+			EntryKey:    "entry-mixed-activation",
+			CueID:       "cue-mixed-activation",
+			CueRevision: 1,
+			Targets: []fallbackprogram.NodeTarget{
+				{NodeID: "node-c", Render: &fallbackprogram.RenderActivation{Sequence: "seq-c", Filename: "seq-c.fseq"}},
+				{NodeID: "node-d"},
+			},
+		},
+	}
+	return p
+}
+
 func sign(program fallbackprogram.Program, priv ed25519.PrivateKey) fallbackprogram.SignedProgram {
 	payload, err := program.CanonicalBytes()
 	if err != nil {
@@ -185,6 +245,9 @@ func main() {
 
 	wrongKeySigned := sign(program, wrongPriv)
 	writeFile(outDir, "wrong-key.json", mustMarshal(wrongKeySigned))
+
+	resolverEdgeCases := sign(buildResolverEdgeCasesProgram(), priv)
+	writeFile(outDir, "resolver-edge-cases.json", mustMarshal(resolverEdgeCases))
 
 	// A second, distinct valid program (different content, same real
 	// key), for the restart-survival and overwrite-on-reinstall tests.

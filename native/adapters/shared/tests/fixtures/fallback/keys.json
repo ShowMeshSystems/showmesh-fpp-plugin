@@ -1,5 +1,5 @@
 {
-  "coordinatorPublicKeyBase64": "MYmfWBK+2XpePmBxBO3xGvuiK5UzCim9Qq6FIl+Rg40=",
+  "coordinatorPublicKeyBase64": "AGczpYgWdIsk9x/4JnzP9jJ/tBqd7hcsCFujltAgCwE=",
   "note": "throwaway ed25519 keypairs generated only for these fixtures, never a real coordinator signing key",
-  "wrongPublicKeyBase64": "/XibGPxcyie+xLxn8bL1pyqdaROUOiIN4zIZKKyBuKk="
+  "wrongPublicKeyBase64": "yDgNmSUy7MVzegm9xXtqCKDJloveOJs3x3mI2c2F+Yc="
 }
