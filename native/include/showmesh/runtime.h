@@ -204,6 +204,29 @@ class FallbackActivationRecorder {
     // fresh read of the clock, so a recorded outcome and the observation
     // it belongs to always agree on when the entry actually played.
     virtual void recordEntryKeyResolution(const std::string& entryKey, TimeMillis observedAtMillis) = 0;
+
+    // Called exactly once, on the worker thread, before its first pass
+    // over drainOnce(): the one-time signed-program fetch belongs here,
+    // never in this recorder's own constructor. A fetch running during
+    // construction runs on whichever thread constructs the plugin (FPP's
+    // load path on both majors), which is exactly the boot-time
+    // coordinator dependency ADR-025 decision 3 exists to avoid; the
+    // worker thread already exists, already has a join-based stop path,
+    // and already carries the interrupt plumbing this needs, so nothing
+    // about relocating the fetch here should reach for a second thread.
+    // Defaulted to a no-op so every existing caller and test compiles
+    // unchanged.
+    virtual void performStartupFetch() {}
+
+    // Interrupts an in-flight performStartupFetch() so
+    // ShowMeshRuntime::stop()'s join does not have to wait for it. Called
+    // before that join, alongside ObservationSink::requestStop() and
+    // DefinitionPublisher::requestStop(), for the identical reason: a
+    // fetch blocked against an unreachable coordinator must not be able
+    // to hold shutdown past FPP 10's deadline. Defaulted to a no-op:
+    // performStartupFetch() itself defaults to doing nothing, so there
+    // is nothing to interrupt unless both are overridden together.
+    virtual void requestStop() {}
 };
 
 // Clock is injected so the whole runtime is testable without waiting.

@@ -1,11 +1,13 @@
 #pragma once
 
 // Wires the ADR-048 fallback path into the shipping plugin: fetches the
-// signed fallback program exactly once, at worker start (never again;
-// when to refetch is an operator decision that has not been made, and
-// this file does not make it by accident through a retry loop), then
-// implements FallbackActivationRecorder so ShowMeshRuntime's worker can
-// record what the installed program says about every entry it resolves.
+// signed fallback program exactly once, on the WORKER THREAD's first
+// pass, never at construction (see performStartupFetch() below for why),
+// and never again after that (when to refetch is an operator decision
+// that has not been made, and this file does not make it by accident
+// through a retry loop), then implements FallbackActivationRecorder so
+// ShowMeshRuntime's worker can record what the installed program says
+// about every entry it resolves.
 //
 // This is the recording half only. It never sends anything to a node:
 // ADR-048 decision 3's node ingress and per-host executor credential do
@@ -36,6 +38,15 @@ namespace adapter {
 // stops finding some call sites while still looking like it works.
 inline const char* kFallbackActivationLogPrefix = "ShowMesh fallback activation: ";
 
+// requestStop() is deliberately NOT overridden here: CurlHttpTransport has
+// no mid-transfer cancellation today, so there is nothing this class could
+// interrupt an in-flight call with. The worst case for a truly blocked
+// fetch stays bounded by the transport's own CURLOPT_TIMEOUT_MS
+// (HttpRequest::timeoutMillis, 10000ms by default here since neither
+// request below overrides it), comfortably under FPP 10's 60 second
+// shutdown deadline even though it is a bound rather than a genuine
+// interruption. Giving CurlHttpTransport real cancellation is future work,
+// not something this relocation needs to be safe.
 class FallbackActivationDelivery : public showmesh::FallbackActivationRecorder {
  public:
     // fppInstanceUuid is read once, here, at construction (the identical
@@ -60,6 +71,11 @@ class FallbackActivationDelivery : public showmesh::FallbackActivationRecorder {
     // constructor parameter does not already give, since enrollment,
     // tests, and any later wiring can already point this wherever it
     // needs to go, decided at wiring time rather than at runtime.
+    // Construction only loads the pinned key: a local file stat and read,
+    // never a network call, so it is safe to run on whatever thread
+    // constructs the plugin (FPP's load path on both majors). The signed
+    // program fetch itself does NOT happen here; see
+    // performStartupFetch() below.
     FallbackActivationDelivery(showmesh::Clock clock, std::string fppInstanceUuid,
                                 std::string credentialDir = showmesh::resolveCredentialDir())
         : clock_(clock),
@@ -68,14 +84,18 @@ class FallbackActivationDelivery : public showmesh::FallbackActivationRecorder {
           // where it points: never a check against the default while
           // reading from an override, because there is no override to
           // read from anywhere but this parameter.
-          keyResult_(showmesh::fallback::LoadPinnedCoordinatorPublicKey(credentialDir)) {
+          keyResult_(showmesh::fallback::LoadPinnedCoordinatorPublicKey(credentialDir)) {}
+
+    // Called once by ShowMeshRuntime, on the worker thread, before its
+    // first pass over drainOnce(): see
+    // FallbackActivationRecorder::performStartupFetch()'s own doc
+    // comment for why this used to run in the constructor and why that
+    // was wrong. A host with no usable pinned key attempts nothing here,
+    // ever, until a restart finds one (ADR-025 decision 7: a node with no
+    // pinned key has no usable cache, and that is legitimate, visible,
+    // and must not block the agent).
+    void performStartupFetch() override {
         if (keyResult_.status != showmesh::fallback::PinnedKeyLoadStatus::kLoaded) {
-            // ADR-025 decision 7: a node with no pinned key has no usable
-            // cache, and that is legitimate, visible, and must not block
-            // the agent from starting. Nothing below this can run
-            // without a trusted key, so nothing is attempted: no fetch,
-            // no acknowledge, no per-entry resolution, ever, until a
-            // restart finds a key.
             LogErr(VB_PLUGIN, "%sno usable fallback program at worker start: %s (%s)\n",
                    kFallbackActivationLogPrefix, showmesh::fallback::PinnedKeyLoadStatusName(keyResult_.status),
                    keyResult_.error.c_str());
