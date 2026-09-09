@@ -1,0 +1,154 @@
+//go:build ignore
+
+// One-off generator: produces signed ADR-048 fallback program fixtures
+// for the FPP plugin's verifier tests, using the coordinator repository's
+// own Program/CanonicalBytes/SignedProgram code and crypto/ed25519
+// directly (not internal/coordinator/signingkey: these are throwaway
+// test keypairs, never a real coordinator signing key).
+//
+// This file imports github.com/showmeshsystems/showmesh, which is the
+// coordinator repository's module, not this one's: the ignore build tag
+// keeps `go build ./...`/`go vet ./...` in this repository from trying to
+// compile it. Run it from inside a checkout of ShowMeshSystems/showmesh:
+//   go run generate_fixtures.go <output-dir>
+package main
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/showmeshsystems/showmesh/pkg/coordsig"
+	"github.com/showmeshsystems/showmesh/pkg/fallbackprogram"
+)
+
+func buildProgram(packageID, revision, show string) fallbackprogram.Program {
+	expires := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	compiled := time.Date(2026, 9, 8, 11, 0, 0, 0, time.UTC)
+	return fallbackprogram.Program{
+		SchemaVersion:   fallbackprogram.SchemaVersion,
+		PackageID:       packageID,
+		Revision:        revision,
+		ExpiresAt:       expires,
+		CompiledAt:      compiled,
+		FPPInstanceUUID: "22222222-2222-4222-8222-222222222222",
+		Show:            show,
+		Generation:      1,
+		PlaylistRevisions: map[string]int64{
+			"pl-main": 7,
+		},
+		CatalogRevisions: map[string]string{
+			"node-a": "cat-rev-1",
+		},
+		Entries: []fallbackprogram.EntryMapping{
+			{
+				EntryKey:    "entry-0",
+				CueID:       "cue-a",
+				CueRevision: 3,
+				Targets: []fallbackprogram.NodeTarget{
+					{
+						NodeID: "node-a",
+						Render: &fallbackprogram.RenderActivation{
+							Sequence:    "seq-a",
+							Filename:    "seq-a.fseq",
+							AssetHashes: []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+						},
+					},
+				},
+			},
+		},
+		Rules: fallbackprogram.FixedRules,
+	}
+}
+
+func sign(program fallbackprogram.Program, priv ed25519.PrivateKey) fallbackprogram.SignedProgram {
+	payload, err := program.CanonicalBytes()
+	if err != nil {
+		panic(err)
+	}
+	sig := ed25519.Sign(priv, payload)
+	return fallbackprogram.SignedProgram{Program: program, Signature: coordsig.Signature(sig)}
+}
+
+func mustMarshal(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func writeFile(dir, name string, contents []byte) {
+	if err := os.WriteFile(filepath.Join(dir, name), contents, 0o644); err != nil {
+		panic(err)
+	}
+}
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: main <output-dir>")
+		os.Exit(1)
+	}
+	outDir := os.Args[1]
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		panic(err)
+	}
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	wrongPub, wrongPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+
+	program := buildProgram("11111111-1111-4111-8111-111111111111", "test-revision-0001", "Test Show")
+
+	valid := sign(program, priv)
+	validBytes := mustMarshal(valid)
+	writeFile(outDir, "valid.json", validBytes)
+
+	// One byte changed inside a string field value, keeping the document
+	// syntactically valid JSON, so the refusal below is a signature
+	// mismatch against what the coordinator signed, not a parse failure.
+	marker := []byte("Test Show")
+	idx := bytes.Index(validBytes, marker)
+	if idx < 0 {
+		panic("marker \"Test Show\" not found in marshaled document")
+	}
+	tampered := append([]byte(nil), validBytes...)
+	tampered[idx] = 'X'
+	if bytes.Equal(tampered, validBytes) {
+		panic("tamper produced no change")
+	}
+	writeFile(outDir, "tampered-one-byte.json", tampered)
+
+	wrongKeySigned := sign(program, wrongPriv)
+	writeFile(outDir, "wrong-key.json", mustMarshal(wrongKeySigned))
+
+	// A second, distinct valid program (different content, same real
+	// key), for the restart-survival and overwrite-on-reinstall tests.
+	program2 := buildProgram("33333333-3333-4333-8333-333333333333", "test-revision-0002", "Second Test Show")
+	valid2 := sign(program2, priv)
+	writeFile(outDir, "valid-second.json", mustMarshal(valid2))
+
+	keys := map[string]string{
+		"coordinatorPublicKeyBase64": base64.StdEncoding.EncodeToString(pub),
+		"wrongPublicKeyBase64":       base64.StdEncoding.EncodeToString(wrongPub),
+		"note":                       "throwaway ed25519 keypairs generated only for these fixtures, never a real coordinator signing key",
+	}
+	keysBytes, err := json.MarshalIndent(keys, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	writeFile(outDir, "keys.json", keysBytes)
+
+	fmt.Println("wrote fixtures to", outDir)
+}

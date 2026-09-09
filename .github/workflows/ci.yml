@@ -118,20 +118,27 @@ jobs:
 
   adapter-shared-tests:
     # Unit tests for the adapter-shared headers (native/adapters/shared),
-    # which need jsoncpp but no FPP source tree. This is a separate job
-    # rather than a step in fpp-adapters below because that job is a
-    # matrix over FPP majors and this test is major-independent: running
-    # it in both matrix arms would duplicate it, and running it in only
-    # one would be an arbitrary choice between them.
+    # which need jsoncpp and libcrypto but no FPP source tree. This is a
+    # separate job rather than a step in fpp-adapters below because that
+    # job is a matrix over FPP majors and this test is major-independent:
+    # running it in both matrix arms would duplicate it, and running it
+    # in only one would be an arbitrary choice between them.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install jsoncpp
+      - name: Install jsoncpp and OpenSSL headers
         run: |
           sudo apt-get update -o Acquire::Retries=2
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libjsoncpp-dev
+          # libssl-dev is named explicitly rather than left to arrive as
+          # libcurl4-openssl-dev's own dependency: on ubuntu-latest
+          # (this job) that package only Suggests libssl-dev, so
+          # openssl/evp.h is absent unless asked for by name; it is only
+          # a genuine Depends on debian:trixie below, which is exactly
+          # the kind of distro-specific accident this line exists to not
+          # rely on.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libjsoncpp-dev libssl-dev
 
       - name: Build and test
         run: make -C native/adapters test
