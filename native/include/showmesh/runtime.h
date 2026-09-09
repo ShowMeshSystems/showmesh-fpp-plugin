@@ -174,6 +174,38 @@ class DefinitionPublisher {
     virtual DefinitionHoldings definitionHoldings() const = 0;
 };
 
+// FallbackActivationRecorder is where the plugin records what the
+// installed ADR-048 fallback program (Track J) says about the entry key
+// the worker has just resolved. It never sends anything to a node: the
+// node-activation route and the per-host executor credential ADR-048
+// decision 3 requires do not exist yet, so recording is the whole job.
+//
+// Deliberately as narrow as ObservationSink and DefinitionPublisher:
+// entryKey and observedAtMillis are the only two things the worker
+// already has at the one call site that needs this, and both are
+// standard types, so this header pulls in nothing the host-neutral core
+// does not already carry. The adapter-side implementation
+// (fallback_activation_delivery.h) does the actual resolve-and-record
+// work using the fallback headers (jsoncpp, OpenSSL) this core module
+// never links.
+//
+// Closer in shape to DefinitionPublisher than to ObservationSink or
+// PlaylistMismatchNotifier: there is no accept/retry contract to honor
+// (ObservationSink's bool return exists for gap tracking that does not
+// apply here), and every resolved entry is recorded, not only a
+// transition into or out of some state (PlaylistMismatchNotifier's
+// raise/clear pair). One method, called once per resolved entry.
+class FallbackActivationRecorder {
+ public:
+    virtual ~FallbackActivationRecorder() = default;
+    // Called once per entry whose identity resolved, right where the
+    // worker already has entryKey: never re-derived, never a second
+    // lookup. observedAtMillis is the observation's own timestamp, not a
+    // fresh read of the clock, so a recorded outcome and the observation
+    // it belongs to always agree on when the entry actually played.
+    virtual void recordEntryKeyResolution(const std::string& entryKey, TimeMillis observedAtMillis) = 0;
+};
+
 // Clock is injected so the whole runtime is testable without waiting.
 using Clock = TimeMillis (*)();
 
@@ -231,10 +263,15 @@ class ShowMeshRuntime {
     // is needed for it after that. Defaulted to the built-in constant so
     // every existing caller and test compiles unchanged; both adapters
     // pass the "ShowMeshSafeCeilingPercent" setting's value instead.
+    // fallbackRecorder is likewise optional and defaults to nullptr so
+    // every existing caller and test compiles unchanged. When non-null,
+    // drainOnce() calls recordEntryKeyResolution() once per entry whose
+    // identity resolves, right after entryKey itself is known.
     ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                     SequenceFileStore* sequenceStore = nullptr, DefinitionPublisher* definitions_publisher = nullptr,
                     BrightnessFileStore* brightnessStore = nullptr,
-                    int safeCeilingPercent = kDefaultSafeCeilingPercent);
+                    int safeCeilingPercent = kDefaultSafeCeilingPercent,
+                    FallbackActivationRecorder* fallbackRecorder = nullptr);
     ~ShowMeshRuntime();
 
     // Guarded engine access. The returned accessor holds engineMutex_ for
@@ -402,6 +439,7 @@ class ShowMeshRuntime {
     Clock clock_;
     SequenceFileStore* sequenceStore_;
     DefinitionPublisher* definitionPublisher_;
+    FallbackActivationRecorder* fallbackRecorder_;
     BrightnessFileStore* brightnessStore_;
     // Set once in the constructor; see brightnessRestartTrust().
     BrightnessRestartTrust brightnessRestartTrust_ = BrightnessRestartTrust::kTrustedOrNoRecord;

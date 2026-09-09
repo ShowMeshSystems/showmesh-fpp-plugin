@@ -60,12 +60,14 @@ bool playlistNameIsPathSafe(const std::string& name) {
 
 ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                                  SequenceFileStore* sequenceStore, DefinitionPublisher* definitionPublisher,
-                                 BrightnessFileStore* brightnessStore, int safeCeilingPercent)
+                                 BrightnessFileStore* brightnessStore, int safeCeilingPercent,
+                                 FallbackActivationRecorder* fallbackRecorder)
     : definitions_(definitions),
       sink_(sink),
       clock_(clock),
       sequenceStore_(sequenceStore),
       definitionPublisher_(definitionPublisher),
+      fallbackRecorder_(fallbackRecorder),
       brightnessStore_(brightnessStore),
       handoff_(16) {
     if (definitions_ != nullptr) {
@@ -303,6 +305,15 @@ bool ShowMeshRuntime::drainOnce() {
 
     observation.identity = resolution.identity;
     observation.entryKey = resolution.entryKey;
+    // Right where entryKey is known, and nowhere else: this is the one
+    // key the fallback resolver looks up, already computed by
+    // resolveEntryIdentity() above, never re-derived a second way. Never
+    // gated on definitionPublisher_ or sink_'s outcome below: recording
+    // what the installed fallback program says about this entry does not
+    // depend on whether the coordinator accepted the observation.
+    if (fallbackRecorder_ != nullptr) {
+        fallbackRecorder_->recordEntryKeyResolution(resolution.entryKey, evidence.observedAtMillis);
+    }
     // Before the observation citing it, not after: an observation whose
     // definition has not arrived is still accepted, but Track H holds the
     // binding as having no definition until it does. The return value is

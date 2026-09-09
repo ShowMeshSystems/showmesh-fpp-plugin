@@ -90,6 +90,33 @@ enum class FallbackFetchOutcomeKind {
     kInstalled,
 };
 
+// The enum value's own spelling, the identical "grep the name, find the
+// code and the log" rule ActivationResolveKindName()
+// (fallback_activation_resolver.h) states for its own vocabulary.
+inline const char* FallbackFetchOutcomeKindName(FallbackFetchOutcomeKind kind) {
+    switch (kind) {
+        case FallbackFetchOutcomeKind::kCredentialUnavailable:
+            return "kCredentialUnavailable";
+        case FallbackFetchOutcomeKind::kTransportUnreachable:
+            return "kTransportUnreachable";
+        case FallbackFetchOutcomeKind::kUnexpectedStatus:
+            return "kUnexpectedStatus";
+        case FallbackFetchOutcomeKind::kNotPublished:
+            return "kNotPublished";
+        case FallbackFetchOutcomeKind::kMalformedEnvelope:
+            return "kMalformedEnvelope";
+        case FallbackFetchOutcomeKind::kVerificationRefused:
+            return "kVerificationRefused";
+        case FallbackFetchOutcomeKind::kInstanceMismatch:
+            return "kInstanceMismatch";
+        case FallbackFetchOutcomeKind::kExpired:
+            return "kExpired";
+        case FallbackFetchOutcomeKind::kInstalled:
+            return "kInstalled";
+    }
+    return "kUnknown";
+}
+
 // The vocabulary POST .../acknowledge actually accepts
 // (v1.FallbackProgramAcknowledgeRequest.VerificationResult), a CLOSED,
 // three-member set that is deliberately coarser than

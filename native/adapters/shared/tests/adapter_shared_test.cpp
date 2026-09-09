@@ -21,11 +21,13 @@
 #include <vector>
 
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "callback_fields.h"
 #include "check.h"
 #include "fallback_activation_resolver.h"
+#include "fallback_pinned_key_loader.h"
 #include "fallback_program_fetch.h"
 #include "fallback_program_installer.h"
 #include "fallback_program_verifier.h"
@@ -996,4 +998,131 @@ TEST(ValidMatchCopiesCueRevisionAndTargetsVerbatim) {
     CHECK(!target.audio.has_value());
     CHECK_EQ(stringMember(*target.render, "sequence"), std::string("seq-a"));
     CHECK_EQ(stringMember(*target.render, "filename"), std::string("seq-a.fseq"));
+}
+
+TEST(FallbackFetchOutcomeKindNameIsTheEnumsOwnSpelling) {
+    using showmesh::fallback::FallbackFetchOutcomeKind;
+    using showmesh::fallback::FallbackFetchOutcomeKindName;
+    CHECK_EQ(std::string(FallbackFetchOutcomeKindName(FallbackFetchOutcomeKind::kCredentialUnavailable)),
+             std::string("kCredentialUnavailable"));
+    CHECK_EQ(std::string(FallbackFetchOutcomeKindName(FallbackFetchOutcomeKind::kInstalled)),
+             std::string("kInstalled"));
+    CHECK_EQ(std::string(FallbackFetchOutcomeKindName(FallbackFetchOutcomeKind::kNotPublished)),
+             std::string("kNotPublished"));
+}
+
+TEST(ActivationResolveKindNameIsTheEnumsOwnSpelling) {
+    using showmesh::fallback::ActivationResolveKind;
+    using showmesh::fallback::ActivationResolveKindName;
+    CHECK_EQ(std::string(ActivationResolveKindName(ActivationResolveKind::kNoProgramInstalled)),
+             std::string("kNoProgramInstalled"));
+    CHECK_EQ(std::string(ActivationResolveKindName(ActivationResolveKind::kProgramFailedReverification)),
+             std::string("kProgramFailedReverification"));
+    CHECK_EQ(std::string(ActivationResolveKindName(ActivationResolveKind::kProgramExpired)),
+             std::string("kProgramExpired"));
+    CHECK_EQ(std::string(ActivationResolveKindName(ActivationResolveKind::kUnknownEntry)),
+             std::string("kUnknownEntry"));
+    CHECK_EQ(std::string(ActivationResolveKindName(ActivationResolveKind::kAmbiguousEntry)),
+             std::string("kAmbiguousEntry"));
+    CHECK_EQ(std::string(ActivationResolveKindName(ActivationResolveKind::kNoActivatableTarget)),
+             std::string("kNoActivatableTarget"));
+    CHECK_EQ(std::string(ActivationResolveKindName(ActivationResolveKind::kMatch)), std::string("kMatch"));
+}
+
+// --- pinned coordinator public key loader -------------------------------
+//
+// The directory check runs before the file check, so every branch that
+// requires the DIRECTORY to be root-owned with the file itself
+// examined (a wrong file mode while the directory passes, or malformed
+// content once both ownership checks pass) requires a root-owned
+// directory to reach at all. That is not exercisable by this
+// unprivileged test process, nor by an unprivileged CI runner: a test
+// cannot chown a directory to root without root. Those branches were
+// verified manually, as root, inside the same Docker container used for
+// the fpp10 adapter build, recorded in this change's pull request body.
+// This file automatically covers the two shapes reachable without
+// privilege: a directory that does not exist at all (kMissing, since
+// stat() on the directory fails before anything else is examined), and
+// an existing directory this test process itself owns (kOwnershipUntrusted,
+// the exact "agent's own account could have written it" case ADR-025
+// decision 4 is actually about, reached at the directory level here
+// rather than the file level, but the identical status and the identical
+// refusal).
+
+namespace {
+
+class TempKeyDir {
+ public:
+    TempKeyDir() {
+        char buffer[] = "/tmp/showmesh-pinned-key-test-XXXXXX";
+        const char* made = ::mkdtemp(buffer);
+        CHECK(made != nullptr);
+        path_ = made != nullptr ? std::string(made) : std::string();
+    }
+    ~TempKeyDir() {
+        std::remove((path_ + "/coordinator-fallback-public-key").c_str());
+        ::rmdir(path_.c_str());
+    }
+    const std::string& path() const { return path_; }
+
+ private:
+    std::string path_;
+};
+
+}  // namespace
+
+TEST(MissingPinnedKeyDirectoryIsReportedAsMissingNotUntrusted) {
+    TempKeyDir dir;
+    const std::string neverCreated = dir.path() + "/never-created";
+    const showmesh::fallback::PinnedKeyLoadResult result =
+        showmesh::fallback::LoadPinnedCoordinatorPublicKey(neverCreated);
+    CHECK(result.status == showmesh::fallback::PinnedKeyLoadStatus::kMissing);
+    CHECK(!result.error.empty());
+    CHECK_EQ(result.publicKey.size(), static_cast<size_t>(0));
+}
+
+// Depends on this test process NOT being root: a directory it creates
+// itself is then owned by its own uid, the exact "agent's own account
+// could have written it" case ADR-025 decision 4 refuses, caught here
+// before the loader ever looks for the file inside, regardless of
+// whether that file exists, what it contains, or what mode it carries.
+// Run as root (this repository's own manual verification container
+// included, since a container's default user is root unless told
+// otherwise) the assumption is false: root owns the temp directory, so
+// the same steps would instead exercise kLoaded, a different test
+// entirely. Skipped rather than faked when euid is 0, the identical
+// "state the gap plainly, do not report a pass that was not earned"
+// choice locale_guard_test.cpp already makes for a locale this host does
+// not have installed.
+TEST(APresentDirectoryNotOwnedByRootIsRefusedAsUntrustedBeforeCheckingTheFile) {
+    if (::geteuid() == 0) {
+        std::fprintf(stderr,
+                      "SKIP APresentDirectoryNotOwnedByRootIsRefusedAsUntrustedBeforeCheckingTheFile: "
+                      "running as root, so a directory this test creates is root-owned and the "
+                      "not-owned-by-root assumption does not hold here\n");
+        return;
+    }
+
+    TempKeyDir dir;
+    const std::string path = dir.path() + "/coordinator-fallback-public-key";
+    std::ofstream out(path, std::ios::binary);
+    out << "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    out.close();
+    ::chmod(path.c_str(), 0644);
+
+    const showmesh::fallback::PinnedKeyLoadResult result =
+        showmesh::fallback::LoadPinnedCoordinatorPublicKey(dir.path());
+    CHECK(result.status == showmesh::fallback::PinnedKeyLoadStatus::kOwnershipUntrusted);
+    CHECK(!result.error.empty());
+    CHECK_EQ(result.publicKey.size(), static_cast<size_t>(0));
+}
+
+TEST(PinnedKeyLoadStatusNameIsTheEnumsOwnSpelling) {
+    using showmesh::fallback::PinnedKeyLoadStatus;
+    using showmesh::fallback::PinnedKeyLoadStatusName;
+    CHECK_EQ(std::string(PinnedKeyLoadStatusName(PinnedKeyLoadStatus::kMissing)), std::string("kMissing"));
+    CHECK_EQ(std::string(PinnedKeyLoadStatusName(PinnedKeyLoadStatus::kOwnershipUntrusted)),
+             std::string("kOwnershipUntrusted"));
+    CHECK_EQ(std::string(PinnedKeyLoadStatusName(PinnedKeyLoadStatus::kMalformed)), std::string("kMalformed"));
+    CHECK_EQ(std::string(PinnedKeyLoadStatusName(PinnedKeyLoadStatus::kLoaded)), std::string("kLoaded"));
 }

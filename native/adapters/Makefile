@@ -30,9 +30,24 @@ ifeq ($(strip $(JSONCPP_LIBS)),)
 JSONCPP_LIBS := -ljsoncpp
 endif
 
+# Ed25519 verification for the ADR-048 fallback program
+# (fallback_program_verifier.h). libcrypto's runtime shared object is
+# already on an FPP host regardless of this package, pulled in
+# transitively by libcurl4-openssl-dev's own dependency on libcurl4;
+# named here so the adapter links it explicitly rather than relying on
+# whatever happens to already be loaded. Defined before INCLUDES below
+# (a := assignment expands immediately, at the point it is written, not
+# lazily): both majors' plugin.cpp reach fallback_activation_delivery.h
+# now, so this is no longer only the test target's dependency.
+OPENSSL_INCLUDE := $(shell pkg-config --cflags-only-I libcrypto 2>/dev/null | sed 's/-I/-isystem /g')
+OPENSSL_LIBS := $(shell pkg-config --libs libcrypto 2>/dev/null)
+ifeq ($(strip $(OPENSSL_LIBS)),)
+OPENSSL_LIBS := -lcrypto
+endif
+
 # FPP's own headers are included with -isystem so their warnings do not
 # drown this repository's. -Werror applies to this code either way.
-INCLUDES := -I$(CORE_DIR)/include -Ishared -isystem $(FPP_SRC) $(JSONCPP_INCLUDE)
+INCLUDES := -I$(CORE_DIR)/include -Ishared -isystem $(FPP_SRC) $(JSONCPP_INCLUDE) $(OPENSSL_INCLUDE)
 
 # The outbound coordinator client. libcurl is not a new dependency on an
 # FPP host (fppd links it already); it is named here so the adapter links
@@ -41,18 +56,6 @@ INCLUDES := -I$(CORE_DIR)/include -Ishared -isystem $(FPP_SRC) $(JSONCPP_INCLUDE
 CURL_LIBS := $(shell pkg-config --libs libcurl 2>/dev/null)
 ifeq ($(strip $(CURL_LIBS)),)
 CURL_LIBS := -lcurl
-endif
-
-# Ed25519 verification for the ADR-048 fallback program
-# (fallback_program_verifier.h). libcrypto's runtime shared object is
-# already on an FPP host regardless of this package, pulled in
-# transitively by libcurl4-openssl-dev's own dependency on libcurl4;
-# named here so the adapter links it explicitly rather than relying on
-# whatever happens to already be loaded.
-OPENSSL_INCLUDE := $(shell pkg-config --cflags-only-I libcrypto 2>/dev/null | sed 's/-I/-isystem /g')
-OPENSSL_LIBS := $(shell pkg-config --libs libcrypto 2>/dev/null)
-ifeq ($(strip $(OPENSSL_LIBS)),)
-OPENSSL_LIBS := -lcrypto
 endif
 
 # The FPP 10 adapter declares FPP_PLUGIN_SUPPORTS_UNLOAD(), and that
@@ -80,11 +83,11 @@ fpp10: $(BUILD)/fpp10/libshowmesh-fpp10.so
 
 $(BUILD)/fpp9/libshowmesh-fpp9.so: fpp9/plugin.cpp $(CORE_SOURCES)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -shared $^ $(CURL_LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -shared $^ $(CURL_LIBS) $(OPENSSL_LIBS) -o $@
 
 $(BUILD)/fpp10/libshowmesh-fpp10.so: fpp10/plugin.cpp $(CORE_SOURCES)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(FPP10_UNLOAD_FLAGS) $(INCLUDES) -shared $^ $(CURL_LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(FPP10_UNLOAD_FLAGS) $(INCLUDES) -shared $^ $(CURL_LIBS) $(OPENSSL_LIBS) -o $@
 
 # The loader looks up createPlugin() by name, so a build that produced a
 # library without it would install cleanly and then fail at load with

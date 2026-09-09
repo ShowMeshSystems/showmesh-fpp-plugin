@@ -25,6 +25,7 @@
 #include "callback_fields.h"
 #include "channel_ranges.h"
 #include "coordinator_delivery.h"
+#include "fallback_activation_delivery.h"
 #include "fpp_definition_source.h"
 #include "safe_ceiling.h"
 #include "section_names.h"
@@ -79,9 +80,10 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
           sequenceStore_(showmesh::resolveSequenceStateDir()),
           brightnessStore_(showmesh::resolveSequenceStateDir()),
           delivery_(nowMillis),
+          fallbackDelivery_(nowMillis, definitions_.instanceUuid()),
           safeCeilingPercent_(showmesh::adapter::resolveSafeCeilingPercent()),
           runtime_(&definitions_, delivery_.client(), nowMillis, &sequenceStore_, delivery_.client(),
-                  &brightnessStore_, safeCeilingPercent_) {
+                  &brightnessStore_, safeCeilingPercent_, &fallbackDelivery_) {
         logBrightnessRestartTrust(runtime_.brightnessRestartTrust(), safeCeilingPercent_);
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
@@ -287,6 +289,11 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // Declared before runtime_ for the same reason sequenceStore_ is: the
     // runtime holds pointers into it from construction onward.
     showmesh::adapter::CoordinatorDelivery delivery_;
+    // Declared after definitions_ (its constructor reads
+    // definitions_.instanceUuid() once) and before runtime_ (which holds
+    // a pointer into it), the same two reasons delivery_ above is placed
+    // where it is.
+    showmesh::adapter::FallbackActivationDelivery fallbackDelivery_;
     // Declared before runtime_ for the same reason: resolved from the
     // "ShowMeshSafeCeilingPercent" setting once, here, before runtime_'s
     // constructor uses it to settle an untrusted restart.

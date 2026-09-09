@@ -130,6 +130,33 @@ enum class ActivationResolveKind {
     kMatch,
 };
 
+// The enum value's own spelling, not a friendlier rewrite: a caller that
+// records or logs this (fallback_activation_delivery.h does exactly
+// that) must grep the enum name and find both the code and the record
+// naming it, which a renamed-for-readability string would silently
+// break. Exhaustive by switch rather than a lookup table, so a future
+// eighth kind that forgets to add a case here fails to compile instead
+// of logging "kUnknown".
+inline const char* ActivationResolveKindName(ActivationResolveKind kind) {
+    switch (kind) {
+        case ActivationResolveKind::kNoProgramInstalled:
+            return "kNoProgramInstalled";
+        case ActivationResolveKind::kProgramFailedReverification:
+            return "kProgramFailedReverification";
+        case ActivationResolveKind::kProgramExpired:
+            return "kProgramExpired";
+        case ActivationResolveKind::kUnknownEntry:
+            return "kUnknownEntry";
+        case ActivationResolveKind::kAmbiguousEntry:
+            return "kAmbiguousEntry";
+        case ActivationResolveKind::kNoActivatableTarget:
+            return "kNoActivatableTarget";
+        case ActivationResolveKind::kMatch:
+            return "kMatch";
+    }
+    return "kUnknown";
+}
+
 // One target node and its exact activation, copied verbatim from the
 // program: this resolver never re-derives or filters what a target
 // carries. A target naming neither render nor audio (the coordinator's
