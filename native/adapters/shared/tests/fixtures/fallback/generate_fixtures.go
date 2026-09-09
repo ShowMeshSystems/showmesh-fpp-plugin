@@ -110,6 +110,20 @@ func buildResolverEdgeCasesProgram() fallbackprogram.Program {
 				{NodeID: "node-b"},
 			},
 		},
+		{
+			// One live target alongside one inert target: a real match
+			// (node-c gets an activation) that must survive with
+			// node-d's inertness copied through verbatim, distinct from
+			// entry-no-activation above where inertness is the WHOLE
+			// match.
+			EntryKey:    "entry-mixed-activation",
+			CueID:       "cue-mixed-activation",
+			CueRevision: 1,
+			Targets: []fallbackprogram.NodeTarget{
+				{NodeID: "node-c", Render: &fallbackprogram.RenderActivation{Sequence: "seq-c", Filename: "seq-c.fseq"}},
+				{NodeID: "node-d"},
+			},
+		},
 	}
 	return p
 }

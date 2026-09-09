@@ -923,24 +923,52 @@ TEST(EmptyTargetsListIsRefusedNeverAMatchWithNothingToSend) {
     const showmesh::fallback::ActivationResolution resolution = showmesh::fallback::ResolveActivationFromDocument(
         "entry-empty", document, publicKey, timeFromMillis(clockBeforeExpiry()));
 
-    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kEmptyTargets);
+    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kNoActivatableTarget);
     CHECK(!resolution.reason.empty());
     CHECK(!resolution.match.has_value());
 }
 
-TEST(TargetWithNeitherRenderNorAudioPassesThroughAsPartOfAMatch) {
+// A one-target list whose only target is inert is the empty-targets
+// failure wearing a different length: a match here would read as
+// success to every caller above this resolver while nothing happens on
+// any node, identically to EmptyTargetsListIsRefusedNeverAMatchWithNothingToSend
+// above. Refused the same way, as kNoActivatableTarget.
+TEST(SoleInertTargetIsRefusedNeverAMatchWithNothingToSend) {
     const std::string document = readFixtureOrFail("resolver-edge-cases.json");
     const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
 
     const showmesh::fallback::ActivationResolution resolution = showmesh::fallback::ResolveActivationFromDocument(
         "entry-no-activation", document, publicKey, timeFromMillis(clockBeforeExpiry()));
 
+    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kNoActivatableTarget);
+    CHECK(!resolution.reason.empty());
+    CHECK(!resolution.match.has_value());
+}
+
+// An inert target ALONGSIDE a live one is a real match: node-c still
+// gets activated, and node-d's inertness is copied through verbatim
+// rather than filtered out or turned into a refusal. Only a match where
+// NOT ONE target can do anything is refused (the two tests above).
+TEST(InertTargetAlongsideALiveOneSurvivesAsAMatch) {
+    const std::string document = readFixtureOrFail("resolver-edge-cases.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+
+    const showmesh::fallback::ActivationResolution resolution = showmesh::fallback::ResolveActivationFromDocument(
+        "entry-mixed-activation", document, publicKey, timeFromMillis(clockBeforeExpiry()));
+
     CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kMatch);
     CHECK(resolution.match.has_value());
-    CHECK_EQ(resolution.match->targets.size(), static_cast<size_t>(1));
-    CHECK_EQ(resolution.match->targets[0].nodeId, std::string("node-b"));
-    CHECK(!resolution.match->targets[0].render.has_value());
-    CHECK(!resolution.match->targets[0].audio.has_value());
+    CHECK_EQ(resolution.match->targets().size(), static_cast<size_t>(2));
+
+    const showmesh::fallback::ActivationTarget& live = resolution.match->targets()[0];
+    CHECK_EQ(live.nodeId, std::string("node-c"));
+    CHECK(live.render.has_value());
+    CHECK_EQ(stringMember(*live.render, "sequence"), std::string("seq-c"));
+
+    const showmesh::fallback::ActivationTarget& inert = resolution.match->targets()[1];
+    CHECK_EQ(inert.nodeId, std::string("node-d"));
+    CHECK(!inert.render.has_value());
+    CHECK(!inert.audio.has_value());
 }
 
 TEST(ValidMatchCopiesCueRevisionAndTargetsVerbatim) {
@@ -952,17 +980,17 @@ TEST(ValidMatchCopiesCueRevisionAndTargetsVerbatim) {
 
     CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kMatch);
     CHECK(resolution.match.has_value());
-    CHECK_EQ(resolution.match->packageId, std::string(kValidPackageId));
-    CHECK_EQ(resolution.match->revision, std::string(kValidRevision));
-    CHECK_EQ(resolution.match->fppInstanceUuid, std::string(kExpectedInstanceUuid));
-    CHECK_EQ(resolution.match->entryKey, std::string("entry-0"));
-    CHECK_EQ(resolution.match->cueId, std::string("cue-a"));
-    CHECK_EQ(resolution.match->cueRevision, static_cast<std::int64_t>(3));
-    CHECK(resolution.match->generation.has_value());
-    CHECK_EQ(*resolution.match->generation, static_cast<std::int64_t>(1));
-    CHECK_EQ(resolution.match->targets.size(), static_cast<size_t>(1));
+    CHECK_EQ(resolution.match->packageId(), std::string(kValidPackageId));
+    CHECK_EQ(resolution.match->revision(), std::string(kValidRevision));
+    CHECK_EQ(resolution.match->fppInstanceUuid(), std::string(kExpectedInstanceUuid));
+    CHECK_EQ(resolution.match->entryKey(), std::string("entry-0"));
+    CHECK_EQ(resolution.match->cueId(), std::string("cue-a"));
+    CHECK_EQ(resolution.match->cueRevision(), static_cast<std::int64_t>(3));
+    CHECK(resolution.match->generation().has_value());
+    CHECK_EQ(*resolution.match->generation(), static_cast<std::int64_t>(1));
+    CHECK_EQ(resolution.match->targets().size(), static_cast<size_t>(1));
 
-    const showmesh::fallback::ActivationTarget& target = resolution.match->targets[0];
+    const showmesh::fallback::ActivationTarget& target = resolution.match->targets()[0];
     CHECK_EQ(target.nodeId, std::string("node-a"));
     CHECK(target.render.has_value());
     CHECK(!target.audio.has_value());

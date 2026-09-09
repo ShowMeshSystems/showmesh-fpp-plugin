@@ -21,10 +21,26 @@
 // current program has nothing for this key" is not "a genuinely current
 // program has two conflicting things for this key" (a coordinator
 // defect, not an ordinary gap), is not "a genuinely current program
-// names a Cue with no node to send it to" (a match with nothing to send
-// it to is functionally the same as no delivery, but every caller above
-// this resolver would otherwise read a returned match as success).
+// names a Cue with no target that can actually do anything" (a match
+// where not one target carries a render or an audio activation is
+// functionally the same as no delivery, but every caller above this
+// resolver would otherwise read a returned match as success -- an empty
+// targets list and a one-target list whose only target is inert are the
+// identical failure wearing different lengths, so both are refused the
+// same way; a match with several targets where only some are inert is a
+// real match, because the live targets still get activated).
+//
+// ActivationMatch has no public constructor: the only way one exists is
+// that ResolveActivationFromDocument (this match's one friend) built it
+// after confirming at least one target in it actually does something. A
+// caller cannot express "a match with nothing to send it to" in code
+// that compiles, the identical structural guarantee
+// VerifiedFallbackProgram's private constructor gives slice one
+// (fallback_program_verifier.h): the only person who could otherwise
+// construct a hand-built ActivationMatch is the delivery layer this
+// file's own header comment says does not exist yet.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -37,6 +53,19 @@
 
 namespace showmesh {
 namespace fallback {
+
+struct ActivationResolution;
+
+// Forward declaration only, the identical reason
+// fallback_program_verifier.h forward-declares VerifyFallbackProgram:
+// ActivationMatch's constructor names this exact signature as its one
+// friend, and the definition below (repeated, as C++ requires for a
+// function defined after the class that friends it) is what a caller
+// actually calls.
+inline ActivationResolution ResolveActivationFromDocument(const std::string& entryKey,
+                                                            const std::string& rawDocument,
+                                                            const std::vector<uint8_t>& coordinatorPublicKey,
+                                                            std::chrono::system_clock::time_point now);
 
 enum class ActivationResolveKind {
     // Nothing installed at all: ReadInstalledFallbackProgram found no
@@ -81,17 +110,23 @@ enum class ActivationResolveKind {
     // coordinator-side defect this resolver can surface but must not
     // paper over by guessing which of the two entries is meant.
     kAmbiguousEntry,
-    // Exactly one entry matches, but its targets list is empty. The
-    // coordinator's own compiler is not expected to emit this (a Cue
-    // with no resolved node targets), but nothing in the wire format
-    // forbids it either. This is refused rather than returned as a
-    // match with zero targets: a match with nothing to send it to would
-    // read as success to every caller above this resolver, and a show
+    // Exactly one entry matches, but no target in it can actually do
+    // anything: either its targets list is empty, or every target in it
+    // names neither a render nor an audio activation. The coordinator's
+    // own compiler is not expected to emit either shape (a Cue with no
+    // resolved node targets, or a target with nothing resolved for it),
+    // but nothing in the wire format forbids either. Both are refused
+    // rather than returned as a match: a match with nothing to send
+    // reads as success to every caller above this resolver, and a show
     // running its fallback entry while nothing happens on any node is
-    // exactly what a silent outage already looks like.
-    kEmptyTargets,
-    // Exactly one entry matches, has at least one target, and every
-    // field this resolver needs to report it is present.
+    // exactly what a silent outage already looks like, whether that
+    // match's targets list has zero entries or one inert one. A match
+    // with SOME live targets and some inert ones is not this: the live
+    // targets still get activated, and the inert ones are copied
+    // through verbatim as the coordinator's business to explain.
+    kNoActivatableTarget,
+    // Exactly one entry matches, has at least one target, and at least
+    // one of those targets carries a render or an audio activation.
     kMatch,
 };
 
@@ -100,9 +135,11 @@ enum class ActivationResolveKind {
 // carries. A target naming neither render nor audio (the coordinator's
 // own NodeTarget doc comment says its compiler never emits this, but
 // nothing in the wire format forbids it) is copied through unchanged
-// rather than refused here: ADR-048 decision 3 has the node ingress run
-// "the same Cue activation validation ... as normal coordinator
-// dispatch" before it ever acts on a target, so rejecting a
+// rather than refused here, PROVIDED at least one other target in the
+// same match carries an activation (see kNoActivatableTarget above for
+// when it is the only target): ADR-048 decision 3 has the node ingress
+// run "the same Cue activation validation ... as normal coordinator
+// dispatch" before it ever acts on a target, so rejecting an individual
 // no-activation target is that validation's job, not this resolver's.
 // Refusing it here would be this resolver quietly doing part of a job
 // that belongs on the other side of the boundary it does not cross.
@@ -119,15 +156,50 @@ struct ActivationTarget {
 // path additionally needs that this type cannot supply (execution id,
 // the per-host executor credential): this type is not that payload, it
 // is the local half feeding one.
-struct ActivationMatch {
-    std::string packageId;
-    std::string revision;
-    std::string fppInstanceUuid;
-    std::string entryKey;
-    std::string cueId;
-    std::int64_t cueRevision = 0;
-    std::optional<std::int64_t> generation;
-    std::vector<ActivationTarget> targets;
+//
+// NO PUBLIC CONSTRUCTOR IS THE POINT, NOT AN IMPLEMENTATION DETAIL. See
+// this file's top comment. Widening this class (a public constructor, a
+// setter, a non-const accessor exposing targets_ by reference) removes
+// the one thing standing between "the only ActivationMatch that exists
+// has at least one live target" and "a caller hands this resolver's
+// eventual consumer whatever it built by hand," so do not widen it
+// without re-deriving why that guarantee still holds.
+class ActivationMatch {
+ public:
+    const std::string& packageId() const { return packageId_; }
+    const std::string& revision() const { return revision_; }
+    const std::string& fppInstanceUuid() const { return fppInstanceUuid_; }
+    const std::string& entryKey() const { return entryKey_; }
+    const std::string& cueId() const { return cueId_; }
+    std::int64_t cueRevision() const { return cueRevision_; }
+    const std::optional<std::int64_t>& generation() const { return generation_; }
+    const std::vector<ActivationTarget>& targets() const { return targets_; }
+
+ private:
+    friend ActivationResolution ResolveActivationFromDocument(const std::string&, const std::string&,
+                                                                const std::vector<uint8_t>&,
+                                                                std::chrono::system_clock::time_point);
+
+    ActivationMatch(std::string packageId, std::string revision, std::string fppInstanceUuid, std::string entryKey,
+                     std::string cueId, std::int64_t cueRevision, std::optional<std::int64_t> generation,
+                     std::vector<ActivationTarget> targets)
+        : packageId_(std::move(packageId)),
+          revision_(std::move(revision)),
+          fppInstanceUuid_(std::move(fppInstanceUuid)),
+          entryKey_(std::move(entryKey)),
+          cueId_(std::move(cueId)),
+          cueRevision_(cueRevision),
+          generation_(std::move(generation)),
+          targets_(std::move(targets)) {}
+
+    std::string packageId_;
+    std::string revision_;
+    std::string fppInstanceUuid_;
+    std::string entryKey_;
+    std::string cueId_;
+    std::int64_t cueRevision_ = 0;
+    std::optional<std::int64_t> generation_;
+    std::vector<ActivationTarget> targets_;
 };
 
 struct ActivationResolution {
@@ -276,25 +348,7 @@ inline ActivationResolution ResolveActivationFromDocument(const std::string& ent
         return result;
     }
 
-    if (targetsValue->items().empty()) {
-        result.kind = ActivationResolveKind::kEmptyTargets;
-        result.reason = "fallback: the entry matching this key names no node targets";
-        return result;
-    }
-
-    ActivationMatch match;
-    match.packageId = verified.program->packageId();
-    match.revision = verified.program->revision();
-    match.fppInstanceUuid = verified.program->fppInstanceUuid();
-    match.entryKey = entryKey;
-    match.cueId = cueIdValue->string();
-    match.cueRevision = static_cast<std::int64_t>(cueRevisionValue->number());
-
-    const showmesh::json::Value* generationValue = detail::findEntryMember(*programValue, "generation");
-    if (generationValue != nullptr && generationValue->type() == showmesh::json::Type::kNumber) {
-        match.generation = static_cast<std::int64_t>(generationValue->number());
-    }
-
+    std::vector<ActivationTarget> targets;
     for (const showmesh::json::Value& targetValue : targetsValue->items()) {
         if (targetValue.type() != showmesh::json::Type::kObject) continue;
         const showmesh::json::Value* nodeIdValue = detail::findEntryMember(targetValue, "nodeId");
@@ -310,21 +364,40 @@ inline ActivationResolution ResolveActivationFromDocument(const std::string& ent
         if (audioValue != nullptr && audioValue->type() != showmesh::json::Type::kNull) {
             target.audio = *audioValue;
         }
-        match.targets.push_back(std::move(target));
+        targets.push_back(std::move(target));
     }
 
-    if (match.targets.empty()) {
-        // Every item in a non-empty targets array was itself malformed
-        // (not an object, or missing/wrong-typed nodeId): the same
-        // "nothing to send this to" situation kEmptyTargets exists for,
-        // reached by a different route.
-        result.kind = ActivationResolveKind::kEmptyTargets;
-        result.reason = "fallback: the entry matching this key names targets, but none carry a usable nodeId";
+    // Refused as the identical outcome whether targets ended up empty
+    // (an empty array, or every item malformed: not an object, or
+    // missing/wrong-typed nodeId) or every target that did survive
+    // names neither render nor audio: both are "nothing in this match
+    // can actually do anything," and a match asserting otherwise would
+    // read as success to every caller above this resolver. This is the
+    // ONE place ActivationMatch's private constructor is ever called, so
+    // this check is the type's invariant, not a rule a future caller
+    // could forget to repeat.
+    const bool anyActivation =
+        std::any_of(targets.begin(), targets.end(),
+                     [](const ActivationTarget& t) { return t.render.has_value() || t.audio.has_value(); });
+    if (targets.empty() || !anyActivation) {
+        result.kind = ActivationResolveKind::kNoActivatableTarget;
+        result.reason = targets.empty() ? "fallback: the entry matching this key names no node targets"
+                                         : "fallback: the entry matching this key names targets, but none carry a "
+                                           "render or an audio activation";
         return result;
     }
 
+    const showmesh::json::Value* generationValue = detail::findEntryMember(*programValue, "generation");
+    std::optional<std::int64_t> generation;
+    if (generationValue != nullptr && generationValue->type() == showmesh::json::Type::kNumber) {
+        generation = static_cast<std::int64_t>(generationValue->number());
+    }
+
     result.kind = ActivationResolveKind::kMatch;
-    result.match = std::move(match);
+    result.match = ActivationMatch(verified.program->packageId(), verified.program->revision(),
+                                    verified.program->fppInstanceUuid(), entryKey, cueIdValue->string(),
+                                    static_cast<std::int64_t>(cueRevisionValue->number()), generation,
+                                    std::move(targets));
     return result;
 }
 
