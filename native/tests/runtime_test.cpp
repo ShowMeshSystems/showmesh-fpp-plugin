@@ -128,6 +128,12 @@ class RecordingTransport : public HttpTransport {
         response.statusCode = 200;
         return response;
     }
+
+    // Not exercised by this file's own tests, which only drive
+    // observation posts; shares post()'s canned response so the
+    // interface's second verb has a stated behavior rather than none.
+    HttpResponse get(const HttpRequest& request) override { return post(request); }
+
     std::vector<HttpRequest> requests;
 };
 
@@ -142,6 +148,13 @@ class UnreachableTransport : public HttpTransport {
         response.error = "connection refused";
         return response;
     }
+
+    // Not exercised by this file's own tests; shares post()'s
+    // unreachable behavior so the interface's second verb has a stated
+    // behavior rather than none, and stays consistent with this fake's
+    // one job.
+    HttpResponse get(const HttpRequest& request) override { return post(request); }
+
     std::vector<HttpRequest> requests;
 };
 

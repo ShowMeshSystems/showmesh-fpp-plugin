@@ -108,6 +108,11 @@ class FakeTransport : public HttpTransport {
         return response;
     }
 
+    // Not exercised by this file's own tests, which only drive publish
+    // paths; shares post()'s canned response so the interface's second
+    // verb has a stated behavior rather than none.
+    HttpResponse get(const HttpRequest& request) override { return post(request); }
+
     std::vector<HttpRequest> requests;
     int statusCode = 200;
 };
