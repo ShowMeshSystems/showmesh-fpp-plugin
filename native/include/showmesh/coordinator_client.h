@@ -143,6 +143,12 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // and by the sleeper during a backoff wait.
     void requestStop() override { stopRequested_.store(true, std::memory_order_relaxed); }
 
+    // Contract section 3.9's republish, called from fppd's own web thread
+    // rather than the worker: both take mutex_, which every other read and
+    // write of these two sets already takes.
+    DefinitionHoldings clearHeldDefinitions() override;
+    DefinitionHoldings definitionHoldings() const override;
+
     CoordinatorStatus status() const;
     bool holdsDefinition(const std::string& instanceUuid, const std::string& playlistHash) const;
     // True once a definition with this exact content has been refused

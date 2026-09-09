@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
+#include <set>
 #include <vector>
 
 #include "check.h"
@@ -68,7 +69,20 @@ class RecordingPublisher : public DefinitionPublisher {
                            const std::string& playlistHash, const std::string& canonicalDefinition,
                            showmesh::TimeMillis capturedAtMillis) override {
         published.push_back(Record{instanceUuid, playlistName, playlistHash, canonicalDefinition, capturedAtMillis});
+        if (accept) held.insert(instanceUuid + "/" + playlistHash);
         return accept;
+    }
+
+    showmesh::DefinitionHoldings clearHeldDefinitions() override {
+        showmesh::DefinitionHoldings holdings;
+        holdings.cleared = held.size();
+        held.clear();
+        return holdings;
+    }
+    showmesh::DefinitionHoldings definitionHoldings() const override {
+        showmesh::DefinitionHoldings holdings;
+        holdings.held = held.size();
+        return holdings;
     }
 
     struct Record {
@@ -79,6 +93,7 @@ class RecordingPublisher : public DefinitionPublisher {
         showmesh::TimeMillis capturedAtMillis;
     };
     std::vector<Record> published;
+    std::set<std::string> held;
     bool accept = true;
 };
 

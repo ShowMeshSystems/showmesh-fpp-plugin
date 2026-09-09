@@ -184,6 +184,26 @@ TransitionGainResponse ShowMeshRuntime::applyTransitionGain(const std::string& b
     return applyTransitionGainRequest(body, &engine_, &lastTransitionGainRequestId_, clock_());
 }
 
+void ShowMeshRuntime::RuntimeSweepRecord::requestSweep() {
+    runtime_->sweepRequested_.fetch_add(1);
+    // Woken the same way an observation wakes it, so the sweep starts now
+    // rather than at the end of the worker's 250ms poll.
+    {
+        std::lock_guard<std::mutex> lock(runtime_->wakeMutex_);
+        runtime_->hasWork_ = true;
+    }
+    runtime_->wake_.notify_one();
+}
+
+bool ShowMeshRuntime::RuntimeSweepRecord::sweepPending() const {
+    return runtime_->sweepRequested_.load() != runtime_->sweepCompleted_.load();
+}
+
+DefinitionRepublishResponse ShowMeshRuntime::applyDefinitionRepublish(const std::string& body) {
+    std::lock_guard<std::mutex> lock(republishMutex_);
+    return applyDefinitionRepublishRequest(body, definitionPublisher_, &sweepRecord_, &lastRepublishRequestId_);
+}
+
 void ShowMeshRuntime::modifyChannelData(std::uint8_t* channelData, std::size_t channelCount) {
     std::lock_guard<std::mutex> lock(engineMutex_);
     engine_.applyToFrame(channelData, channelCount, clock_());
@@ -410,8 +430,15 @@ bool ShowMeshRuntime::sweepDefinitions() {
 }
 
 bool ShowMeshRuntime::maybeSweepDefinitions() {
-    if (sweptOnce_ && clock_() - lastSweepMillis_ < kDefinitionRescanIntervalMillis) return false;
-    return sweepDefinitions();
+    // An owed sweep is served regardless of how recently the last one ran,
+    // and the record is cleared only once the sweep it asked for has
+    // actually completed, so sweepPending() answers a poller honestly.
+    const std::uint64_t requested = sweepRequested_.load();
+    const bool owed = requested != sweepCompleted_.load();
+    if (!owed && sweptOnce_ && clock_() - lastSweepMillis_ < kDefinitionRescanIntervalMillis) return false;
+    const bool swept = sweepDefinitions();
+    if (swept && owed) sweepCompleted_.store(requested);
+    return swept;
 }
 
 void ShowMeshRuntime::workerLoop() {

@@ -331,6 +331,27 @@ bool CoordinatorClient::publishDefinition(const std::string& instanceUuid, const
     return outcome.accepted;
 }
 
+DefinitionHoldings CoordinatorClient::clearHeldDefinitions() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    DefinitionHoldings holdings;
+    holdings.cleared = heldDefinitions_.size();
+    heldDefinitions_.clear();
+    holdings.held = heldDefinitions_.size();
+    // refusedDefinitions_ survives on purpose: a terminal refusal cannot
+    // change until the plugin restarts, so re-sending those bytes would
+    // spend the retry budget ahead of what would succeed.
+    holdings.refusedTerminally = refusedDefinitions_.size();
+    return holdings;
+}
+
+DefinitionHoldings CoordinatorClient::definitionHoldings() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    DefinitionHoldings holdings;
+    holdings.held = heldDefinitions_.size();
+    holdings.refusedTerminally = refusedDefinitions_.size();
+    return holdings;
+}
+
 CoordinatorClient::Outcome CoordinatorClient::postWithRetry(const char* path, const std::string& body) {
     Outcome outcome;
     if (transport_ == nullptr || credentials_ == nullptr || baseUrl_.empty()) {

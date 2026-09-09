@@ -28,6 +28,7 @@
 #include "section_names.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
+#include "showmesh/definition_republish.h"
 #include "showmesh/transition_gain.h"
 
 namespace {
@@ -149,7 +150,8 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         return [this] { return quiesceDone_.load(); };
     }
 
-    // Contract section 2.2's transition-gain write. Registered through
+    // Contract section 2.2's transition-gain write and section 3.9's
+    // definition republish. Registered through
     // FPPPlugins::registerPluginApi(), never drogon::app().registerHandler():
     // drogon has no route removal, so a handler registered straight with it
     // is a function pointer into this .so that can never be withdrawn, which
@@ -170,6 +172,18 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
                 callback(makeStringResponse(result.body, result.status, "application/json"));
             },
             { drogon::Post });
+        FPPPlugins::registerPluginApi(
+            showmesh::kDefinitionRepublishPath,
+            [this](const HttpRequestPtr& req, HttpCallback&& callback) {
+                // Synchronous for the same reason. This handler records
+                // that a sweep is owed and returns; the worker thread runs
+                // the sweep, so nothing from this route is left executing
+                // when the handler is withdrawn.
+                const showmesh::DefinitionRepublishResponse result =
+                    runtime_.applyDefinitionRepublish(getRequestContent(req));
+                callback(makeStringResponse(result.body, result.status, "application/json"));
+            },
+            { drogon::Post });
     }
 
     // FPP calls this before shutdown() on both teardown paths
@@ -179,7 +193,13 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
     // that makes the later dlclose() safe: destroy while still mapped,
     // then unmap. Safe to call for an unregistered path and safe to call
     // twice, so it needs no guard of its own.
-    void unregisterApis() override { FPPPlugins::unregisterPluginApi(showmesh::kTransitionGainPath); }
+    // Every registered path is withdrawn here. A handler left registered
+    // pins this .so for the life of the process, which defeats
+    // FPP_PLUGIN_SUPPORTS_UNLOAD() below.
+    void unregisterApis() override {
+        FPPPlugins::unregisterPluginApi(showmesh::kTransitionGainPath);
+        FPPPlugins::unregisterPluginApi(showmesh::kDefinitionRepublishPath);
+    }
 
     void playlistCallback(const Json::Value& playlist, const std::string& action, const std::string& section,
                           int item) override {
@@ -295,11 +315,12 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
 }  // namespace
 
 // This plugin stops and joins its worker in shutdown(), withdraws its
-// settings listener and the command it registered, registers its one HTTP
-// route through FPPPlugins::registerPluginApi() and never through
-// drogon::app().registerHandler(), and hands nothing else to a drogon
-// event loop, so it is safe to unmap. The route is the rule rather than an
-// exception to it: Plugin.h's unload checklist requires routes to go
+// settings listener and the command it registered, registers both of its
+// HTTP routes through FPPPlugins::registerPluginApi() and never through
+// drogon::app().registerHandler(), withdraws both again in
+// unregisterApis(), and hands nothing else to a drogon event loop, so it
+// is safe to unmap. The routes are the rule rather than an exception to
+// it: Plugin.h's unload checklist requires routes to go
 // through registerPluginApi() precisely so they can be withdrawn, and
 // drogon has no route removal, so a handler registered directly with
 // drogon would pin this .so for the life of the process. Its outbound client links libcurl and calls curl_global_init()

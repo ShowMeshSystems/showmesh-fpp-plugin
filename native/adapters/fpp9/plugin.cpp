@@ -28,6 +28,7 @@
 #include "fpp_definition_source.h"
 #include "safe_ceiling.h"
 #include "section_names.h"
+#include "showmesh/definition_republish.h"
 #include "showmesh/transition_gain.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
@@ -167,23 +168,25 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // adjustment, so a duplicate or delayed payload cannot apply twice.
     void multiSyncData(const uint8_t* data, int len) override { runtime_.adoptEncodedFullState(data, len); }
 
-    // Contract section 2.2's transition-gain write. FPP 9 registers on the
-    // libhttpserver instance FPP hands in, which is the same one carrying
-    // /fppd and /commands, so the route answers at the same LAN address
-    // FPP 10 serves it at even though the two registration APIs share
-    // nothing.
+    // Contract section 2.2's transition-gain write and section 3.9's
+    // definition republish. FPP 9 registers on the libhttpserver instance
+    // FPP hands in, which is the same one carrying /fppd and /commands, so
+    // the routes answer at the same LAN addresses FPP 10 serves them at
+    // even though the two registration APIs share nothing.
     void registerApis(httpserver::webserver* ws) override {
         if (ws == nullptr) return;
         ws->register_resource(showmesh::kTransitionGainPath, &gainResource_, false);
+        ws->register_resource(showmesh::kDefinitionRepublishPath, &republishResource_, false);
     }
 
     // FPP 9 has no runtime unload endpoint, so this runs only on the
-    // process-teardown path. Withdrawn anyway: libhttpserver holds a bare
-    // pointer to gainResource_, and leaving it registered past this
-    // object's life would be a call into a destroyed member.
+    // process-teardown path. Every route is withdrawn anyway: libhttpserver
+    // holds a bare pointer to each resource member, and one left registered
+    // past this object's life would be a call into a destroyed member.
     void unregisterApis(httpserver::webserver* ws) override {
         if (ws == nullptr) return;
         ws->unregister_resource(showmesh::kTransitionGainPath);
+        ws->unregister_resource(showmesh::kDefinitionRepublishPath);
     }
 
  private:
@@ -205,6 +208,30 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
             // it later cannot race a request still inside it.
             const showmesh::TransitionGainResponse result =
                 runtime_->applyTransitionGain(std::string(req.get_content()));
+            return std::shared_ptr<httpserver::http_response>(new httpserver::string_response(
+                result.body, result.status, "application/json"));
+        }
+
+     private:
+        showmesh::ShowMeshRuntime* runtime_;
+    };
+
+    // The libhttpserver side of the republish route, a member for the same
+    // lifetime reason gainResource_ is.
+    class DefinitionRepublishResource : public httpserver::http_resource {
+     public:
+        explicit DefinitionRepublishResource(showmesh::ShowMeshRuntime* runtime) : runtime_(runtime) {
+            disallow_all();
+            set_allowing("POST", true);
+        }
+
+        std::shared_ptr<httpserver::http_response> render_POST(const httpserver::http_request& req) override {
+            // Synchronous, and it must stay that way. It records that a
+            // sweep is owed and returns; the worker thread performs the
+            // sweep, so nothing here is still running when this resource
+            // is unregistered.
+            const showmesh::DefinitionRepublishResponse result =
+                runtime_->applyDefinitionRepublish(std::string(req.get_content()));
             return std::shared_ptr<httpserver::http_response>(new httpserver::string_response(
                 result.body, result.status, "application/json"));
         }
@@ -268,6 +295,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // Declared after runtime_ on purpose: members initialise in
     // declaration order, so this captures a runtime_ that already exists.
     TransitionGainResource gainResource_{&runtime_};
+    DefinitionRepublishResource republishResource_{&runtime_};
     Command* command_ = nullptr;
     std::uint64_t publishedRevision_ = 0;
 };
