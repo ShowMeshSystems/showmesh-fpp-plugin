@@ -1033,22 +1033,28 @@ TEST(ActivationResolveKindNameIsTheEnumsOwnSpelling) {
 //
 // The directory check runs before the file check, so every branch that
 // requires the DIRECTORY to already be root-owned before the file itself
-// is examined (a tighter-than-usual file mode that must still load, a
-// group- or other-writable file that must still be refused, or malformed
-// content once both ownership checks pass) requires a root-owned
-// directory to reach at all. That is not exercisable by this
-// unprivileged test process, nor by an unprivileged CI runner: a test
-// cannot chown a directory to root without root. Those branches were
-// verified manually, as root, inside the same Docker container used for
-// the fpp10 adapter build, recorded in this change's pull request body.
-// This file automatically covers the two shapes reachable without
-// privilege: a directory that does not exist at all (kMissing, since
-// stat() on the directory fails before anything else is examined), and
-// an existing directory this test process itself owns (kOwnershipUntrusted,
-// the exact "agent's own account could have written it" case ADR-025
-// decision 4 is actually about, reached at the directory level here
-// rather than the file level, but the identical status and the identical
-// refusal).
+// is examined requires a root-owned directory to reach at all, which
+// this unprivileged test process cannot create. Two shapes are covered
+// unconditionally, reachable without privilege: a directory that does
+// not exist at all (kMissing, since stat() on the directory fails before
+// anything else is examined), and an existing directory this test
+// process itself owns (kOwnershipUntrusted, the exact "agent's own
+// account could have written it" case ADR-025 decision 4 is actually
+// about, reached at the directory level here rather than the file level,
+// but the identical status and the identical refusal).
+//
+// A second test below is gated the other way: it runs ONLY when euid is
+// 0, exercising the shapes that need a root-owned directory, and is
+// itself the reason a security check that refused the SAFER file mode
+// (the bug this file's history exists to fix) now has a repeatable gate
+// instead of a one-time observation in a program that no longer exists
+// in this repository. It proves a root-owned file mode TIGHTER than
+// usual still loads (the exact case an exact-mode match got backwards),
+// and that group- or other-writable still refuses regardless of who
+// owns the file. Two shapes remain manual-only, verified as root inside
+// the same Docker container used for the fpp10 adapter build, recorded
+// in this change's pull request body: malformed content once both
+// ownership checks pass, and the ordinary-mode 0644 success control.
 
 namespace {
 
@@ -1116,6 +1122,47 @@ TEST(APresentDirectoryNotOwnedByRootIsRefusedAsUntrustedBeforeCheckingTheFile) {
     CHECK(result.status == showmesh::fallback::PinnedKeyLoadStatus::kOwnershipUntrusted);
     CHECK(!result.error.empty());
     CHECK_EQ(result.publicKey.size(), static_cast<size_t>(0));
+}
+
+// Mirror of the skip above, gated the other way: runs ONLY when euid is
+// 0, since only a root process can create the root-owned directory
+// these shapes require. Skipped rather than faked otherwise, the
+// identical "state the gap plainly" choice
+// APresentDirectoryNotOwnedByRootIsRefusedAsUntrustedBeforeCheckingTheFile
+// already makes. This is the automated guard for the fix in this
+// change's history: a file mode tighter than usual (0444) must still
+// load, never refuse, and a group- or other-writable file must still be
+// refused regardless of how tight its other bits are.
+TEST(RootOwnedFileModeTighterThanUsualLoadsWritableModesRefused) {
+    if (::geteuid() != 0) {
+        std::fprintf(stderr,
+                      "SKIP RootOwnedFileModeTighterThanUsualLoadsWritableModesRefused: "
+                      "not running as root, so this process cannot create the root-owned directory these "
+                      "cases require\n");
+        return;
+    }
+
+    TempKeyDir dir;
+    const std::string path = dir.path() + "/coordinator-fallback-public-key";
+    std::ofstream out(path, std::ios::binary);
+    out << "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    out.close();
+
+    ::chmod(path.c_str(), 0444);
+    const showmesh::fallback::PinnedKeyLoadResult tighter =
+        showmesh::fallback::LoadPinnedCoordinatorPublicKey(dir.path());
+    CHECK(tighter.status == showmesh::fallback::PinnedKeyLoadStatus::kLoaded);
+    CHECK_EQ(tighter.publicKey.size(), static_cast<size_t>(32));
+
+    ::chmod(path.c_str(), 0664);
+    const showmesh::fallback::PinnedKeyLoadResult groupWritable =
+        showmesh::fallback::LoadPinnedCoordinatorPublicKey(dir.path());
+    CHECK(groupWritable.status == showmesh::fallback::PinnedKeyLoadStatus::kOwnershipUntrusted);
+
+    ::chmod(path.c_str(), 0646);
+    const showmesh::fallback::PinnedKeyLoadResult otherWritable =
+        showmesh::fallback::LoadPinnedCoordinatorPublicKey(dir.path());
+    CHECK(otherWritable.status == showmesh::fallback::PinnedKeyLoadStatus::kOwnershipUntrusted);
 }
 
 TEST(PinnedKeyLoadStatusNameIsTheEnumsOwnSpelling) {
