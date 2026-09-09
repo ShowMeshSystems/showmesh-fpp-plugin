@@ -10,7 +10,8 @@
 // coordinator repository's module, not this one's: the ignore build tag
 // keeps `go build ./...`/`go vet ./...` in this repository from trying to
 // compile it. Run it from inside a checkout of ShowMeshSystems/showmesh:
-//   go run generate_fixtures.go <output-dir>
+//
+//	go run generate_fixtures.go <output-dir>
 package main
 
 import (
