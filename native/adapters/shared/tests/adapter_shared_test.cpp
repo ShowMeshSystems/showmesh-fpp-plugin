@@ -25,6 +25,7 @@
 
 #include "callback_fields.h"
 #include "check.h"
+#include "fallback_program_fetch.h"
 #include "fallback_program_installer.h"
 #include "fallback_program_verifier.h"
 #include "section_names.h"
@@ -372,4 +373,423 @@ TEST(WriteFailurePartwayLeavesPreviousProgramUnchanged) {
     CHECK(!failedInstall.ok);
     CHECK(!failedInstall.refusalReason.empty());
     CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+}
+
+// --- fallback program fetch -------------------------------------------
+
+namespace {
+
+const char* kExpectedInstanceUuid = "22222222-2222-4222-8222-222222222222";
+const char* kOtherInstanceUuid = "99999999-9999-4999-8999-999999999999";
+const char* kBaseUrl = "http://coordinator.invalid:8080";
+
+// 2026-09-08T10:00:00Z and 2026-09-08T13:00:00Z: the fixtures' own
+// program.expiresAt is 2026-09-08T12:00:00Z, so these bracket it exactly
+// where a real wall clock cannot be trusted to land relative to a fixed
+// fixture value.
+showmesh::TimeMillis clockBeforeExpiry() { return 1788861600000; }
+showmesh::TimeMillis clockAfterExpiry() { return 1788872400000; }
+
+class ScriptedTransport : public showmesh::HttpTransport {
+ public:
+    showmesh::HttpResponse get(const showmesh::HttpRequest& request) override {
+        getCalls.push_back(request);
+        return getResponse;
+    }
+    showmesh::HttpResponse post(const showmesh::HttpRequest& request) override {
+        postCalls.push_back(request);
+        return postResponse;
+    }
+
+    showmesh::HttpResponse getResponse;
+    showmesh::HttpResponse postResponse;
+    std::vector<showmesh::HttpRequest> getCalls;
+    std::vector<showmesh::HttpRequest> postCalls;
+};
+
+class FixedCredentials : public showmesh::CredentialSource {
+ public:
+    bool token(std::string* out, std::string* error) override {
+        if (!available) {
+            *error = "no credential available";
+            return false;
+        }
+        *out = "test-bearer-token";
+        return true;
+    }
+    void invalidate() override {}
+
+    bool available = true;
+};
+
+showmesh::HttpResponse okResponse(std::string body) {
+    showmesh::HttpResponse r;
+    r.transportOk = true;
+    r.statusCode = 200;
+    r.body = std::move(body);
+    return r;
+}
+
+showmesh::HttpResponse statusResponse(int status) {
+    showmesh::HttpResponse r;
+    r.transportOk = true;
+    r.statusCode = status;
+    return r;
+}
+
+showmesh::HttpResponse unreachableResponse() {
+    showmesh::HttpResponse r;
+    r.transportOk = false;
+    r.error = "connection refused";
+    return r;
+}
+
+}  // namespace
+
+TEST(FetchInstallsAValidPublishedProgram) {
+    const std::string envelope = readFixtureOrFail("valid-get-response.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = okResponse(envelope);
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kInstalled);
+    CHECK_EQ(outcome.packageId, std::string(kValidPackageId));
+    CHECK_EQ(outcome.revision, std::string(kValidRevision));
+    CHECK(showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+
+    // The installed bytes are the reconstructed signed document
+    // ({"program":...,"signature":"..."}), never the fetched HTTP
+    // envelope: re-reading it must independently re-verify, exactly
+    // slice one's restart-survival property.
+    const showmesh::fallback::ReadInstalledResult reread =
+        showmesh::fallback::ReadInstalledFallbackProgram(dir.programPath());
+    CHECK(reread.ok);
+    const showmesh::fallback::FallbackVerifyResult reverified =
+        showmesh::fallback::VerifyFallbackProgram(reread.rawDocument, publicKey);
+    CHECK(reverified.accepted);
+    CHECK_EQ(reverified.program->packageId(), std::string(kValidPackageId));
+
+    CHECK_EQ(transport.getCalls.size(), static_cast<size_t>(1));
+    CHECK_EQ(transport.getCalls[0].bearerToken, std::string("test-bearer-token"));
+    CHECK(transport.getCalls[0].maxResponseBytes > 8192);
+}
+
+TEST(FetchRefusesAndDoesNotInstallOnConnectionRefused) {
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = unreachableResponse();
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const std::string previousDocument = readFixtureOrFail("valid.json");
+    showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kTransportUnreachable);
+    CHECK(!outcome.detail.empty());
+    CHECK(!showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+    CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+}
+
+TEST(FetchTreatsAnUnexpectedStatusAsRefusedAndDoesNotInstall) {
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    for (const int status : {404, 500, 503}) {
+        ScriptedTransport transport;
+        transport.getResponse = statusResponse(status);
+        FixedCredentials credentials;
+        TempDir dir;
+
+        const std::string previousDocument = readFixtureOrFail("valid.json");
+        showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+        const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+            &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(),
+            &clockBeforeExpiry);
+
+        CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kUnexpectedStatus);
+        CHECK_EQ(outcome.statusCode, status);
+        CHECK(!showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+        CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+    }
+}
+
+TEST(FetchTreatsATruncatedOrEmptyBodyAsMalformedAndDoesNotInstall) {
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    for (const std::string& body : {std::string(""), std::string("{\"published\":true,\"program\":{\"packageId\"")}) {
+        ScriptedTransport transport;
+        transport.getResponse = okResponse(body);
+        FixedCredentials credentials;
+        TempDir dir;
+
+        const std::string previousDocument = readFixtureOrFail("valid.json");
+        showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+        const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+            &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(),
+            &clockBeforeExpiry);
+
+        CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kMalformedEnvelope);
+        CHECK(!showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+        CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+    }
+}
+
+TEST(FetchTreatsValidJsonThatIsNotASignedProgramAsMalformedAndDoesNotInstall) {
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = okResponse("{\"published\":true}");
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const std::string previousDocument = readFixtureOrFail("valid.json");
+    showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kMalformedEnvelope);
+    CHECK(!showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+    CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+}
+
+TEST(FetchTreatsAProgramThatIsNotAnObjectAsMalformedNeverAsAForgery) {
+    // The bug this guards against: reaching VerifyFallbackProgram with a
+    // "program" that is a string, not an object, gets refused THERE, and
+    // an earlier version of this file acknowledged that refusal as
+    // "signature-invalid": a forgery report for a forgery that never
+    // happened, no signature ever having been checked. The outcome kind
+    // alone does not catch a regression back to that: it must never be
+    // acknowledgeable.
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse =
+        okResponse("{\"published\":true,\"program\":\"not an object\",\"signatureBase64\":\"AAAA\"}");
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const std::string previousDocument = readFixtureOrFail("valid.json");
+    showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kMalformedEnvelope);
+    CHECK(!showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+    CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+}
+
+TEST(FetchTreatsANonStringSignatureBase64AsMalformedNeverAsAForgery) {
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = okResponse("{\"published\":true,\"program\":{\"packageId\":\"x\"},\"signatureBase64\":12345}");
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const std::string previousDocument = readFixtureOrFail("valid.json");
+    showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kMalformedEnvelope);
+    CHECK(!showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+    CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+}
+
+TEST(FetchTreatsANonJsonBodyAsMalformedAndDoesNotInstall) {
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = okResponse("this is not json at all");
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kMalformedEnvelope);
+    CHECK(!showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+}
+
+TEST(FetchTreatsAnEnormousBodyAsMalformedRatherThanCrashing) {
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    // A fake can hand back more than any real transport's own cap would
+    // allow; this proves the fetch itself never assumes a bounded body,
+    // even though CurlHttpTransport also enforces one in production.
+    transport.getResponse = okResponse(std::string(2 * 1024 * 1024, 'a'));
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kMalformedEnvelope);
+}
+
+TEST(FetchNotPublishedIsAnOrdinaryOutcomeNotAFailure) {
+    const std::string envelope = readFixtureOrFail("not-published-get-response.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = okResponse(envelope);
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kNotPublished);
+    CHECK(!showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+}
+
+TEST(FetchRefusesATamperedProgramAndReportsSignatureInvalid) {
+    const std::string envelope = readFixtureOrFail("tampered-get-response.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = okResponse(envelope);
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const std::string previousDocument = readFixtureOrFail("valid.json");
+    showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kVerificationRefused);
+    CHECK(showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+    CHECK_EQ(showmesh::fallback::FallbackFetchOutcomeVerificationResult(outcome.kind),
+             std::string(showmesh::fallback::kVerificationResultSignatureInvalid));
+    CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+}
+
+TEST(FetchRefusesAWrongKeyProgramAndReportsSignatureInvalid) {
+    const std::string envelope = readFixtureOrFail("wrong-key-get-response.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = okResponse(envelope);
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const std::string previousDocument = readFixtureOrFail("valid.json");
+    showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kVerificationRefused);
+    CHECK_EQ(showmesh::fallback::FallbackFetchOutcomeVerificationResult(outcome.kind),
+             std::string(showmesh::fallback::kVerificationResultSignatureInvalid));
+    CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+}
+
+TEST(FetchRefusesAProgramSignedForADifferentHostAsMismatchedNotSignatureInvalid) {
+    const std::string envelope = readFixtureOrFail("valid-get-response.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = okResponse(envelope);
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const std::string previousDocument = readFixtureOrFail("valid.json");
+    showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+    // The fixture's own program.fppInstanceUuid is kExpectedInstanceUuid;
+    // asking on behalf of a different host is exactly a coordinator (or
+    // a proxy in front of one) serving the wrong host's program, valid
+    // signature and all.
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kOtherInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kInstanceMismatch);
+    CHECK(showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+    // The signature was genuinely valid: reporting it as signature-invalid
+    // would describe a forgery that never happened.
+    CHECK_EQ(showmesh::fallback::FallbackFetchOutcomeVerificationResult(outcome.kind),
+             std::string(showmesh::fallback::kVerificationResultMismatchedProgram));
+    CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+}
+
+TEST(FetchRefusesAnExpiredProgramAsMismatchedNotSignatureInvalid) {
+    const std::string envelope = readFixtureOrFail("valid-get-response.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = okResponse(envelope);
+    FixedCredentials credentials;
+    TempDir dir;
+
+    const std::string previousDocument = readFixtureOrFail("valid.json");
+    showmesh::writeFileAtomically(dir.programPath(), previousDocument);
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockAfterExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kExpired);
+    CHECK(showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+    CHECK_EQ(showmesh::fallback::FallbackFetchOutcomeVerificationResult(outcome.kind),
+             std::string(showmesh::fallback::kVerificationResultMismatchedProgram));
+    CHECK_EQ(readRawOrFail(dir.programPath()), previousDocument);
+}
+
+TEST(FetchWithNoCredentialMakesNoNetworkCall) {
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    ScriptedTransport transport;
+    transport.getResponse = okResponse(readFixtureOrFail("valid-get-response.json"));
+    FixedCredentials credentials;
+    credentials.available = false;
+    TempDir dir;
+
+    const showmesh::fallback::FallbackFetchOutcome outcome = showmesh::fallback::FetchAndInstallFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, publicKey, dir.programPath(), &clockBeforeExpiry);
+
+    CHECK(outcome.kind == showmesh::fallback::FallbackFetchOutcomeKind::kCredentialUnavailable);
+    CHECK(!showmesh::fallback::ShouldAcknowledgeFallbackFetchOutcome(outcome));
+    CHECK_EQ(transport.getCalls.size(), static_cast<size_t>(0));
+}
+
+TEST(AcknowledgeSendsExactlyTheFourFieldsWithTheClosedVocabulary) {
+    ScriptedTransport transport;
+    transport.postResponse = statusResponse(200);
+    FixedCredentials credentials;
+
+    showmesh::fallback::FallbackFetchOutcome outcome;
+    outcome.kind = showmesh::fallback::FallbackFetchOutcomeKind::kInstalled;
+    outcome.packageId = "pkg-1";
+    outcome.revision = "rev-1";
+
+    const showmesh::fallback::AcknowledgeResult result = showmesh::fallback::AcknowledgeFallbackProgram(
+        &transport, &credentials, kBaseUrl, kExpectedInstanceUuid, outcome, &clockBeforeExpiry);
+
+    CHECK(result.ok);
+    CHECK_EQ(transport.postCalls.size(), static_cast<size_t>(1));
+
+    const showmesh::json::ParseResult sent = showmesh::json::parse(transport.postCalls[0].body);
+    CHECK(sent.ok);
+    CHECK_EQ(sent.value.members().size(), static_cast<size_t>(4));
+    bool sawPackageId = false, sawRevision = false, sawResult = false, sawInstalledAt = false;
+    for (const auto& member : sent.value.members()) {
+        if (member.first == "packageId") {
+            CHECK_EQ(member.second.string(), std::string("pkg-1"));
+            sawPackageId = true;
+        } else if (member.first == "revision") {
+            CHECK_EQ(member.second.string(), std::string("rev-1"));
+            sawRevision = true;
+        } else if (member.first == "verificationResult") {
+            CHECK_EQ(member.second.string(), std::string("verified"));
+            sawResult = true;
+        } else if (member.first == "installedAt") {
+            CHECK_EQ(member.second.string(), std::string("2026-09-08T10:00:00Z"));
+            sawInstalledAt = true;
+        }
+    }
+    CHECK(sawPackageId);
+    CHECK(sawRevision);
+    CHECK(sawResult);
+    CHECK(sawInstalledAt);
 }

@@ -60,16 +60,37 @@ class VerifiedFallbackProgram {
     const std::string& packageId() const { return packageId_; }
     const std::string& revision() const { return revision_; }
     const std::string& rawDocument() const { return rawDocument_; }
+    // The signed content's OWN claim of which FPP host this program is
+    // for. The Ed25519 check never evaluates this: a program honestly
+    // signed by the coordinator for a different host verifies cleanly
+    // here too, so a caller that fetched this program on behalf of a
+    // specific host must compare this against that host's own
+    // configured instance id itself. Slice two's fetch does exactly
+    // that.
+    const std::string& fppInstanceUuid() const { return fppInstanceUuid_; }
+    // The signed content's OWN claimed expiry (RFC 3339). The Ed25519
+    // check never evaluates this either: a validly signed, long-expired
+    // program stays validly signed forever, so "is this still current"
+    // is a freshness check a caller makes against this field, never
+    // something a signature can answer by itself.
+    const std::string& expiresAt() const { return expiresAt_; }
 
  private:
     friend FallbackVerifyResult VerifyFallbackProgram(const std::string&, const std::vector<uint8_t>&);
 
-    VerifiedFallbackProgram(std::string packageId, std::string revision, std::string rawDocument)
-        : packageId_(std::move(packageId)), revision_(std::move(revision)), rawDocument_(std::move(rawDocument)) {}
+    VerifiedFallbackProgram(std::string packageId, std::string revision, std::string rawDocument,
+                             std::string fppInstanceUuid, std::string expiresAt)
+        : packageId_(std::move(packageId)),
+          revision_(std::move(revision)),
+          rawDocument_(std::move(rawDocument)),
+          fppInstanceUuid_(std::move(fppInstanceUuid)),
+          expiresAt_(std::move(expiresAt)) {}
 
     std::string packageId_;
     std::string revision_;
     std::string rawDocument_;
+    std::string fppInstanceUuid_;
+    std::string expiresAt_;
 };
 
 struct FallbackVerifyResult {
@@ -237,18 +258,25 @@ inline FallbackVerifyResult VerifyFallbackProgram(const std::string& signedProgr
 
     // A program that verifies but does not carry its own reported
     // identity is not something this function reports as accepted with
-    // blank fields: the caller's report (ADR-048 section 1) needs both.
+    // blank fields: the caller's report (ADR-048 section 1) needs both,
+    // and a caller matching this program against a specific host or
+    // clock needs fppInstanceUuid/expiresAt too.
     const showmesh::json::Value* packageIdValue = detail::findMember(*programValue, "packageId");
     const showmesh::json::Value* revisionValue = detail::findMember(*programValue, "revision");
+    const showmesh::json::Value* fppInstanceUuidValue = detail::findMember(*programValue, "fppInstanceUuid");
+    const showmesh::json::Value* expiresAtValue = detail::findMember(*programValue, "expiresAt");
     if (packageIdValue == nullptr || packageIdValue->type() != showmesh::json::Type::kString ||
-        revisionValue == nullptr || revisionValue->type() != showmesh::json::Type::kString) {
-        result.refusalReason = "fallback: verified program is missing packageId or revision";
+        revisionValue == nullptr || revisionValue->type() != showmesh::json::Type::kString ||
+        fppInstanceUuidValue == nullptr || fppInstanceUuidValue->type() != showmesh::json::Type::kString ||
+        expiresAtValue == nullptr || expiresAtValue->type() != showmesh::json::Type::kString) {
+        result.refusalReason = "fallback: verified program is missing packageId, revision, fppInstanceUuid, or expiresAt";
         return result;
     }
 
     result.accepted = true;
     result.program.emplace(VerifiedFallbackProgram(packageIdValue->string(), revisionValue->string(),
-                                                     signedProgramDocument));
+                                                     signedProgramDocument, fppInstanceUuidValue->string(),
+                                                     expiresAtValue->string()));
     return result;
 }
 

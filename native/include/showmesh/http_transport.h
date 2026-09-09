@@ -20,6 +20,15 @@ struct HttpRequest {
     // credential rule this whole seam exists to keep.
     std::string bearerToken;
     int timeoutMillis = 10000;
+    // Bounds how much of a response body a transport buffers, get() or
+    // post(), before truncating: a full disk-free response body read
+    // without limit is unsafe on a host running a show, but a fixed
+    // constant sized for a small refusal body (the original reason this
+    // field exists) is too small for a real GET response that legitimately
+    // carries many playlist entries. Each call site states its own bound
+    // rather than sharing one constant tuned for a different shape of
+    // response.
+    int maxResponseBytes = 8192;
 };
 
 struct HttpResponse {
@@ -37,6 +46,12 @@ class HttpTransport {
  public:
     virtual ~HttpTransport() = default;
     virtual HttpResponse post(const HttpRequest& request) = 0;
+    // A pure virtual rather than a defaulted no-op: a transport that
+    // silently failed every GET until someone noticed is exactly the
+    // kind of untested default this codebase keeps finding holes
+    // through, so every implementation, real or a test fake, must say
+    // what it actually does.
+    virtual HttpResponse get(const HttpRequest& request) = 0;
 };
 
 }  // namespace showmesh

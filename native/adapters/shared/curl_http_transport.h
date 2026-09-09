@@ -28,7 +28,20 @@ class CurlHttpTransport : public HttpTransport {
         curl_global_init(CURL_GLOBAL_DEFAULT);
     }
 
-    HttpResponse post(const HttpRequest& request) override {
+    HttpResponse post(const HttpRequest& request) override { return perform(request, /*isPost=*/true); }
+
+    HttpResponse get(const HttpRequest& request) override { return perform(request, /*isPost=*/false); }
+
+ private:
+    // Bounds an in-flight response body by the request's own cap, sized
+    // for the response this specific call expects rather than one
+    // constant shared by every call site.
+    struct BoundedBody {
+        std::string body;
+        std::size_t maxBytes = 8192;
+    };
+
+    HttpResponse perform(const HttpRequest& request, bool isPost) {
         HttpResponse response;
 
         CURL* handle = curl_easy_init();
@@ -45,11 +58,16 @@ class CurlHttpTransport : public HttpTransport {
         headers = curl_slist_append(headers, authorization.c_str());
         authorization.assign(authorization.size(), '\0');
 
-        std::string body;
+        BoundedBody bounded;
+        bounded.maxBytes = request.maxResponseBytes > 0 ? static_cast<std::size_t>(request.maxResponseBytes) : 0;
         curl_easy_setopt(handle, CURLOPT_URL, request.url.c_str());
-        curl_easy_setopt(handle, CURLOPT_POST, 1L);
-        curl_easy_setopt(handle, CURLOPT_POSTFIELDS, request.body.c_str());
-        curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, static_cast<long>(request.body.size()));
+        if (isPost) {
+            curl_easy_setopt(handle, CURLOPT_POST, 1L);
+            curl_easy_setopt(handle, CURLOPT_POSTFIELDS, request.body.c_str());
+            curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, static_cast<long>(request.body.size()));
+        } else {
+            curl_easy_setopt(handle, CURLOPT_HTTPGET, 1L);
+        }
         curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, static_cast<long>(request.timeoutMillis));
         curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(request.timeoutMillis));
@@ -60,7 +78,7 @@ class CurlHttpTransport : public HttpTransport {
         // unless this is set, which is not safe off the main thread.
         curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, &appendBody);
-        curl_easy_setopt(handle, CURLOPT_WRITEDATA, &body);
+        curl_easy_setopt(handle, CURLOPT_WRITEDATA, &bounded);
 
         const CURLcode code = curl_easy_perform(handle);
         if (code == CURLE_OK) {
@@ -68,7 +86,7 @@ class CurlHttpTransport : public HttpTransport {
             curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &status);
             response.transportOk = true;
             response.statusCode = static_cast<int>(status);
-            response.body = std::move(body);
+            response.body = std::move(bounded.body);
         } else {
             // curl's own text, which describes the transport and never
             // reflects a request header back.
@@ -80,16 +98,12 @@ class CurlHttpTransport : public HttpTransport {
         return response;
     }
 
- private:
     static std::size_t appendBody(char* data, std::size_t size, std::size_t count, void* userdata) {
         const std::size_t bytes = size * count;
-        std::string* out = static_cast<std::string*>(userdata);
-        // The coordinator's refusal bodies are small; a response that is
-        // not is truncated rather than buffered without bound on a host
-        // running a show.
-        constexpr std::size_t kMaxResponseBytes = 8192;
-        if (out->size() < kMaxResponseBytes) {
-            out->append(data, bytes > kMaxResponseBytes - out->size() ? kMaxResponseBytes - out->size() : bytes);
+        BoundedBody* out = static_cast<BoundedBody*>(userdata);
+        if (out->body.size() < out->maxBytes) {
+            const std::size_t room = out->maxBytes - out->body.size();
+            out->body.append(data, bytes > room ? room : bytes);
         }
         return bytes;
     }
