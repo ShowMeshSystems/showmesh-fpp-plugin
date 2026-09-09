@@ -91,6 +91,58 @@ func writeFile(dir, name string, contents []byte) {
 	}
 }
 
+// mirrorGetResponse copies v1.FallbackProgramResponse's JSON shape
+// (internal/coordinator/api/v1/fallbackprograms.go) field for field and
+// tag for tag. It is a copy, not the real type, only because that
+// package is internal to the coordinator module; the wire shape is
+// public contract (api/openapi.yaml), not an implementation detail this
+// script is free to invent.
+type mirrorGetResponse struct {
+	ServerTime      string          `json:"serverTime"`
+	FPPInstanceUUID string          `json:"fppInstanceUuid"`
+	Published       bool            `json:"published"`
+	Program         json.RawMessage `json:"program,omitempty"`
+	SignatureBase64 string          `json:"signatureBase64,omitempty"`
+
+	AcknowledgedStatus string `json:"acknowledgedStatus"`
+}
+
+// wrapAsGetResponse extracts "program" and "signature" out of an already
+// fully-marshaled SignedProgram document (signedDocumentBytes) via
+// json.RawMessage, the identical verbatim-slice technique
+// extractStoredProgramBytes uses coordinator-side, and re-homes them as
+// mirrorGetResponse's sibling fields. The program bytes are never
+// decoded into a Go struct and re-marshaled: only the envelope around
+// them, built fresh here, goes through json.Marshal.
+func wrapAsGetResponse(signedDocumentBytes []byte, published bool) []byte {
+	var decoded struct {
+		Program   json.RawMessage `json:"program"`
+		Signature string          `json:"signature"`
+	}
+	if err := json.Unmarshal(signedDocumentBytes, &decoded); err != nil {
+		panic(err)
+	}
+	response := mirrorGetResponse{
+		ServerTime:         "2026-09-08T09:00:00Z",
+		FPPInstanceUUID:    "22222222-2222-4222-8222-222222222222",
+		Published:          published,
+		Program:            decoded.Program,
+		SignatureBase64:    decoded.Signature,
+		AcknowledgedStatus: "fallback-program-unacknowledged",
+	}
+	return mustMarshal(response)
+}
+
+func notPublishedGetResponse() []byte {
+	response := mirrorGetResponse{
+		ServerTime:         "2026-09-08T09:00:00Z",
+		FPPInstanceUUID:    "22222222-2222-4222-8222-222222222222",
+		Published:          false,
+		AcknowledgedStatus: "fallback-program-unacknowledged",
+	}
+	return mustMarshal(response)
+}
+
 func main() {
 	if len(os.Args) != 2 {
 		fmt.Fprintln(os.Stderr, "usage: main <output-dir>")
@@ -139,6 +191,21 @@ func main() {
 	program2 := buildProgram("33333333-3333-4333-8333-333333333333", "test-revision-0002", "Second Test Show")
 	valid2 := sign(program2, priv)
 	writeFile(outDir, "valid-second.json", mustMarshal(valid2))
+
+	// GET /api/v1/fallback-programs/{fppInstanceId}'s actual response
+	// shape (v1.FallbackProgramResponse), wrapping each signed document
+	// above: "program" as raw bytes (never re-marshaled: see
+	// wrapAsGetResponse's own comment) and "signature" traveling as the
+	// sibling field "signatureBase64", never nested. v1 is
+	// internal to the coordinator module and this throwaway script does
+	// not import it; the shape below is copied from
+	// internal/coordinator/api/v1/fallbackprograms.go's own struct
+	// tags, not reimplemented independently, and is also documented in
+	// this repository's api/openapi.yaml.
+	writeFile(outDir, "valid-get-response.json", wrapAsGetResponse(validBytes, true))
+	writeFile(outDir, "tampered-get-response.json", wrapAsGetResponse(tampered, true))
+	writeFile(outDir, "wrong-key-get-response.json", wrapAsGetResponse(mustMarshal(wrongKeySigned), true))
+	writeFile(outDir, "not-published-get-response.json", notPublishedGetResponse())
 
 	keys := map[string]string{
 		"coordinatorPublicKeyBase64": base64.StdEncoding.EncodeToString(pub),
