@@ -72,6 +72,13 @@ services:
 networks:
   bench:
     name: showmesh-fppbench-${BENCH_ID:-local}-net
+    # Pinned rather than allocated. See the subnet comment in
+    # scripts/test-plugin-load-fpp.sh: an unpinned bench network can be handed
+    # a range containing the host's own LAN, which breaks published ports for
+    # every container on the machine.
+    ipam:
+      config:
+        - subnet: ${BENCH_SUBNET:?run this through scripts/test-plugin-load-fpp.sh, which computes it}
 
 volumes:
   media:

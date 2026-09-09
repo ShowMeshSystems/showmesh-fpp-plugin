@@ -214,7 +214,21 @@ else
     FPP_BUILD_CONTEXT="$BENCH_DIR/.fpp-src/${BENCH_FPP_MAJOR}-${BENCH_ID}"
 fi
 
-export FPP_IMAGE FPP_TAG FPP_COMMIT FPP_BUILD_CONTEXT FPP_PLATFORM BENCH_ID BENCH_HTTP_PORT
+# Docker's own allocator walks into 192.168 space once its default pools are
+# used up, and a bench network that contains the host's LAN breaks published
+# ports for every container on the machine, not just its own. So the subnet is
+# chosen here rather than left to Docker.
+#
+# 192.168.112.0/20 is carved into 64 /26s, all of them below 192.168.128.0,
+# which is where this project's hardware lives. The index is derived from
+# BENCH_ID, so a leaked network from an earlier run with the same id is reused
+# instead of pushing the allocator somewhere new, and two concurrent runs with
+# different ids rarely collide. A collision is loud: Docker refuses to create a
+# network overlapping an existing one.
+BENCH_SUBNET_INDEX=$(printf '%s' "$BENCH_ID" | cksum | awk '{print $1 % 64}')
+BENCH_SUBNET="192.168.$((112 + BENCH_SUBNET_INDEX / 4)).$(((BENCH_SUBNET_INDEX % 4) * 64))/26"
+
+export FPP_IMAGE FPP_TAG FPP_COMMIT FPP_BUILD_CONTEXT FPP_PLATFORM BENCH_ID BENCH_HTTP_PORT BENCH_SUBNET
 
 PROJECT="showmesh-fppbench-${BENCH_ID}"
 CONTAINER="showmesh-fppbench-${BENCH_ID}-fpp"
