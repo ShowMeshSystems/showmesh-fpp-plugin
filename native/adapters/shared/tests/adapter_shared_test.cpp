@@ -247,12 +247,12 @@ TEST(ValidFallbackProgramVerifiesAndInstalls) {
     const showmesh::fallback::FallbackVerifyResult verified =
         showmesh::fallback::VerifyFallbackProgram(document, publicKey);
     CHECK(verified.accepted);
-    CHECK_EQ(verified.program.packageId, std::string(kValidPackageId));
-    CHECK_EQ(verified.program.revision, std::string(kValidRevision));
+    CHECK_EQ(verified.program->packageId(), std::string(kValidPackageId));
+    CHECK_EQ(verified.program->revision(), std::string(kValidRevision));
 
     TempDir dir;
     const showmesh::fallback::InstallResult installed =
-        showmesh::fallback::InstallFallbackProgram(verified.program, dir.programPath());
+        showmesh::fallback::InstallFallbackProgram(*verified.program, dir.programPath());
     CHECK(installed.ok);
     CHECK_EQ(installed.report.packageId, std::string(kValidPackageId));
     CHECK_EQ(installed.report.revision, std::string(kValidRevision));
@@ -272,7 +272,7 @@ TEST(TamperedFallbackProgramIsRefusedAndNotInstalled) {
     const showmesh::fallback::FallbackVerifyResult previousVerified =
         showmesh::fallback::VerifyFallbackProgram(previousDocument, publicKey);
     CHECK(previousVerified.accepted);
-    CHECK(showmesh::fallback::InstallFallbackProgram(previousVerified.program, dir.programPath()).ok);
+    CHECK(showmesh::fallback::InstallFallbackProgram(*previousVerified.program, dir.programPath()).ok);
 
     const std::string tamperedDocument = readFixtureOrFail("tampered-one-byte.json");
     const showmesh::fallback::FallbackVerifyResult tamperedVerified =
@@ -295,7 +295,7 @@ TEST(WrongKeyFallbackProgramIsRefusedAndNotInstalled) {
     const showmesh::fallback::FallbackVerifyResult previousVerified =
         showmesh::fallback::VerifyFallbackProgram(previousDocument, publicKey);
     CHECK(previousVerified.accepted);
-    CHECK(showmesh::fallback::InstallFallbackProgram(previousVerified.program, dir.programPath()).ok);
+    CHECK(showmesh::fallback::InstallFallbackProgram(*previousVerified.program, dir.programPath()).ok);
 
     const std::string wrongKeyDocument = readFixtureOrFail("wrong-key.json");
     const showmesh::fallback::FallbackVerifyResult wrongKeyVerified =
@@ -316,7 +316,7 @@ TEST(InstalledFallbackProgramSurvivesRestartInAFreshRead) {
         const showmesh::fallback::FallbackVerifyResult verified =
             showmesh::fallback::VerifyFallbackProgram(document, publicKey);
         CHECK(verified.accepted);
-        CHECK(showmesh::fallback::InstallFallbackProgram(verified.program, dir.programPath()).ok);
+        CHECK(showmesh::fallback::InstallFallbackProgram(*verified.program, dir.programPath()).ok);
     }
 
     // A fresh read, standing in for a restarted process that never held
@@ -329,8 +329,8 @@ TEST(InstalledFallbackProgramSurvivesRestartInAFreshRead) {
     const showmesh::fallback::FallbackVerifyResult reverified =
         showmesh::fallback::VerifyFallbackProgram(reloaded.rawDocument, publicKey);
     CHECK(reverified.accepted);
-    CHECK_EQ(reverified.program.packageId, std::string(kValidPackageId));
-    CHECK_EQ(reverified.program.revision, std::string(kValidRevision));
+    CHECK_EQ(reverified.program->packageId(), std::string(kValidPackageId));
+    CHECK_EQ(reverified.program->revision(), std::string(kValidRevision));
     CHECK_EQ(reloaded.rawDocument, document);
 }
 
@@ -342,7 +342,7 @@ TEST(WriteFailurePartwayLeavesPreviousProgramUnchanged) {
     const showmesh::fallback::FallbackVerifyResult previousVerified =
         showmesh::fallback::VerifyFallbackProgram(previousDocument, publicKey);
     CHECK(previousVerified.accepted);
-    CHECK(showmesh::fallback::InstallFallbackProgram(previousVerified.program, dir.programPath()).ok);
+    CHECK(showmesh::fallback::InstallFallbackProgram(*previousVerified.program, dir.programPath()).ok);
 
     const std::string secondDocument = readFixtureOrFail("valid-second.json");
     const showmesh::fallback::FallbackVerifyResult secondVerified =
@@ -364,7 +364,7 @@ TEST(WriteFailurePartwayLeavesPreviousProgramUnchanged) {
     CHECK(setrlimit(RLIMIT_FSIZE, &smallLimit) == 0);
 
     const showmesh::fallback::InstallResult failedInstall =
-        showmesh::fallback::InstallFallbackProgram(secondVerified.program, dir.programPath());
+        showmesh::fallback::InstallFallbackProgram(*secondVerified.program, dir.programPath());
 
     CHECK(setrlimit(RLIMIT_FSIZE, &originalLimit) == 0);
     std::signal(SIGXFSZ, originalHandler);

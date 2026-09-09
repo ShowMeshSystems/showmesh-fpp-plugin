@@ -17,9 +17,10 @@
 // turns that false into a stated refusal, never a silent no-op and never
 // a directory this function created on its own.
 //
-// This file does not verify: it trusts that the caller already called
-// VerifyFallbackProgram and is installing exactly what that call
-// accepted.
+// This file does not verify. It does not need to trust a caller's word
+// that VerifyFallbackProgram already ran: VerifiedFallbackProgram's own
+// private constructor makes that structural, not a convention this file
+// has to take on faith.
 
 #include <chrono>
 #include <fstream>
@@ -59,14 +60,17 @@ inline const char* DefaultFallbackProgramPath() {
     return "/home/fpp/media/plugindata/fpp-showmesh/fallback-program.json";
 }
 
-// Atomically installs verified.rawDocument as the last known good
-// fallback program at path. Never creates path's directory: a missing
-// directory, or one that exists but is not writable, is a stated
-// refusal, not a silently created tree and not a silent no-op.
+// Atomically installs verified's document as the last known good
+// fallback program at path. verified can only exist because
+// VerifyFallbackProgram's signature check accepted it (see that type's
+// own doc comment), so this function never needs its own opinion about
+// whether the content is trustworthy. Never creates path's directory: a
+// missing directory, or one that exists but is not writable, is a
+// stated refusal, not a silently created tree and not a silent no-op.
 inline InstallResult InstallFallbackProgram(const VerifiedFallbackProgram& verified, const std::string& path) {
     InstallResult result;
 
-    if (!showmesh::writeFileAtomically(path, verified.rawDocument)) {
+    if (!showmesh::writeFileAtomically(path, verified.rawDocument())) {
         result.refusalReason = "fallback: could not durably install fallback program at " + path +
                                 " (directory missing, not writable, or write failed; the previous program there, "
                                 "if any, is unchanged)";
@@ -74,8 +78,8 @@ inline InstallResult InstallFallbackProgram(const VerifiedFallbackProgram& verif
     }
 
     result.ok = true;
-    result.report.packageId = verified.packageId;
-    result.report.revision = verified.revision;
+    result.report.packageId = verified.packageId();
+    result.report.revision = verified.revision();
     result.report.verificationResult = "accepted";
     result.report.installedAt = std::chrono::system_clock::now();
     return result;

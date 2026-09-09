@@ -15,7 +15,9 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <openssl/evp.h>
@@ -25,15 +27,49 @@
 namespace showmesh {
 namespace fallback {
 
-// One accepted fallback program. rawDocument is the exact bytes verified,
-// byte for byte, never a re-serialization: this is what
-// FallbackProgramInstaller installs, mirroring the coordinator's own
+struct FallbackVerifyResult;
+
+// Forward declaration only: VerifiedFallbackProgram's constructor names
+// this exact signature as its one friend, and the definition below (the
+// same declaration, repeated, as C++ requires for a function defined
+// after the class that friends it) is what a caller actually calls.
+inline FallbackVerifyResult VerifyFallbackProgram(const std::string& signedProgramDocument,
+                                                   const std::vector<uint8_t>& coordinatorPublicKey);
+
+// One accepted fallback program: the exact bytes verified, byte for
+// byte, never a re-serialization, mirroring the coordinator's own
 // schemaV25 rule that a re-fetch replays the exact signed bytes rather
 // than re-marshaling them at read time.
-struct VerifiedFallbackProgram {
-    std::string packageId;
-    std::string revision;
-    std::string rawDocument;
+//
+// THE PRIVATE CONSTRUCTOR IS THE POINT, NOT AN IMPLEMENTATION DETAIL.
+// This type has no public constructor and no setters: the only way one
+// of these exists is that VerifyFallbackProgram's friend constructor
+// call ran, checked the Ed25519 signature, and accepted. Holding a
+// VerifiedFallbackProgram is therefore itself the proof that a signature
+// check happened, not a claim a caller could otherwise fabricate; a
+// caller cannot express "install this document I did not verify" in
+// code that compiles. InstallFallbackProgram (fallback_program_
+// installer.h) trusts exactly this and nothing more. Widening this
+// class (a public constructor, a setter, a non-const accessor exposing
+// the fields by reference) removes the one thing standing between "the
+// installer only ever writes a verified program" and "the installer
+// writes whatever a caller hands it," so do not widen it without
+// re-deriving why that guarantee still holds.
+class VerifiedFallbackProgram {
+ public:
+    const std::string& packageId() const { return packageId_; }
+    const std::string& revision() const { return revision_; }
+    const std::string& rawDocument() const { return rawDocument_; }
+
+ private:
+    friend FallbackVerifyResult VerifyFallbackProgram(const std::string&, const std::vector<uint8_t>&);
+
+    VerifiedFallbackProgram(std::string packageId, std::string revision, std::string rawDocument)
+        : packageId_(std::move(packageId)), revision_(std::move(revision)), rawDocument_(std::move(rawDocument)) {}
+
+    std::string packageId_;
+    std::string revision_;
+    std::string rawDocument_;
 };
 
 struct FallbackVerifyResult {
@@ -42,7 +78,10 @@ struct FallbackVerifyResult {
     // caller reports this as-is; it is not free-form diagnostic text
     // meant only for a log.
     std::string refusalReason;
-    VerifiedFallbackProgram program;
+    // Populated only when accepted: std::optional rather than a plain
+    // value because VerifiedFallbackProgram deliberately has no default
+    // constructor for a refusal case to default-initialize.
+    std::optional<VerifiedFallbackProgram> program;
 };
 
 namespace detail {
@@ -208,9 +247,8 @@ inline FallbackVerifyResult VerifyFallbackProgram(const std::string& signedProgr
     }
 
     result.accepted = true;
-    result.program.packageId = packageIdValue->string();
-    result.program.revision = revisionValue->string();
-    result.program.rawDocument = signedProgramDocument;
+    result.program.emplace(VerifiedFallbackProgram(packageIdValue->string(), revisionValue->string(),
+                                                     signedProgramDocument));
     return result;
 }
 
