@@ -1032,8 +1032,9 @@ TEST(ActivationResolveKindNameIsTheEnumsOwnSpelling) {
 // --- pinned coordinator public key loader -------------------------------
 //
 // The directory check runs before the file check, so every branch that
-// requires the DIRECTORY to be root-owned with the file itself
-// examined (a wrong file mode while the directory passes, or malformed
+// requires the DIRECTORY to already be root-owned before the file itself
+// is examined (a tighter-than-usual file mode that must still load, a
+// group- or other-writable file that must still be refused, or malformed
 // content once both ownership checks pass) requires a root-owned
 // directory to reach at all. That is not exercisable by this
 // unprivileged test process, nor by an unprivileged CI runner: a test

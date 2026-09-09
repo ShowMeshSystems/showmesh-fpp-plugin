@@ -29,15 +29,24 @@
 // Both must pass, or this reports unverified and refuses to load,
 // exactly as it does for the file alone.
 //
-// This mirrors loadCoordinatorCredential's own "stat, check the exact
-// mode, then read" shape (showmesh/coordinator_config.h) rather than
-// inventing a second convention for a root-owned file. It does not reuse
-// that function: the credential file is owner-secret (0600); this one is
-// a public key meant to be read by fppd's own account, so its required
-// mode and its required owner are both different checks, and unlike the
-// credential file this one also walks its parent directory.
+// This borrows the "stat before read" shape loadCoordinatorCredential
+// uses (showmesh/coordinator_config.h), but not its exact-mode check,
+// and the reason is what each file protects. The credential is a
+// SECRET: being readable by anyone else is itself the harm, so an exact
+// tight mode (0600) is correct there. A pinned key is PUBLIC: its
+// confidentiality is worth nothing and its integrity is worth
+// everything, and the only property that matters is that nobody who
+// should not be able to replace it can. That is what checking the
+// writability bits (owner root, no group or other write) expresses, and
+// an exact-mode match does not: it would refuse a root-owned key mode
+// 0400 or 0444, shapes that are MORE locked down than required, not
+// less, and its remedy would have to tell an operator to loosen a
+// permission bit inside the one code path that exists to catch a
+// filesystem an attacker controls. No value of a required-mode constant
+// fixes that; only checking the bits that actually matter does. So this
+// file never names a required mode, on the directory or the file, and
+// its error text never suggests making anything more permissive.
 
-#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -110,14 +119,6 @@ struct PinnedKeyLoadResult {
 // quietly settles by being first to pick a name.
 inline const char* kPinnedCoordinatorPublicKeyFilename = "coordinator-fallback-public-key";
 
-// Exact bits, not a maximum, the identical convention
-// loadCoordinatorCredential uses for the credential file's own mode.
-// 0644 rather than 0600: this is a public key, meant to be read by
-// fppd's own account, so world-readable is correct; it must simply never
-// be group- or other-writable, which 0644 already guarantees alongside
-// the owner check below.
-constexpr ::mode_t kRequiredPinnedKeyMode = 0644;
-
 namespace detail {
 
 // Owner must be root and neither group nor other may hold the write bit.
@@ -183,20 +184,13 @@ inline PinnedKeyLoadResult LoadPinnedCoordinatorPublicKey(const std::string& cre
         result.error = "pinned coordinator public key path " + path + " is not a regular file";
         return result;
     }
-    if (info.st_uid != 0) {
+    if (!detail::statPassesOwnershipCheck(info)) {
         result.status = PinnedKeyLoadStatus::kOwnershipUntrusted;
         result.error = "pinned coordinator public key file " + path +
-                       " is not owned by root; refusing to verify against a key the agent's own account could "
-                       "have written";
-        return result;
-    }
-    const ::mode_t mode = info.st_mode & 07777;
-    if (mode != kRequiredPinnedKeyMode) {
-        char found[8] = {0};
-        std::snprintf(found, sizeof(found), "%04o", static_cast<unsigned>(mode));
-        result.status = PinnedKeyLoadStatus::kOwnershipUntrusted;
-        result.error = "pinned coordinator public key file " + path + " has mode " + found +
-                       "; refusing to use it until it is exactly 0644 (root-writable, world-readable only)";
+                       " is not root-owned and non-group/other-writable; refusing to verify against a key "
+                       "whose ownership the agent's own account could have produced. Fix this by correcting "
+                       "who owns the file and removing group/other write access, never by making it more "
+                       "permissive";
         return result;
     }
 

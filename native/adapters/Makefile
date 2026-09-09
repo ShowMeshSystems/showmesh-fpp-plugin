@@ -35,10 +35,16 @@ endif
 # already on an FPP host regardless of this package, pulled in
 # transitively by libcurl4-openssl-dev's own dependency on libcurl4;
 # named here so the adapter links it explicitly rather than relying on
-# whatever happens to already be loaded. Defined before INCLUDES below
-# (a := assignment expands immediately, at the point it is written, not
-# lazily): both majors' plugin.cpp reach fallback_activation_delivery.h
-# now, so this is no longer only the test target's dependency.
+# whatever happens to already be loaded. That is a statement about the
+# runtime .so on a deployed host, not about what this BUILD needs: the
+# pkg-config calls below still require the libcrypto dev headers
+# (openssl/evp.h) and .pc file to be installed on whatever machine runs
+# this Makefile, the identical distinction ci.yml's own libssl-dev
+# comment draws for libcurl4-openssl-dev's Suggests-vs-Depends split.
+# Defined before INCLUDES below (a := assignment expands immediately, at
+# the point it is written, not lazily): both majors' plugin.cpp reach
+# fallback_activation_delivery.h now, so this is no longer only the test
+# target's dependency.
 OPENSSL_INCLUDE := $(shell pkg-config --cflags-only-I libcrypto 2>/dev/null | sed 's/-I/-isystem /g')
 OPENSSL_LIBS := $(shell pkg-config --libs libcrypto 2>/dev/null)
 ifeq ($(strip $(OPENSSL_LIBS)),)
