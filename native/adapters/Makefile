@@ -121,6 +121,16 @@ TEST_BINARY        := $(BUILD)/adapter_shared_tests
 
 vpath %.cpp shared/tests $(CORE_DIR)/tests $(CORE_DIR)/src
 
+# Objects are named by basename only, not by path, because the sources live
+# under $(CORE_DIR) (..) and native/Makefile's path-preserving pattern would
+# place objects outside $(BUILD) (e.g. $(BUILD)/../src/json.o). Flattening
+# means two test sources with the same basename in different directories
+# would silently overwrite one object with the other, so that collision is
+# turned into a parse-time error instead.
+ifneq ($(words $(TEST_OBJECTS)),$(words $(sort $(TEST_OBJECTS))))
+$(error two test sources share a basename, so the flattened object directory would silently drop one)
+endif
+
 .PHONY: test
 test: $(TEST_BINARY)
 	$(TEST_BINARY)
