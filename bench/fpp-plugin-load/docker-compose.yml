@@ -78,7 +78,7 @@ networks:
     # every container on the machine.
     ipam:
       config:
-        - subnet: ${BENCH_SUBNET:-192.168.112.0/24}
+        - subnet: ${BENCH_SUBNET:?run this through scripts/test-plugin-load-fpp.sh, which computes it}
 
 volumes:
   media:
