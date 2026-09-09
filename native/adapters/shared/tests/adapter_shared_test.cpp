@@ -25,6 +25,7 @@
 
 #include "callback_fields.h"
 #include "check.h"
+#include "fallback_activation_resolver.h"
 #include "fallback_program_fetch.h"
 #include "fallback_program_installer.h"
 #include "fallback_program_verifier.h"
@@ -792,4 +793,179 @@ TEST(AcknowledgeSendsExactlyTheFourFieldsWithTheClosedVocabulary) {
     CHECK(sawRevision);
     CHECK(sawResult);
     CHECK(sawInstalledAt);
+}
+
+// --- fallback activation resolver --------------------------------------
+//
+// resolver-edge-cases.json (see fixtures/fallback/README.md and
+// generate_fixtures.go's buildResolverEdgeCasesProgram) is a validly
+// signed program the coordinator's own compiler would never emit, but
+// whose wire format does not forbid: two entries sharing an entryKey, an
+// entry with an empty targets list, and an entry whose one target names
+// neither render nor audio. It exists only so this resolver, which must
+// treat the installed file as untrusted input, is exercised against
+// exactly those shapes rather than only against what a healthy
+// coordinator happens to produce today.
+
+namespace {
+
+std::chrono::system_clock::time_point timeFromMillis(showmesh::TimeMillis millis) {
+    return std::chrono::system_clock::time_point(std::chrono::milliseconds(millis));
+}
+
+std::string stringMember(const showmesh::json::Value& object, const char* name) {
+    for (const auto& member : object.members()) {
+        if (member.first == name) return member.second.string();
+    }
+    CHECK(false);
+    return "";
+}
+
+}  // namespace
+
+TEST(NoInstalledProgramIsRefusedAsNoProgram) {
+    TempDir dir;
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+
+    const showmesh::fallback::ActivationResolution resolution = showmesh::fallback::ResolveInstalledActivation(
+        "entry-0", dir.programPath(), publicKey, timeFromMillis(clockBeforeExpiry()));
+
+    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kNoProgramInstalled);
+    CHECK(!resolution.reason.empty());
+    CHECK(!resolution.match.has_value());
+}
+
+TEST(InstalledFileThatNoLongerVerifiesIsRefusedNotTrusted) {
+    // The file on disk is exactly tampered-one-byte.json: a document
+    // this process never verified and installed itself. Simulates disk
+    // content changing after InstallFallbackProgram last wrote it.
+    TempDir dir;
+    const std::string tampered = readFixtureOrFail("tampered-one-byte.json");
+    std::ofstream out(dir.programPath(), std::ios::binary);
+    out << tampered;
+    out.close();
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+
+    const showmesh::fallback::ActivationResolution resolution = showmesh::fallback::ResolveInstalledActivation(
+        "entry-0", dir.programPath(), publicKey, timeFromMillis(clockBeforeExpiry()));
+
+    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kProgramFailedReverification);
+    CHECK(!resolution.reason.empty());
+    CHECK(!resolution.match.has_value());
+}
+
+TEST(ExpiredInstalledProgramIsRefusedAsExpiredNotAsAMatch) {
+    TempDir dir;
+    const std::string document = readFixtureOrFail("valid.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+    const showmesh::fallback::FallbackVerifyResult verified =
+        showmesh::fallback::VerifyFallbackProgram(document, publicKey);
+    CHECK(showmesh::fallback::InstallFallbackProgram(*verified.program, dir.programPath()).ok);
+
+    const showmesh::fallback::ActivationResolution resolution = showmesh::fallback::ResolveInstalledActivation(
+        "entry-0", dir.programPath(), publicKey, timeFromMillis(clockAfterExpiry()));
+
+    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kProgramExpired);
+    CHECK(!resolution.reason.empty());
+    CHECK(!resolution.match.has_value());
+}
+
+// A key this program never covers, and a key belonging to a different
+// program's show entirely, reach the identical outcome for the identical
+// reason: deriveEntryKey hashes playlist name/definition/section/position
+// together, so a key from one show structurally cannot appear in another
+// show's entries. There is no separate "wrong show" branch in the
+// resolver to test, because none exists.
+TEST(KeyNotCoveredByTheCurrentProgramIsUnknownEntry) {
+    const std::string document = readFixtureOrFail("valid.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+
+    const showmesh::fallback::ActivationResolution resolution = showmesh::fallback::ResolveActivationFromDocument(
+        "entry-from-a-different-playlist", document, publicKey, timeFromMillis(clockBeforeExpiry()));
+
+    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kUnknownEntry);
+    CHECK(!resolution.reason.empty());
+    CHECK(!resolution.match.has_value());
+}
+
+TEST(KeyBelongingToADifferentShowsProgramIsUnknownEntryNotAMatch) {
+    // valid.json's own covered key, looked up against
+    // resolver-edge-cases.json (a different show, different packageId).
+    // Never resolves to valid.json's cue-a: a resolver that fell back to
+    // "close enough" here would be exactly the "different Cue" substitution
+    // ADR-048 forbids.
+    const std::string document = readFixtureOrFail("resolver-edge-cases.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+
+    const showmesh::fallback::ActivationResolution resolution =
+        showmesh::fallback::ResolveActivationFromDocument("entry-0", document, publicKey, timeFromMillis(clockBeforeExpiry()));
+
+    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kUnknownEntry);
+    CHECK(!resolution.match.has_value());
+}
+
+TEST(EntryKeyMatchingTwoMappingsIsAmbiguousNotAGuess) {
+    const std::string document = readFixtureOrFail("resolver-edge-cases.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+
+    const showmesh::fallback::ActivationResolution resolution = showmesh::fallback::ResolveActivationFromDocument(
+        "entry-dup", document, publicKey, timeFromMillis(clockBeforeExpiry()));
+
+    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kAmbiguousEntry);
+    CHECK(!resolution.reason.empty());
+    CHECK(!resolution.match.has_value());
+}
+
+TEST(EmptyTargetsListIsRefusedNeverAMatchWithNothingToSend) {
+    const std::string document = readFixtureOrFail("resolver-edge-cases.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+
+    const showmesh::fallback::ActivationResolution resolution = showmesh::fallback::ResolveActivationFromDocument(
+        "entry-empty", document, publicKey, timeFromMillis(clockBeforeExpiry()));
+
+    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kEmptyTargets);
+    CHECK(!resolution.reason.empty());
+    CHECK(!resolution.match.has_value());
+}
+
+TEST(TargetWithNeitherRenderNorAudioPassesThroughAsPartOfAMatch) {
+    const std::string document = readFixtureOrFail("resolver-edge-cases.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+
+    const showmesh::fallback::ActivationResolution resolution = showmesh::fallback::ResolveActivationFromDocument(
+        "entry-no-activation", document, publicKey, timeFromMillis(clockBeforeExpiry()));
+
+    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kMatch);
+    CHECK(resolution.match.has_value());
+    CHECK_EQ(resolution.match->targets.size(), static_cast<size_t>(1));
+    CHECK_EQ(resolution.match->targets[0].nodeId, std::string("node-b"));
+    CHECK(!resolution.match->targets[0].render.has_value());
+    CHECK(!resolution.match->targets[0].audio.has_value());
+}
+
+TEST(ValidMatchCopiesCueRevisionAndTargetsVerbatim) {
+    const std::string document = readFixtureOrFail("valid.json");
+    const std::vector<uint8_t> publicKey = fixturePublicKey("coordinatorPublicKeyBase64");
+
+    const showmesh::fallback::ActivationResolution resolution = showmesh::fallback::ResolveActivationFromDocument(
+        "entry-0", document, publicKey, timeFromMillis(clockBeforeExpiry()));
+
+    CHECK(resolution.kind == showmesh::fallback::ActivationResolveKind::kMatch);
+    CHECK(resolution.match.has_value());
+    CHECK_EQ(resolution.match->packageId, std::string(kValidPackageId));
+    CHECK_EQ(resolution.match->revision, std::string(kValidRevision));
+    CHECK_EQ(resolution.match->fppInstanceUuid, std::string(kExpectedInstanceUuid));
+    CHECK_EQ(resolution.match->entryKey, std::string("entry-0"));
+    CHECK_EQ(resolution.match->cueId, std::string("cue-a"));
+    CHECK_EQ(resolution.match->cueRevision, static_cast<std::int64_t>(3));
+    CHECK(resolution.match->generation.has_value());
+    CHECK_EQ(*resolution.match->generation, static_cast<std::int64_t>(1));
+    CHECK_EQ(resolution.match->targets.size(), static_cast<size_t>(1));
+
+    const showmesh::fallback::ActivationTarget& target = resolution.match->targets[0];
+    CHECK_EQ(target.nodeId, std::string("node-a"));
+    CHECK(target.render.has_value());
+    CHECK(!target.audio.has_value());
+    CHECK_EQ(stringMember(*target.render, "sequence"), std::string("seq-a"));
+    CHECK_EQ(stringMember(*target.render, "filename"), std::string("seq-a.fseq"));
 }
