@@ -14,6 +14,7 @@
 #include "showmesh/brightness.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/callback_handoff.h"
+#include "showmesh/definition_republish.h"
 #include "showmesh/playlist_identity.h"
 #include "showmesh/sequence_store.h"
 #include "showmesh/transition_gain.h"
@@ -161,6 +162,16 @@ class DefinitionPublisher {
     // See ObservationSink::requestStop(); the same reasoning applies to a
     // definition post stuck in backoff during sweepDefinitions().
     virtual void requestStop() {}
+
+    // Drops every hash this publisher believes the coordinator holds and
+    // reports all three counts from the one critical section that clears
+    // it. Called from fppd's web thread, so the set must be guarded. The
+    // terminally refused set is deliberately not cleared: those refusals
+    // cannot change until the plugin restarts.
+    virtual DefinitionHoldings clearHeldDefinitions() = 0;
+    // The same counts without clearing anything, for section 3.9's
+    // idempotent repeat. cleared is not meaningful here and is left 0.
+    virtual DefinitionHoldings definitionHoldings() const = 0;
 };
 
 // Clock is injected so the whole runtime is testable without waiting.
@@ -243,6 +254,14 @@ class ShowMeshRuntime {
     // a handler that handed this work to another thread would step outside
     // it and make the plugin unsafe to unload. Keep this synchronous.
     TransitionGainResponse applyTransitionGain(const std::string& body);
+
+    // Serves one contract section 3.9 republish. Called from fppd's own
+    // web thread, and synchronous for exactly the reason
+    // applyTransitionGain() is. It clears the publisher's held set and
+    // records that a sweep is owed; the sweep itself runs on the worker
+    // thread, because it reads every definition on the host and posts
+    // each one with the retry policy's full backoff budget.
+    DefinitionRepublishResponse applyDefinitionRepublish(const std::string& body);
 
     // Called from FPP's own callback thread. Bounded work only: copy and
     // return.
@@ -432,9 +451,36 @@ class ShowMeshRuntime {
     // Test seam only; see setTestHookBeforeWait().
     std::function<void()> testHookBeforeWait_;
 
-    // Worker-thread only; see sweepDefinitions().
+    // Worker-thread only; see sweepDefinitions(). The inbound republish
+    // route never touches these: see sweepRequested_.
     bool sweptOnce_ = false;
     TimeMillis lastSweepMillis_ = 0;
+
+    // The owed-sweep record contract section 3.9 requires, and the only
+    // state the HTTP thread and the worker thread share for it. The route
+    // increments sweepRequested_; the worker sweeps whenever the two
+    // disagree, regardless of the cadence above, and then stores the
+    // value it observed at the start of that sweep into sweepCompleted_.
+    // Counters rather than a flag so a republish arriving mid-sweep is
+    // not swallowed by the sweep that was already running.
+    std::atomic<std::uint64_t> sweepRequested_{0};
+    std::atomic<std::uint64_t> sweepCompleted_{0};
+
+    // The republish route's idempotency memory and the SweepRecord it
+    // writes through. republishMutex_ guards the id alone; the held-set
+    // clear runs under the publisher's own lock.
+    class RuntimeSweepRecord : public SweepRecord {
+     public:
+        explicit RuntimeSweepRecord(ShowMeshRuntime* runtime) : runtime_(runtime) {}
+        void requestSweep() override;
+        bool sweepPending() const override;
+
+     private:
+        ShowMeshRuntime* runtime_;
+    };
+    RuntimeSweepRecord sweepRecord_{this};
+    std::mutex republishMutex_;
+    std::string lastRepublishRequestId_;
 
     std::atomic<std::uint64_t> published_{0};
     std::atomic<std::uint64_t> unavailable_{0};
