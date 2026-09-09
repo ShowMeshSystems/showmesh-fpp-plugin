@@ -454,6 +454,13 @@ bool ShowMeshRuntime::maybeSweepDefinitions() {
 
 void ShowMeshRuntime::workerLoop() {
     workerActive_.store(true);
+    // Exactly once, before this thread's first pass over drainOnce():
+    // see FallbackActivationRecorder::performStartupFetch()'s own doc
+    // comment for why this runs here rather than in that recorder's
+    // constructor. workerLoop() itself only ever runs once per start(),
+    // so no separate "already attempted" flag is needed to keep this to
+    // one call.
+    if (fallbackRecorder_ != nullptr) fallbackRecorder_->performStartupFetch();
     while (running_.load()) {
         while (drainOnce()) {
             if (!running_.load()) {
@@ -484,8 +491,11 @@ void ShowMeshRuntime::stop() {
     // A worker stuck inside publish() or publishDefinition(), retrying
     // against an unreachable coordinator, must be interrupted before the
     // join below waits on it, not after: the join itself has no timeout.
+    // A worker stuck inside performStartupFetch() is the identical
+    // hazard, one time only, at start rather than per observation.
     if (sink_ != nullptr) sink_->requestStop();
     if (definitionPublisher_ != nullptr) definitionPublisher_->requestStop();
+    if (fallbackRecorder_ != nullptr) fallbackRecorder_->requestStop();
     {
         std::lock_guard<std::mutex> lock(wakeMutex_);
         hasWork_ = true;
