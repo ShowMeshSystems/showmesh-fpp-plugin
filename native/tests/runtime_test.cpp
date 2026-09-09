@@ -114,6 +114,19 @@ class RecordingSink : public ObservationSink {
     bool acceptUnavailable = true;
 };
 
+class RecordingFallbackActivationRecorder : public showmesh::FallbackActivationRecorder {
+ public:
+    void recordEntryKeyResolution(const std::string& entryKey, TimeMillis observedAtMillis) override {
+        calls.push_back({entryKey, observedAtMillis});
+    }
+
+    struct Call {
+        std::string entryKey;
+        TimeMillis observedAtMillis;
+    };
+    std::vector<Call> calls;
+};
+
 // A transport that answers 200 and records what actually reached the
 // wire. Used to run an unavailable observation through the real
 // CoordinatorClient and the real buildObservationBody(), rather than
@@ -272,6 +285,49 @@ TEST(TheSequenceIsMonotonicAcrossObservations) {
     for (std::size_t i = 0; i < sink.published.size(); ++i) {
         CHECK_EQ(sink.published[i].sequence, static_cast<std::uint64_t>(i + 1));
     }
+}
+
+TEST(AFallbackRecorderIsCalledOnceWithTheAlreadyComputedEntryKey) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    RecordingFallbackActivationRecorder recorder;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
+                            showmesh::kDefaultSafeCeilingPercent, &recorder);
+
+    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "song.mp3");
+    CHECK(runtime.drainOnce());
+
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(recorder.calls.size(), static_cast<std::size_t>(1));
+    // The exact same key the sink's own observation carries: never a
+    // second, independently derived value.
+    CHECK_EQ(recorder.calls[0].entryKey, sink.published[0].entryKey);
+    CHECK_EQ(recorder.calls[0].observedAtMillis, sink.published[0].observedAtMillis);
+}
+
+TEST(AFallbackRecorderIsNotCalledWhenIdentityDidNotResolve) {
+    FakeDefinitions definitions;
+    definitions.definition = "";
+    RecordingSink sink;
+    RecordingFallbackActivationRecorder recorder;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
+                            showmesh::kDefaultSafeCeilingPercent, &recorder);
+
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 2, "a.fseq", "song.mp3");
+    CHECK(runtime.drainOnce());
+
+    CHECK_EQ(sink.unavailable.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(recorder.calls.size(), static_cast<std::size_t>(0));
+}
+
+TEST(AnAbsentFallbackRecorderIsNotACrash) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+
+    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "song.mp3");
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(1));
 }
 
 TEST(AMissingDefinitionProducesAnUnavailableObservationNotAGuess) {
