@@ -330,7 +330,10 @@ The weather gate rides the same record but is not subject to that darker-only
 comparison: a restart trusts it directly off whatever record it can read,
 including a recovered backup whose ceiling and gain are not trusted for
 timing purposes, so a restart with a persisted closed gate comes back closed
-before the first frame is written. `ShowMeshRuntime::applyWeatherGate()` also
+before the first frame is written. A flush that changes the gate writes the
+record twice, so the rotated backup always agrees with the primary on the
+gate. With both records unreadable the gate restarts open.
+`ShowMeshRuntime::applyWeatherGate()` also
 flushes brightness state synchronously on an applied write, unlike the
 transition-gain write: a closed gate must survive a restart even when `fppd`
 is not currently outputting frames and would otherwise never reach the

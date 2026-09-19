@@ -106,6 +106,7 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
     const int clampedSafeCeilingPercent = std::min(std::max(safeCeilingPercent, kMinPercent), kMaxPercent);
     if (brightnessStore_ != nullptr) {
         BrightnessStateLoad loaded = brightnessStore_->load();
+        storedGateClosed_ = loaded.ok && loaded.state.weatherGateClosed;
         if (loaded.ok && loaded.trustedAsCurrent) {
             std::lock_guard<std::mutex> lock(engineMutex_);
             engine_.restoreFromPersisted(loaded.state, clock_());
@@ -242,8 +243,17 @@ StateAdoption ShowMeshRuntime::adoptEncodedFullState(const std::uint8_t* data, i
     BrightnessStateDecode decoded =
         decodeBrightnessState(std::string(reinterpret_cast<const char*>(data), static_cast<std::size_t>(length)));
     if (!decoded.ok) return StateAdoption::kRejectedUnsupportedVersion;
-    std::lock_guard<std::mutex> lock(engineMutex_);
-    return engine_.adoptState(decoded.state, clock_());
+    bool gateJustClosed;
+    StateAdoption result;
+    {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        const bool wasClosed = engine_.weatherGateClosed();
+        result = engine_.adoptState(decoded.state, clock_());
+        gateJustClosed = !wasClosed && engine_.weatherGateClosed();
+    }
+    // Persisted by the worker now, not at the next frame, which an idle host may never output.
+    if (gateJustClosed) markBrightnessDirty();
+    return result;
 }
 
 bool ShowMeshRuntime::drainOnce() {
@@ -367,6 +377,9 @@ bool ShowMeshRuntime::flushSequenceState() {
 
 bool ShowMeshRuntime::flushBrightnessState() {
     if (brightnessStore_ == nullptr) return true;
+    // The weather-gate route flushes from the web thread while the worker may
+    // be flushing too; both share one temp file, and the later capture must land last.
+    std::lock_guard<std::mutex> flushLock(brightnessFlushMutex_);
     BrightnessState state;
     {
         std::lock_guard<std::mutex> lock(engineMutex_);
@@ -382,8 +395,12 @@ bool ShowMeshRuntime::flushBrightnessState() {
     // with engineMutex_ already released: a slow write against a real SD
     // card must never hold modifyChannelData (or another flush caller)
     // waiting on the same mutex for its duration.
-    const bool ok = brightnessStore_->store(state);
+    bool ok = brightnessStore_->store(state);
+    // A gate change is written twice so rotation leaves the backup agreeing
+    // with the primary on the gate: a recovered backup then restores it too.
+    if (ok && storedGateClosed_ != state.weatherGateClosed) ok = brightnessStore_->store(state);
     if (ok) {
+        storedGateClosed_ = state.weatherGateClosed;
         std::lock_guard<std::mutex> lock(engineMutex_);
         flushedBrightnessRevision_ = state.revision;
         brightnessEverFlushed_ = true;

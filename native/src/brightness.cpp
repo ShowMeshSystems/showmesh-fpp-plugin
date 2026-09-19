@@ -259,6 +259,13 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state, TimeMil
     if (state.schemaVersion != kBrightnessStateSchemaVersion) {
         return StateAdoption::kRejectedUnsupportedVersion;
     }
+    // A peer's closed gate is adopted before any ordering-key or fade check,
+    // so a skewed peer clock cannot keep this host lit. An open gate is never
+    // adopted: only setWeatherGate (the coordinator write) opens it.
+    if (state.weatherGateClosed && !gateClosed_) {
+        gateClosed_ = true;
+        ++revision_;
+    }
     if (!timestampIsPlausible(state.stateChangedAtMillis)) {
         return StateAdoption::kRejectedImplausibleTimestamp;
     }
@@ -281,17 +288,6 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state, TimeMil
     if (!fadeWindowIsPlausible(state.ceilingFadeStartMillis, state.ceilingFadeEndMillis) ||
         !fadeWindowIsPlausible(state.gainFadeStartMillis, state.gainFadeEndMillis)) {
         return StateAdoption::kRejectedInvalidFadeWindow;
-    }
-
-    // The weather gate is not part of the ordering key: a peer's closed
-    // gate is always adopted here, whatever the ordering key says below,
-    // and an open one is never adopted from a peer at all -- only
-    // BrightnessEngine::setWeatherGate (the coordinator write) opens it.
-    // Structurally invalid payloads were already refused above, so this
-    // still cannot be forced by a hostile timestamp or fade window.
-    if (state.weatherGateClosed && !gateClosed_) {
-        gateClosed_ = true;
-        ++revision_;
     }
 
     // Full state is ordered by (stateChangedAtMillis, instanceId,

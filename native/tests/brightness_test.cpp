@@ -1094,3 +1094,22 @@ TEST(SettleSafeAfterUntrustedRestartHonorsAPreviousGoodRecordsGate) {
     CHECK(closed.weatherGateClosed());
     CHECK_NEAR(closed.ceilingAt(kT0), 25.0, 1e-9);
 }
+
+// The gate ignores the ordering key entirely, including its plausibility:
+// a peer whose clock is skewed still closes this host's gate.
+TEST(APeersClosedGateIsAdoptedEvenWithAnImplausibleTimestamp) {
+    for (TimeMillis skewed : {TimeMillis{1000}, kT0 + showmesh::kMaxOrderingKeyAheadOfNowMillis + 60'000}) {
+        BrightnessEngine local;
+        local.setInstanceId("local");
+        CHECK(local.setCeiling(80, 0, kT0).ok);
+
+        BrightnessState peer = local.captureState(kT0);
+        peer.instanceId = "peer";
+        peer.stateChangedAtMillis = skewed;
+        peer.weatherGateClosed = true;
+
+        CHECK(local.adoptState(peer, kT0) == StateAdoption::kRejectedImplausibleTimestamp);
+        CHECK_NEAR(local.ceilingAt(kT0), 80.0, 1e-9);
+        CHECK(local.weatherGateClosed());
+    }
+}

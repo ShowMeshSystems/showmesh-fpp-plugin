@@ -1770,3 +1770,68 @@ TEST(ARestartWithAPersistedClosedGateIsDarkOnTheFirstFrame) {
 
     gNow = savedNow;
 }
+
+// A gate closed by a peer must reach disk without waiting for a frame:
+// an idle host restarted before its next frame would otherwise come back
+// open while the rest of the group is closed.
+TEST(APeerClosedGateIsPersistedWithoutAFrame) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+        CHECK(runtime.flushBrightnessState());
+
+        showmesh::BrightnessEngine peer;
+        peer.setInstanceId("peer");
+        peer.setWeatherGate(true, gNow);
+        const std::string payload = showmesh::encodeBrightnessState(peer.captureState(gNow));
+        runtime.adoptEncodedFullState(reinterpret_cast<const std::uint8_t*>(payload.data()),
+                                      static_cast<int>(payload.size()));
+        CHECK(runtime.brightness()->weatherGateClosed());
+        CHECK(runtime.flushBrightnessIfDirty());
+    }
+    BrightnessFileStore store(dir.path());
+    const showmesh::BrightnessStateLoad loaded = store.load();
+    CHECK(loaded.ok);
+    CHECK(loaded.state.weatherGateClosed);
+}
+
+namespace {
+
+// Writes the gate through the route, optionally corrupts the primary
+// (and the backup), then reports the gate a restarted runtime comes back with.
+bool gateAfterRestart(const std::vector<bool>& writes, bool corruptPrimary, bool corruptBackup) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+        CHECK(runtime.applyBrightnessCommand("100", "0").ok);
+        CHECK(runtime.flushBrightnessState());
+        for (bool closed : writes) {
+            ++gNow;
+            CHECK_EQ(runtime.applyWeatherGate(closed ? R"({"closed":true})" : R"({"closed":false})").status, 200);
+        }
+    }
+    if (corruptPrimary) std::ofstream(dir.path() + "/brightness-state", std::ios::trunc) << "not a valid record";
+    if (corruptBackup) std::ofstream(dir.path() + "/brightness-state.bak", std::ios::trunc) << "not a valid record";
+    RecordingSink secondSink;
+    BrightnessFileStore store(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &store);
+    return restarted.brightness()->weatherGateClosed();
+}
+
+}  // namespace
+
+// The backup is what a restart falls back to when the primary is
+// unreadable, so it must never disagree with the primary about the gate.
+TEST(AnUnreadablePrimaryRestoresTheGateFromTheBackupInBothDirections) {
+    CHECK(gateAfterRestart({true}, true, false));
+    CHECK(!gateAfterRestart({true, false}, true, false));
+    CHECK(gateAfterRestart({true, false, true}, true, false));
+    // Both records unreadable: the gate restarts open, as before this change.
+    CHECK(!gateAfterRestart({true}, true, true));
+}

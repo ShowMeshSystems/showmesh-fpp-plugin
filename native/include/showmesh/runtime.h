@@ -396,9 +396,8 @@ class ShowMeshRuntime {
     // state; the store's actual write -- a read, a hash, two fsyncs, and
     // a rename -- runs with the lock released, so a caller never blocks
     // modifyChannelData, or another flush caller, for the duration of a
-    // slow write. Safe to call from any thread; callers do not need to
-    // serialize against each other, only against engine_ itself the way
-    // every other engine_ access already does.
+    // slow write. Safe to call from any thread: concurrent callers are
+    // serialized on brightnessFlushMutex_, never on engineMutex_.
     bool flushBrightnessState();
 
     // Marks the engine's brightness state as needing to be persisted,
@@ -515,6 +514,11 @@ class ShowMeshRuntime {
     // backup slot for nothing.
     std::uint64_t flushedBrightnessRevision_ = 0;
     bool brightnessEverFlushed_ = false;
+    // Held across a whole flushBrightnessState(), capture through store.
+    std::mutex brightnessFlushMutex_;
+    // Guarded by brightnessFlushMutex_: the gate both on-disk records last
+    // agreed on. No readable record reads as open, which is what restart does.
+    bool storedGateClosed_ = false;
     std::atomic<bool> running_{false};
     // True only while workerLoop() is on the stack. It is what lets a
     // sweep abandon its remaining definitions when stop() is waiting to
