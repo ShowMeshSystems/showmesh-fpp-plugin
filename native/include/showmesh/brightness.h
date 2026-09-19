@@ -111,6 +111,14 @@ struct BrightnessState {
     double lastAppliedCeiling = 100.0;
     double lastAppliedGain = 100.0;
     TimeMillis persistedAtMillis = 0;
+
+    // The weather gate: closed forces every output channel dark,
+    // independent of the ceiling and gain. Optional on decode: a payload
+    // written before this field existed decodes with it false ("not
+    // mentioned"), which is also the correct default for a genuine first
+    // run. See BrightnessEngine::adoptState and ::restoreFromPersisted for
+    // what "not mentioned" means on each path.
+    bool weatherGateClosed = false;
 };
 
 enum class StateAdoption {
@@ -168,14 +176,25 @@ class BrightnessEngine {
     double ceilingAt(TimeMillis now) const { return ceiling_.valueAt(now); }
     double gainAt(TimeMillis now) const { return gain_.valueAt(now); }
 
-    // The composed percentage actually applied to channel data.
+    // The composed percentage actually applied to channel data: 0 whenever
+    // the weather gate is closed, round(ceiling * gain / 100) otherwise.
     int effectivePercentAt(TimeMillis now) const;
 
     bool fadingAt(TimeMillis now) const { return ceiling_.fadingAt(now) || gain_.fadingAt(now); }
 
     // Scales one frame in place. Channels outside the configured ranges,
-    // and channels inside an exclusion, are not written at all.
+    // and channels inside an exclusion, are not written at all -- unless
+    // the weather gate is closed, in which case every channel the plugin
+    // can write goes to 0 regardless of range configuration.
     void applyToFrame(std::uint8_t* channelData, std::size_t channelCount, TimeMillis now);
+
+    // Whether the weather gate is currently closed. See setWeatherGate.
+    bool weatherGateClosed() const { return gateClosed_; }
+
+    // The coordinator-facing weather-gate write (showmesh/weather_gate.h).
+    // No fade: closing and opening are immediate, and a ceiling or gain
+    // fade keeps running underneath so opening reveals its current value.
+    void setWeatherGate(bool closed, TimeMillis now);
 
     // Full-state exchange. captureState is what this node publishes and
     // persists; adoptState is what it does with another node's or a
@@ -211,7 +230,13 @@ class BrightnessEngine {
     // rule bumpRevision applies elsewhere), so the settle is published
     // and a MultiSync group can converge on it instead of a settled node
     // sitting silent forever.
-    void settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now);
+    //
+    // gateClosed carries whatever the best record this restart could find
+    // said about the weather gate, independent of whether that record's
+    // ceiling/gain timing is trusted: an unreadable primary does not mean
+    // an unreadable gate when a recovered backup still names one. Defaults
+    // to false (open) for the case where no record exists to read at all.
+    void settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now, bool gateClosed = false);
 
     std::uint64_t revision() const { return revision_; }
 
@@ -238,6 +263,9 @@ class BrightnessEngine {
     std::string instanceId_;
     double lastAppliedCeiling_ = 100.0;
     double lastAppliedGain_ = 100.0;
+    // Defaults open. See setWeatherGate, adoptState, and
+    // restoreFromPersisted for how each path may change it.
+    bool gateClosed_ = false;
 
     // The MultiSync ordering key of the state this engine currently holds,
     // stored rather than recomputed on every comparison: see

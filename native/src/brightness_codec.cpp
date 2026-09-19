@@ -46,6 +46,21 @@ bool readNumber(const json::Value& object, const char* name, double* out, std::s
     return true;
 }
 
+// The one field this codec treats as optional: a record written before
+// the weather gate existed decodes with it defaulted to false ("not
+// mentioned"), rather than failing the whole payload the way a missing
+// required field does below.
+bool readOptionalBool(const json::Value& object, const char* name, bool defaultValue, bool* out) {
+    const json::Value* v = member(object, name);
+    if (v == nullptr) {
+        *out = defaultValue;
+        return true;
+    }
+    if (v->type() != json::Type::kBool) return false;
+    *out = v->boolean();
+    return true;
+}
+
 bool readString(const json::Value& object, const char* name, std::string* out, std::string* error) {
     const json::Value* v = member(object, name);
     if (v == nullptr || v->type() != json::Type::kString) {
@@ -108,6 +123,7 @@ std::string encodeBrightnessState(const BrightnessState& state) {
     addNumber(&members, "lastAppliedCeiling", state.lastAppliedCeiling);
     addNumber(&members, "lastAppliedGain", state.lastAppliedGain);
     addNumber(&members, "persistedAtMillis", static_cast<double>(state.persistedAtMillis));
+    members.emplace_back("weatherGateClosed", json::Value::makeBool(state.weatherGateClosed));
 
     json::CanonicalResult canonical = json::canonicalize(json::Value::makeObject(std::move(members)));
     return canonical.ok ? canonical.text : std::string();
@@ -144,6 +160,10 @@ BrightnessStateDecode decodeBrightnessState(const std::string& text) {
     if (!readNumber(parsed.value, "lastAppliedCeiling", &s.lastAppliedCeiling, &result.error)) return result;
     if (!readNumber(parsed.value, "lastAppliedGain", &s.lastAppliedGain, &result.error)) return result;
     if (!readMillis(parsed.value, "persistedAtMillis", &s.persistedAtMillis, &result.error)) return result;
+    if (!readOptionalBool(parsed.value, "weatherGateClosed", false, &s.weatherGateClosed)) {
+        result.error = "field \"weatherGateClosed\" must be a boolean";
+        return result;
+    }
 
     s.schemaVersion = static_cast<int>(schemaVersion);
     s.revision = static_cast<std::uint64_t>(revision);

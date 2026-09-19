@@ -1710,3 +1710,63 @@ TEST(ThePassCounterRidesAnUnavailableObservationToo) {
     CHECK(sink.unavailable[0].playlistLoop.has_value());
     CHECK_EQ(*sink.unavailable[0].playlistLoop, 4);
 }
+
+// The weather-gate write's own acceptance property: a closed gate must be
+// durable immediately, not only once a frame happens to pass through
+// modifyChannelData, because a host can be closed for weather ahead of a
+// show that has not started outputting yet.
+TEST(ApplyWeatherGateFlushesImmediatelyWithoutAFrame) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    BrightnessFileStore store(dir.path());
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+
+    const showmesh::WeatherGateResponse r = runtime.applyWeatherGate(R"({"closed":true})");
+    CHECK_EQ(r.status, 200);
+
+    showmesh::BrightnessStateLoad loaded = store.load();
+    CHECK(loaded.ok);
+    CHECK(loaded.state.weatherGateClosed);
+}
+
+TEST(WeatherGateStateReadsWithoutWritingAnything) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+
+    const showmesh::WeatherGateResponse r = runtime.weatherGateState();
+    CHECK_EQ(r.status, 200);
+    CHECK(r.body.find(R"("applied":false)") != std::string::npos);
+    CHECK(r.body.find(R"("weatherGateClosed":false)") != std::string::npos);
+}
+
+// The full observable acceptance property: a plugin restart with a
+// persisted closed gate is dark on the very first frame, before any
+// command or MultiSync payload could reopen it.
+TEST(ARestartWithAPersistedClosedGateIsDarkOnTheFirstFrame) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    const TimeMillis savedNow = gNow;
+    std::vector<std::uint8_t> frame(4, 0xff);
+
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+        CHECK(runtime.applyBrightnessCommand("100", "0").ok);
+        CHECK_EQ(runtime.applyWeatherGate(R"({"closed":true})").status, 200);
+    }
+
+    RecordingSink secondSink;
+    BrightnessFileStore secondStore(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore);
+
+    CHECK(restarted.brightness()->weatherGateClosed());
+    restarted.modifyChannelData(frame.data(), frame.size());
+    for (std::uint8_t v : frame) {
+        CHECK_EQ(static_cast<int>(v), 0);
+    }
+
+    gNow = savedNow;
+}

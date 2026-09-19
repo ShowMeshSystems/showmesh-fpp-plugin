@@ -18,6 +18,7 @@
 #include "showmesh/playlist_identity.h"
 #include "showmesh/sequence_store.h"
 #include "showmesh/transition_gain.h"
+#include "showmesh/weather_gate.h"
 
 // The adapter-facing runtime. Everything here is shared by the FPP 9 and
 // FPP 10 adapters and knows nothing about either one's plugin lifecycle or
@@ -314,6 +315,18 @@ class ShowMeshRuntime {
     // a handler that handed this work to another thread would step outside
     // it and make the plugin unsafe to unload. Keep this synchronous.
     TransitionGainResponse applyTransitionGain(const std::string& body);
+
+    // Serves the weather-gate write registered beside the transition-gain
+    // route. Synchronous for the same reason. Unlike applyTransitionGain,
+    // an applied write also flushes brightness state immediately: a
+    // closed gate must survive a restart even when fppd is not currently
+    // outputting frames, so it cannot wait for modifyChannelData's own
+    // per-frame dirty mark the way a ceiling or gain change can.
+    WeatherGateResponse applyWeatherGate(const std::string& body);
+
+    // Serves the GET route registered beside the write: the current state,
+    // never a write.
+    WeatherGateResponse weatherGateState();
 
     // Serves one contract section 3.9 republish. Called from fppd's own
     // web thread, and synchronous for exactly the reason

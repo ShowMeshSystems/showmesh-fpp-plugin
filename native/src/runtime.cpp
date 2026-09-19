@@ -110,10 +110,13 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
             std::lock_guard<std::mutex> lock(engineMutex_);
             engine_.restoreFromPersisted(loaded.state, clock_());
         } else if (loaded.ok) {
-            // Primary unreadable; only the superseded backup parsed.
+            // Primary unreadable; only the superseded backup parsed. The
+            // backup is still a previous good record for the gate's own
+            // purposes, so it stays closed here if the backup said so,
+            // even though the ceiling and gain settle to the safe value.
             brightnessRestartTrust_ = BrightnessRestartTrust::kPrimaryUnreadableBackupRecovered;
             std::lock_guard<std::mutex> lock(engineMutex_);
-            engine_.settleSafeAfterUntrustedRestart(clampedSafeCeilingPercent, clock_());
+            engine_.settleSafeAfterUntrustedRestart(clampedSafeCeilingPercent, clock_(), loaded.state.weatherGateClosed);
         } else if (loaded.recordExpectedButUnreadable) {
             // Neither file parsed, despite one existing.
             brightnessRestartTrust_ = BrightnessRestartTrust::kNeitherRecordReadable;
@@ -184,6 +187,24 @@ void ShowMeshRuntime::observeCallback(const char* playlistName, const char* acti
 TransitionGainResponse ShowMeshRuntime::applyTransitionGain(const std::string& body) {
     std::lock_guard<std::mutex> lock(engineMutex_);
     return applyTransitionGainRequest(body, &engine_, &lastTransitionGainRequestId_, clock_());
+}
+
+WeatherGateResponse ShowMeshRuntime::applyWeatherGate(const std::string& body) {
+    WeatherGateResponse result;
+    {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        result = applyWeatherGateRequest(body, &engine_, clock_());
+    }
+    // See the declaration's comment: an applied gate change must be
+    // durable before this returns, not merely marked dirty for the next
+    // output frame, which may never come if fppd is not currently playing.
+    if (result.status == 200) flushBrightnessState();
+    return result;
+}
+
+WeatherGateResponse ShowMeshRuntime::weatherGateState() {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    return renderWeatherGateState(&engine_, clock_());
 }
 
 void ShowMeshRuntime::RuntimeSweepRecord::requestSweep() {
