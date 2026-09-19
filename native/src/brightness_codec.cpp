@@ -124,6 +124,7 @@ std::string encodeBrightnessState(const BrightnessState& state) {
     addNumber(&members, "lastAppliedGain", state.lastAppliedGain);
     addNumber(&members, "persistedAtMillis", static_cast<double>(state.persistedAtMillis));
     members.emplace_back("weatherGateClosed", json::Value::makeBool(state.weatherGateClosed));
+    addNumber(&members, "weatherGateRevision", static_cast<double>(state.weatherGateRevision));
 
     json::CanonicalResult canonical = json::canonicalize(json::Value::makeObject(std::move(members)));
     return canonical.ok ? canonical.text : std::string();
@@ -163,6 +164,15 @@ BrightnessStateDecode decodeBrightnessState(const std::string& text) {
     if (!readOptionalBool(parsed.value, "weatherGateClosed", false, &s.weatherGateClosed)) {
         result.error = "field \"weatherGateClosed\" must be a boolean";
         return result;
+    }
+    // Optional like the gate itself: a record or peer without it reads as revision 0.
+    if (member(parsed.value, "weatherGateRevision") != nullptr) {
+        double gateRevision = 0.0;
+        if (!readBoundedCount(parsed.value, "weatherGateRevision", static_cast<double>(kMaxWeatherGateRevision),
+                              &gateRevision, &result.error)) {
+            return result;
+        }
+        s.weatherGateRevision = static_cast<std::uint64_t>(gateRevision);
     }
 
     s.schemaVersion = static_cast<int>(schemaVersion);

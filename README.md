@@ -164,7 +164,14 @@ where range configuration is ignored. It is written at
 `/showmesh/brightness/weather-gate`, registered beside the transition-gain
 route with the same registration, authentication, body-size, and refusal
 handling, and is deliberately not reachable from any FPP action or schedule
-for the same reason the transition gain is not.
+for the same reason the transition gain is not. The body is exactly
+`{"closed": true|false, "revision": <integer 0..2^53-1>}`, where the
+coordinator issues the revision; a missing or out-of-range revision is
+refused without changing state. A valid write always applies, whatever its
+revision, and leaves the stored gate revision at
+max(stored revision + 1, the given revision), so a coordinator that restarts
+its numbering can still close the gate. The response and the `GET` document
+report it as `weatherGateRevision`.
 
 Full state, including any active fade and the weather gate, is what nodes
 exchange and what is persisted: never a relative adjustment, so a duplicated
@@ -175,11 +182,15 @@ applied value and the target. It never comes back brighter than what it was
 already applying. The gate is not part of that darker-only comparison; it is
 its own switch, trusted directly off whatever record can be read regardless
 of whether that record's fade timing is trusted. Over MultiSync, a peer's
-closed gate is always adopted, whatever the ordering key says; a peer's open
-gate is never adopted, since only the coordinator's own write may open a
-gate this host has closed. A payload from before this field existed decodes
-with it absent, which is treated as "not mentioned" rather than "open": for
-a peer payload that means no change, and for a persisted record it means no
+closed gate is adopted only when its gate revision is strictly greater than
+this host's, and adopting it takes that revision; this is independent of the
+ordering key and its timestamp checks. A peer's open gate is never adopted,
+since only the coordinator's own write may open a gate. Because a resume
+opens each host at a newer revision than the close, a host still closed at
+the older revision cannot re-close one the coordinator already opened, and
+a later close at a newer revision still spreads. A payload from before this
+field existed decodes with it absent, which is treated as "not mentioned"
+rather than "open": for a peer payload that means no change, and for a persisted record it means no
 record has ever said closed.
 
 **Playlist identity.** The canonical playlist hash is SHA-256 over the RFC 8785
@@ -330,9 +341,10 @@ The weather gate rides the same record but is not subject to that darker-only
 comparison: a restart trusts it directly off whatever record it can read,
 including a recovered backup whose ceiling and gain are not trusted for
 timing purposes, so a restart with a persisted closed gate comes back closed
-before the first frame is written. A flush that changes the gate writes the
-record twice, so the rotated backup always agrees with the primary on the
-gate. With both records unreadable the gate restarts open.
+before the first frame is written. A flush that changes the gate or its
+revision writes the record twice, so the rotated backup always agrees with the primary on the
+gate and its revision. A record without a revision reads as revision 0.
+With both records unreadable the gate restarts open at revision 0.
 `ShowMeshRuntime::applyWeatherGate()` also
 flushes brightness state synchronously on an applied write, unlike the
 transition-gain write: a closed gate must survive a restart even when `fppd`

@@ -107,6 +107,7 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
     if (brightnessStore_ != nullptr) {
         BrightnessStateLoad loaded = brightnessStore_->load();
         storedGateClosed_ = loaded.ok && loaded.state.weatherGateClosed;
+        storedGateRevision_ = loaded.ok ? loaded.state.weatherGateRevision : 0;
         if (loaded.ok && loaded.trustedAsCurrent) {
             std::lock_guard<std::mutex> lock(engineMutex_);
             engine_.restoreFromPersisted(loaded.state, clock_());
@@ -117,7 +118,8 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
             // even though the ceiling and gain settle to the safe value.
             brightnessRestartTrust_ = BrightnessRestartTrust::kPrimaryUnreadableBackupRecovered;
             std::lock_guard<std::mutex> lock(engineMutex_);
-            engine_.settleSafeAfterUntrustedRestart(clampedSafeCeilingPercent, clock_(), loaded.state.weatherGateClosed);
+            engine_.settleSafeAfterUntrustedRestart(clampedSafeCeilingPercent, clock_(), loaded.state.weatherGateClosed,
+                                                    loaded.state.weatherGateRevision);
         } else if (loaded.recordExpectedButUnreadable) {
             // Neither file parsed, despite one existing.
             brightnessRestartTrust_ = BrightnessRestartTrust::kNeitherRecordReadable;
@@ -243,16 +245,16 @@ StateAdoption ShowMeshRuntime::adoptEncodedFullState(const std::uint8_t* data, i
     BrightnessStateDecode decoded =
         decodeBrightnessState(std::string(reinterpret_cast<const char*>(data), static_cast<std::size_t>(length)));
     if (!decoded.ok) return StateAdoption::kRejectedUnsupportedVersion;
-    bool gateJustClosed;
+    bool gateAdopted;
     StateAdoption result;
     {
         std::lock_guard<std::mutex> lock(engineMutex_);
-        const bool wasClosed = engine_.weatherGateClosed();
+        const std::uint64_t gateRevisionBefore = engine_.weatherGateRevision();
         result = engine_.adoptState(decoded.state, clock_());
-        gateJustClosed = !wasClosed && engine_.weatherGateClosed();
+        gateAdopted = engine_.weatherGateRevision() != gateRevisionBefore;
     }
     // Persisted by the worker now, not at the next frame, which an idle host may never output.
-    if (gateJustClosed) markBrightnessDirty();
+    if (gateAdopted) markBrightnessDirty();
     return result;
 }
 
@@ -398,9 +400,12 @@ bool ShowMeshRuntime::flushBrightnessState() {
     bool ok = brightnessStore_->store(state);
     // A gate change is written twice so rotation leaves the backup agreeing
     // with the primary on the gate: a recovered backup then restores it too.
-    if (ok && storedGateClosed_ != state.weatherGateClosed) ok = brightnessStore_->store(state);
+    if (ok && (storedGateClosed_ != state.weatherGateClosed || storedGateRevision_ != state.weatherGateRevision)) {
+        ok = brightnessStore_->store(state);
+    }
     if (ok) {
         storedGateClosed_ = state.weatherGateClosed;
+        storedGateRevision_ = state.weatherGateRevision;
         std::lock_guard<std::mutex> lock(engineMutex_);
         flushedBrightnessRevision_ = state.revision;
         brightnessEverFlushed_ = true;

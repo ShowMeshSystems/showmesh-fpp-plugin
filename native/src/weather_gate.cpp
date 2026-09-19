@@ -1,6 +1,7 @@
 #include "showmesh/weather_gate.h"
 
 #include <cmath>
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -27,7 +28,8 @@ WeatherGateResponse refuse(const std::string& detail) { return WeatherGateRespon
 
 // The same full state document the transition-gain route renders (gain
 // start/target, the fade duration, the ceiling, and the composed effective
-// output), extended with weatherGateClosed and effectiveOutputPercent. A
+// output), extended with weatherGateClosed, weatherGateRevision, and
+// effectiveOutputPercent. A
 // weather-gate write never starts a gain fade, so gainStart and gainTarget
 // both read the gain as it stands, and fadeSeconds is always 0.
 WeatherGateResponse renderDocument(bool applied, const BrightnessEngine& engine, TimeMillis now) {
@@ -44,6 +46,7 @@ WeatherGateResponse renderDocument(bool applied, const BrightnessEngine& engine,
     members.emplace_back("ceiling", json::Value::makeNumber(ceilingNow));
     members.emplace_back("effectiveOutput", json::Value::makeNumber(effective));
     members.emplace_back("weatherGateClosed", json::Value::makeBool(engine.weatherGateClosed()));
+    members.emplace_back("weatherGateRevision", json::Value::makeNumber(static_cast<double>(engine.weatherGateRevision())));
     members.emplace_back("effectiveOutputPercent", json::Value::makeNumber(effective));
     json::CanonicalResult rendered = json::canonicalize(json::Value::makeObject(std::move(members)));
     if (!rendered.ok) return refuse("the state could not be rendered: " + rendered.error);
@@ -69,17 +72,24 @@ WeatherGateResponse applyWeatherGateRequest(const std::string& body, BrightnessE
     if (!parsed.ok) return refuse("the request body is not valid JSON: " + parsed.error);
     if (parsed.value.type() != json::Type::kObject) return refuse("the request body must be a JSON object");
 
-    // Exactly one key, "closed": an extra or misspelled key is refused
-    // rather than silently ignored, and a missing "closed" falls into the
-    // same count check rather than a separate message.
-    if (parsed.value.members().size() != 1) {
-        return refuse(R"(the request body must contain exactly the "closed" key)");
+    // Exactly "closed" and "revision": an extra or misspelled key is refused
+    // rather than silently ignored, and a missing key fails the count check.
+    if (parsed.value.members().size() != 2) {
+        return refuse(R"(the request body must contain exactly the "closed" and "revision" keys)");
     }
     const json::Value* closed = memberOf(parsed.value, "closed");
-    if (closed == nullptr) return refuse(R"(unknown key in the request body, expected "closed")");
+    const json::Value* revision = memberOf(parsed.value, "revision");
+    if (closed == nullptr || revision == nullptr) {
+        return refuse(R"(unknown key in the request body, expected "closed" and "revision")");
+    }
     if (closed->type() != json::Type::kBool) return refuse(R"("closed" must be a boolean)");
+    if (revision->type() != json::Type::kNumber) return refuse(R"("revision" must be a number)");
+    const double r = revision->number();
+    if (!std::isfinite(r) || r < 0.0 || r != std::floor(r) || r > static_cast<double>(kMaxWeatherGateRevision)) {
+        return refuse(R"("revision" must be a non-negative integer no larger than 2^53 - 1)");
+    }
 
-    engine->setWeatherGate(closed->boolean(), now);
+    engine->setWeatherGate(closed->boolean(), static_cast<std::uint64_t>(r), now);
     return renderDocument(true, *engine, now);
 }
 

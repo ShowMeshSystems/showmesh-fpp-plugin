@@ -147,8 +147,10 @@ int BrightnessEngine::effectivePercentAt(TimeMillis now) const {
     return static_cast<int>(rounded);
 }
 
-void BrightnessEngine::setWeatherGate(bool closed, TimeMillis now) {
+void BrightnessEngine::setWeatherGate(bool closed, std::uint64_t revision, TimeMillis now) {
     gateClosed_ = closed;
+    const std::uint64_t next = std::min(gateRevision_ + 1, kMaxWeatherGateRevision);
+    gateRevision_ = std::max(next, std::min(revision, kMaxWeatherGateRevision));
     bumpRevision(now);
 }
 
@@ -234,6 +236,7 @@ BrightnessState BrightnessEngine::captureState(TimeMillis now) const {
     s.lastAppliedGain = lastAppliedGain_;
     s.persistedAtMillis = now;
     s.weatherGateClosed = gateClosed_;
+    s.weatherGateRevision = gateRevision_;
     return s;
 }
 
@@ -259,11 +262,12 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state, TimeMil
     if (state.schemaVersion != kBrightnessStateSchemaVersion) {
         return StateAdoption::kRejectedUnsupportedVersion;
     }
-    // A peer's closed gate is adopted before any ordering-key or fade check,
-    // so a skewed peer clock cannot keep this host lit. An open gate is never
-    // adopted: only setWeatherGate (the coordinator write) opens it.
-    if (state.weatherGateClosed && !gateClosed_) {
+    // A peer's closed gate is adopted only at a strictly newer gate revision,
+    // before and independent of the ordering-key checks. An open gate never
+    // is: only setWeatherGate (the coordinator write) opens it.
+    if (state.weatherGateClosed && state.weatherGateRevision > gateRevision_) {
         gateClosed_ = true;
+        gateRevision_ = std::min(state.weatherGateRevision, kMaxWeatherGateRevision);
         ++revision_;
     }
     if (!timestampIsPlausible(state.stateChangedAtMillis)) {
@@ -376,6 +380,7 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
     // gate. A record that never mentions it decodes with the field false,
     // which is exactly "no record ever said closed".
     gateClosed_ = state.weatherGateClosed;
+    gateRevision_ = std::min(state.weatherGateRevision, kMaxWeatherGateRevision);
 
     if (state.schemaVersion != kBrightnessStateSchemaVersion) {
         // The field meanings may have changed, so no fade is resumed and
@@ -476,13 +481,15 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
     return StateAdoption::kAdopted;
 }
 
-void BrightnessEngine::settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now, bool gateClosed) {
+void BrightnessEngine::settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now, bool gateClosed,
+                                                       std::uint64_t gateRevision) {
     const double safeCeiling = clampPercent(static_cast<double>(safeCeilingPercent));
     ceiling_.settle(safeCeiling);
     gain_.settle(kMaxPercent);
     lastAppliedCeiling_ = safeCeiling;
     lastAppliedGain_ = kMaxPercent;
     gateClosed_ = gateClosed;
+    gateRevision_ = std::min(gateRevision, kMaxWeatherGateRevision);
     bumpRevision(now);
 }
 

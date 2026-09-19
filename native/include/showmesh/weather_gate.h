@@ -19,7 +19,7 @@ namespace showmesh {
 extern const char* const kWeatherGatePath;
 extern const char* const kWeatherGateLanPath;
 
-// The body is one field, so this bound is generous. It exists for the same
+// The body is two fields, so this bound is generous. It exists for the same
 // reason transition-gain's does: the route is unauthenticated, and any host
 // on the show LAN can post to it.
 constexpr std::size_t kWeatherGateBodyLimitBytes = 4096;
@@ -34,10 +34,12 @@ struct WeatherGateResponse {
 };
 
 // Applies one weather-gate write: the body must be exactly
-// {"closed": true|false}, with no other key, and a non-boolean or missing
-// "closed" is refused rather than clamped or guessed. Renders the same full
-// state document the transition-gain write returns, extended with
-// "weatherGateClosed" and "effectiveOutputPercent".
+// {"closed": true|false, "revision": <integer 0..2^53-1>}, with no other key,
+// and anything else is refused rather than clamped or guessed. A valid write
+// always applies, whatever its revision (see BrightnessEngine::setWeatherGate).
+// Renders the same full state document the transition-gain write returns,
+// extended with "weatherGateClosed", "weatherGateRevision" and
+// "effectiveOutputPercent".
 //
 // The caller holds whatever lock guards engine; this function does no
 // locking of its own, for the same reason applyTransitionGainRequest does

@@ -119,7 +119,13 @@ struct BrightnessState {
     // run. See BrightnessEngine::adoptState and ::restoreFromPersisted for
     // what "not mentioned" means on each path.
     bool weatherGateClosed = false;
+    // Issued by the coordinator; orders peer gate adoption. Missing reads as 0.
+    std::uint64_t weatherGateRevision = 0;
 };
+
+// The largest gate revision a coordinator write or peer payload may carry:
+// every value up to it survives the JSON number round trip exactly.
+constexpr std::uint64_t kMaxWeatherGateRevision = (std::uint64_t{1} << 53) - 1;
 
 enum class StateAdoption {
     kAdopted,
@@ -190,11 +196,14 @@ class BrightnessEngine {
 
     // Whether the weather gate is currently closed. See setWeatherGate.
     bool weatherGateClosed() const { return gateClosed_; }
+    std::uint64_t weatherGateRevision() const { return gateRevision_; }
 
     // The coordinator-facing weather-gate write (showmesh/weather_gate.h).
     // No fade: closing and opening are immediate, and a ceiling or gain
     // fade keeps running underneath so opening reveals its current value.
-    void setWeatherGate(bool closed, TimeMillis now);
+    // Always applies; the stored gate revision becomes
+    // max(stored + 1, revision), so a peer holding an older gate cannot undo it.
+    void setWeatherGate(bool closed, std::uint64_t revision, TimeMillis now);
 
     // Full-state exchange. captureState is what this node publishes and
     // persists; adoptState is what it does with another node's or a
@@ -236,7 +245,8 @@ class BrightnessEngine {
     // ceiling/gain timing is trusted: an unreadable primary does not mean
     // an unreadable gate when a recovered backup still names one. Defaults
     // to false (open) for the case where no record exists to read at all.
-    void settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now, bool gateClosed = false);
+    void settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now, bool gateClosed = false,
+                                         std::uint64_t gateRevision = 0);
 
     std::uint64_t revision() const { return revision_; }
 
@@ -266,6 +276,7 @@ class BrightnessEngine {
     // Defaults open. See setWeatherGate, adoptState, and
     // restoreFromPersisted for how each path may change it.
     bool gateClosed_ = false;
+    std::uint64_t gateRevision_ = 0;
 
     // The MultiSync ordering key of the state this engine currently holds,
     // stored rather than recomputed on every comparison: see

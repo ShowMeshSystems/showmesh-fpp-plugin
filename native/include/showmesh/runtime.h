@@ -519,6 +519,7 @@ class ShowMeshRuntime {
     // Guarded by brightnessFlushMutex_: the gate both on-disk records last
     // agreed on. No readable record reads as open, which is what restart does.
     bool storedGateClosed_ = false;
+    std::uint64_t storedGateRevision_ = 0;
     std::atomic<bool> running_{false};
     // True only while workerLoop() is on the stack. It is what lets a
     // sweep abandon its remaining definitions when stop() is waiting to

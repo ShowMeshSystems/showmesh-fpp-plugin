@@ -42,7 +42,7 @@ TEST(TheRegisteredPathAndTheAddressAreDifferentStrings) {
 TEST(AClosingWriteAppliesImmediatelyAndReportsTheComposedState) {
     Route route;
     CHECK(route.engine.setCeiling(60, 0, kT0).ok);
-    WeatherGateResponse r = route.post(R"({"closed":true})");
+    WeatherGateResponse r = route.post(R"({"closed":true,"revision":1})");
 
     CHECK_EQ(r.status, 200);
     CHECK(contains(r.body, R"("applied":true)"));
@@ -56,8 +56,8 @@ TEST(AClosingWriteAppliesImmediatelyAndReportsTheComposedState) {
 TEST(AnOpeningWriteRevealsTheCurrentComposedValue) {
     Route route;
     CHECK(route.engine.setCeiling(60, 0, kT0).ok);
-    CHECK_EQ(route.post(R"({"closed":true})").status, 200);
-    WeatherGateResponse r = route.post(R"({"closed":false})");
+    CHECK_EQ(route.post(R"({"closed":true,"revision":1})").status, 200);
+    WeatherGateResponse r = route.post(R"({"closed":false,"revision":2})");
 
     CHECK_EQ(r.status, 200);
     CHECK(contains(r.body, R"("weatherGateClosed":false)"));
@@ -68,7 +68,7 @@ TEST(AnOpeningWriteRevealsTheCurrentComposedValue) {
 TEST(AGetReadsWithoutChangingAnything) {
     Route route;
     CHECK(route.engine.setCeiling(40, 0, kT0).ok);
-    CHECK_EQ(route.post(R"({"closed":true})").status, 200);
+    CHECK_EQ(route.post(R"({"closed":true,"revision":1})").status, 200);
 
     WeatherGateResponse r = route.get();
     CHECK_EQ(r.status, 200);
@@ -89,7 +89,7 @@ TEST(AMissingClosedKeyIsRefused) {
 
 TEST(AnUnknownKeyIsRefusedEvenAlongsideAValidOne) {
     Route route;
-    WeatherGateResponse r = route.post(R"({"closed":true,"reason":"storm"})");
+    WeatherGateResponse r = route.post(R"({"closed":true,"revision":1,"reason":"storm"})");
     CHECK_EQ(r.status, 400);
     CHECK(!route.engine.weatherGateClosed());
 }
@@ -97,7 +97,7 @@ TEST(AnUnknownKeyIsRefusedEvenAlongsideAValidOne) {
 TEST(ANonBooleanClosedValueIsRefusedNeverClampedOrGuessed) {
     Route route;
     for (const char* value : {R"("true")", "1", "null", "0"}) {
-        WeatherGateResponse r = route.post(std::string(R"({"closed":)") + value + "}");
+        WeatherGateResponse r = route.post(std::string(R"({"closed":)") + value + R"(,"revision":1})");
         CHECK_EQ(r.status, 400);
     }
     CHECK(!route.engine.weatherGateClosed());
@@ -109,7 +109,7 @@ TEST(EveryMalformedBodyShapeIsRefusedWithJson) {
         "",
         "not json",
         "[1,2]",
-        R"({"closed":true,"unknown":1})",
+        R"({"closed":true,"revision":1,"unknown":1})",
     };
     for (const char* text : bodies) {
         WeatherGateResponse r = route.post(text);
@@ -129,8 +129,40 @@ TEST(AnOversizedBodyIsRefusedBeforeItIsParsed) {
 }
 
 TEST(ANullEngineIsRefusedRatherThanDereferenced) {
-    WeatherGateResponse r = applyWeatherGateRequest(R"({"closed":true})", nullptr, kT0);
+    WeatherGateResponse r = applyWeatherGateRequest(R"({"closed":true,"revision":1})", nullptr, kT0);
     CHECK_EQ(r.status, 400);
     WeatherGateResponse g = renderWeatherGateState(nullptr, kT0);
     CHECK_EQ(g.status, 400);
+}
+
+TEST(TheResponseCarriesTheStoredGateRevision) {
+    Route route;
+    WeatherGateResponse r = route.post(R"({"closed":true,"revision":12})");
+    CHECK_EQ(r.status, 200);
+    CHECK(contains(r.body, R"("weatherGateRevision":12)"));
+    // A lower revision still applies, and the stored revision still climbs.
+    r = route.post(R"({"closed":false,"revision":4})");
+    CHECK_EQ(r.status, 200);
+    CHECK(contains(r.body, R"("weatherGateRevision":13)"));
+    CHECK(contains(route.get().body, R"("weatherGateRevision":13)"));
+}
+
+TEST(ABadOrMissingRevisionIsRefusedWithoutChangingState) {
+    Route route;
+    const char* bodies[] = {
+        R"({"closed":true})",
+        R"({"closed":true,"revision":-1})",
+        R"({"closed":true,"revision":1.5})",
+        R"({"closed":true,"revision":9007199254740992})",
+        R"({"closed":true,"revision":"1"})",
+        R"({"closed":true,"revision":null})",
+        R"({"closed":true,"rev":1})",
+    };
+    for (const char* text : bodies) {
+        WeatherGateResponse r = route.post(text);
+        CHECK_EQ(r.status, 400);
+    }
+    CHECK(!route.engine.weatherGateClosed());
+    CHECK_EQ(route.engine.weatherGateRevision(), std::uint64_t{0});
+    CHECK_EQ(route.post(R"({"closed":true,"revision":9007199254740991})").status, 200);
 }
