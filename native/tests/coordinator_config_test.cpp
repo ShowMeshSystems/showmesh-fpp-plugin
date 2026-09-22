@@ -4,8 +4,10 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <system_error>
 
 #include "check.h"
 
@@ -176,5 +178,6 @@ TEST(WritingTheCredentialCreatesTheDirectoryWithTheRequiredModesAndTheFileReadsB
     CHECK(replaced.ok);
     CHECK_EQ(replaced.token, std::string("smsh_replacement"));
 
-    ::system(("rm -rf " + parent).c_str());
+    std::error_code ec;
+    std::filesystem::remove_all(parent, ec);
 }

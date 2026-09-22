@@ -3,8 +3,10 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -33,7 +35,10 @@ class TempDir {
         CHECK(made != nullptr);
         path_ = made != nullptr ? std::string(made) : std::string();
     }
-    ~TempDir() { ::system(("rm -rf " + path_).c_str()); }
+    ~TempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
     const std::string& path() const { return path_; }
 
     void write(const std::string& contents) const {

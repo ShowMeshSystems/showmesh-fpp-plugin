@@ -5,9 +5,11 @@
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -40,7 +42,8 @@ class TempDir {
     }
     ~TempDir() {
         // Best effort; a leftover temp dir does not fail the suite.
-        ::system(("rm -rf " + path_).c_str());
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
     }
     const std::string& path() const { return path_; }
 
