@@ -137,6 +137,19 @@ void CoordinatorClient::setConfigurationError(std::string error) {
     publishStatus();
 }
 
+void CoordinatorClient::setBaseUrl(std::string baseUrl) {
+    // baseUrl_ itself is worker-thread only, exactly like postWithRetry's
+    // own unguarded reads of it; mutex_ here guards only the status_
+    // fields, the same split setConfigurationError already keeps.
+    baseUrl_ = std::move(baseUrl);
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        status_.configurationError.clear();
+        status_.configured = transport_ != nullptr && credentials_ != nullptr && !baseUrl_.empty();
+    }
+    publishStatus();
+}
+
 CoordinatorStatus CoordinatorClient::status() const {
     std::lock_guard<std::mutex> guard(mutex_);
     return status_;

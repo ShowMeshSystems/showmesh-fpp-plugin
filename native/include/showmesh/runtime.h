@@ -12,12 +12,23 @@
 #include <vector>
 
 #include "showmesh/brightness.h"
+#include "showmesh/brightness_query.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/callback_handoff.h"
 #include "showmesh/definition_republish.h"
 #include "showmesh/playlist_identity.h"
 #include "showmesh/sequence_store.h"
 #include "showmesh/transition_gain.h"
+
+// Forward declared only: PairingWorker (pairing.h) and ConfigWatcher
+// (config_watcher.h) are optional, ticked components the same way
+// DefinitionPublisher and FallbackActivationRecorder are, and neither
+// header is included here so this one stays the smallest dependency an
+// adapter that wants only the observation path needs to pull in.
+namespace showmesh {
+class PairingWorker;
+class ConfigWatcher;
+}  // namespace showmesh
 
 // The adapter-facing runtime. Everything here is shared by the FPP 9 and
 // FPP 10 adapters and knows nothing about either one's plugin lifecycle or
@@ -290,11 +301,18 @@ class ShowMeshRuntime {
     // every existing caller and test compiles unchanged. When non-null,
     // drainOnce() calls recordEntryKeyResolution() once per entry whose
     // identity resolves, right after entryKey itself is known.
+    // pairingWorker and configWatcher are likewise optional and default to
+    // nullptr so every existing caller and test compiles unchanged. When
+    // set, workerLoop() ticks both once per pass, on the same tick: config
+    // reload (contract section 2) before pairing (section 1), so a
+    // pairing-request picked up on this same pass already sees whatever
+    // coordinator URL a config.json change just applied.
     ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                     SequenceFileStore* sequenceStore = nullptr, DefinitionPublisher* definitions_publisher = nullptr,
                     BrightnessFileStore* brightnessStore = nullptr,
                     int safeCeilingPercent = kDefaultSafeCeilingPercent,
-                    FallbackActivationRecorder* fallbackRecorder = nullptr);
+                    FallbackActivationRecorder* fallbackRecorder = nullptr,
+                    PairingWorker* pairingWorker = nullptr, ConfigWatcher* configWatcher = nullptr);
     ~ShowMeshRuntime();
 
     // Guarded engine access. The returned accessor holds engineMutex_ for
@@ -314,6 +332,10 @@ class ShowMeshRuntime {
     // a handler that handed this work to another thread would step outside
     // it and make the plugin unsafe to unload. Keep this synchronous.
     TransitionGainResponse applyTransitionGain(const std::string& body);
+
+    // Serves one contract section 3 GET read. Called from fppd's own web
+    // thread; locks engineMutex_ and returns, same as applyTransitionGain.
+    BrightnessQueryResponse queryBrightness();
 
     // Serves one contract section 3.9 republish. Called from fppd's own
     // web thread, and synchronous for exactly the reason
@@ -464,6 +486,10 @@ class ShowMeshRuntime {
     DefinitionPublisher* definitionPublisher_;
     FallbackActivationRecorder* fallbackRecorder_;
     BrightnessFileStore* brightnessStore_;
+    // Ticked once per workerLoop() pass; see the constructor's doc
+    // comment. Either or both may be null.
+    PairingWorker* pairingWorker_;
+    ConfigWatcher* configWatcher_;
     // Set once in the constructor; see brightnessRestartTrust().
     BrightnessRestartTrust brightnessRestartTrust_ = BrightnessRestartTrust::kTrustedOrNoRecord;
 

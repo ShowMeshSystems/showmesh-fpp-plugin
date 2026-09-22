@@ -132,6 +132,15 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // caller detected (a config.json that would not load, for instance).
     void setConfigurationError(std::string error);
 
+    // Applies a coordinator base URL discovered after construction
+    // (contract section 2's config reload): recomputes `configured` and
+    // clears any prior configurationError the same way the constructor
+    // does, so a client that started unconfigured is reported configured
+    // without a restart the first time the operator sets a real URL.
+    // Worker-thread only, like every other member here: ConfigWatcher
+    // calls this from the same worker-loop tick that ticks pairing.
+    void setBaseUrl(std::string baseUrl);
+
     bool publish(const PlaylistEntryObservation& observation) override;
     bool publishUnavailable(const PlaylistEntryObservation& observation) override;
     bool publishDefinition(const std::string& instanceUuid, const std::string& playlistName,

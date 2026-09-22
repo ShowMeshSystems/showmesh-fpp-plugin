@@ -2,9 +2,14 @@
 
 #include <sys/stat.h>
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "showmesh/atomic_write.h"
 #include "showmesh/json.h"
@@ -151,6 +156,59 @@ CredentialLoad loadCoordinatorCredential(const std::string& credentialDir) {
     load.ok = true;
     load.token = token;
     return load;
+}
+
+bool writeCoordinatorCredentialAtomically(const std::string& credentialDir, const std::string& token,
+                                          std::string* error) {
+    if (::mkdir(credentialDir.c_str(), 0700) != 0 && errno != EEXIST) {
+        if (error != nullptr) *error = "could not create " + credentialDir + ": " + std::strerror(errno);
+        return false;
+    }
+    // Forced regardless of whether this call created the directory: a
+    // directory this program did not create itself is not trusted to
+    // already carry the right mode.
+    if (::chmod(credentialDir.c_str(), 0700) != 0) {
+        if (error != nullptr) *error = "could not set the required mode on " + credentialDir;
+        return false;
+    }
+
+    const std::string path = joinPath(credentialDir, kCredentialFilename);
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            if (error != nullptr) *error = "could not open a temp file in " + credentialDir;
+            return false;
+        }
+        out.write(token.data(), static_cast<std::streamsize>(token.size()));
+        out.flush();
+        if (!out) {
+            if (error != nullptr) *error = "could not write the credential temp file";
+            std::remove(tmp.c_str());
+            return false;
+        }
+    }
+    if (::chmod(tmp.c_str(), kRequiredCredentialMode) != 0) {
+        if (error != nullptr) *error = "could not set the credential file's mode";
+        std::remove(tmp.c_str());
+        return false;
+    }
+    const int fd = ::open(tmp.c_str(), O_WRONLY);
+    if (fd >= 0) {
+        ::fsync(fd);
+        ::close(fd);
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        if (error != nullptr) *error = "could not install the credential file";
+        std::remove(tmp.c_str());
+        return false;
+    }
+    const int dirFd = ::open(credentialDir.c_str(), O_RDONLY);
+    if (dirFd >= 0) {
+        ::fsync(dirFd);
+        ::close(dirFd);
+    }
+    return true;
 }
 
 FileCredentialSource::FileCredentialSource(std::string dir) : dir_(std::move(dir)) {}

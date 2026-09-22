@@ -8,6 +8,8 @@
 #include <string>
 
 #include "showmesh/brightness_codec.h"
+#include "showmesh/config_watcher.h"
+#include "showmesh/pairing.h"
 #include "showmesh/saturating_add.h"
 
 namespace showmesh {
@@ -61,7 +63,8 @@ bool playlistNameIsPathSafe(const std::string& name) {
 ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                                  SequenceFileStore* sequenceStore, DefinitionPublisher* definitionPublisher,
                                  BrightnessFileStore* brightnessStore, int safeCeilingPercent,
-                                 FallbackActivationRecorder* fallbackRecorder)
+                                 FallbackActivationRecorder* fallbackRecorder, PairingWorker* pairingWorker,
+                                 ConfigWatcher* configWatcher)
     : definitions_(definitions),
       sink_(sink),
       clock_(clock),
@@ -69,6 +72,8 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
       definitionPublisher_(definitionPublisher),
       fallbackRecorder_(fallbackRecorder),
       brightnessStore_(brightnessStore),
+      pairingWorker_(pairingWorker),
+      configWatcher_(configWatcher),
       handoff_(16) {
     if (definitions_ != nullptr) {
         std::lock_guard<std::mutex> lock(engineMutex_);
@@ -184,6 +189,11 @@ void ShowMeshRuntime::observeCallback(const char* playlistName, const char* acti
 TransitionGainResponse ShowMeshRuntime::applyTransitionGain(const std::string& body) {
     std::lock_guard<std::mutex> lock(engineMutex_);
     return applyTransitionGainRequest(body, &engine_, &lastTransitionGainRequestId_, clock_());
+}
+
+BrightnessQueryResponse ShowMeshRuntime::queryBrightness() {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    return renderBrightnessQuery(engine_, clock_());
 }
 
 void ShowMeshRuntime::RuntimeSweepRecord::requestSweep() {
@@ -472,6 +482,10 @@ void ShowMeshRuntime::workerLoop() {
         // markBrightnessDirty() and flushBrightnessState().
         flushBrightnessIfDirty();
         maybeSweepDefinitions();
+        // Config reload before pairing, on the same pass: see the
+        // constructor's doc comment.
+        if (configWatcher_ != nullptr) configWatcher_->tick();
+        if (pairingWorker_ != nullptr) pairingWorker_->tick(clock_());
         if (!running_.load()) break;
         if (testHookBeforeWait_) testHookBeforeWait_();
         std::unique_lock<std::mutex> lock(wakeMutex_);

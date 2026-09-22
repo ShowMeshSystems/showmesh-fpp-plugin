@@ -27,10 +27,12 @@
 #include "coordinator_delivery.h"
 #include "fallback_activation_delivery.h"
 #include "fpp_definition_source.h"
+#include "pairing_delivery.h"
 #include "safe_ceiling.h"
 #include "section_names.h"
 #include "showmesh/definition_republish.h"
 #include "showmesh/transition_gain.h"
+#include "showmesh/brightness_query.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
 
@@ -81,9 +83,13 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
           brightnessStore_(showmesh::resolveSequenceStateDir()),
           delivery_(nowMillis),
           fallbackDelivery_(nowMillis, definitions_.instanceUuid()),
+          // Shares delivery_'s ConfigWatcher as its coordinator URL
+          // source: see pairing_delivery.h.
+          pairingDelivery_(delivery_.configWatcher()),
           safeCeilingPercent_(showmesh::adapter::resolveSafeCeilingPercent()),
           runtime_(&definitions_, delivery_.client(), nowMillis, &sequenceStore_, delivery_.client(),
-                  &brightnessStore_, safeCeilingPercent_, &fallbackDelivery_) {
+                  &brightnessStore_, safeCeilingPercent_, &fallbackDelivery_, pairingDelivery_.worker(),
+                  delivery_.configWatcher()) {
         logBrightnessRestartTrust(runtime_.brightnessRestartTrust(), safeCeilingPercent_);
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
@@ -179,6 +185,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         if (ws == nullptr) return;
         ws->register_resource(showmesh::kTransitionGainPath, &gainResource_, false);
         ws->register_resource(showmesh::kDefinitionRepublishPath, &republishResource_, false);
+        ws->register_resource(showmesh::kBrightnessQueryPath, &brightnessQueryResource_, false);
     }
 
     // FPP 9 has no runtime unload endpoint, so this runs only on the
@@ -189,6 +196,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         if (ws == nullptr) return;
         ws->unregister_resource(showmesh::kTransitionGainPath);
         ws->unregister_resource(showmesh::kDefinitionRepublishPath);
+        ws->unregister_resource(showmesh::kBrightnessQueryPath);
     }
 
  private:
@@ -242,6 +250,24 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         showmesh::ShowMeshRuntime* runtime_;
     };
 
+    // The libhttpserver side of contract section 3's read route, a member
+    // for the same lifetime reason the two resources above are.
+    class BrightnessQueryResource : public httpserver::http_resource {
+     public:
+        explicit BrightnessQueryResource(showmesh::ShowMeshRuntime* runtime) : runtime_(runtime) {
+            disallow_all();
+            set_allowing("GET", true);
+        }
+
+        std::shared_ptr<httpserver::http_response> render_GET(const httpserver::http_request&) override {
+            const showmesh::BrightnessQueryResponse result = runtime_->queryBrightness();
+            return std::shared_ptr<httpserver::http_response>(new httpserver::string_response(
+                result.body, result.status, "application/json"));
+        }
+
+     private:
+        showmesh::ShowMeshRuntime* runtime_;
+    };
 
     void publishFullStateIfChanged() {
         const std::uint64_t revision = runtime_.brightness()->revision();
@@ -294,6 +320,10 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // a pointer into it), the same two reasons delivery_ above is placed
     // where it is.
     showmesh::adapter::FallbackActivationDelivery fallbackDelivery_;
+    // Declared after delivery_: its constructor holds a pointer into
+    // delivery_'s ConfigWatcher, and before runtime_, which holds a
+    // pointer into this.
+    showmesh::adapter::PairingDelivery pairingDelivery_;
     // Declared before runtime_ for the same reason: resolved from the
     // "ShowMeshSafeCeilingPercent" setting once, here, before runtime_'s
     // constructor uses it to settle an untrusted restart.
@@ -303,6 +333,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // declaration order, so this captures a runtime_ that already exists.
     TransitionGainResource gainResource_{&runtime_};
     DefinitionRepublishResource republishResource_{&runtime_};
+    BrightnessQueryResource brightnessQueryResource_{&runtime_};
     Command* command_ = nullptr;
     std::uint64_t publishedRevision_ = 0;
 };
