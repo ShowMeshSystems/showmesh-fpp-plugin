@@ -85,7 +85,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
           fallbackDelivery_(nowMillis, definitions_.instanceUuid()),
           // Shares delivery_'s ConfigWatcher as its coordinator URL
           // source: see pairing_delivery.h.
-          pairingDelivery_(delivery_.configWatcher()),
+          pairingDelivery_(delivery_.configWatcher(), nowMillis),
           safeCeilingPercent_(showmesh::adapter::resolveSafeCeilingPercent()),
           runtime_(&definitions_, delivery_.client(), nowMillis, &sequenceStore_, delivery_.client(),
                   &brightnessStore_, safeCeilingPercent_, &fallbackDelivery_, pairingDelivery_.worker(),

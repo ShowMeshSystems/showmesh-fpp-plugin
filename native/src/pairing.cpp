@@ -2,8 +2,10 @@
 
 #include <sys/stat.h>
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -48,6 +50,15 @@ bool stringMember(const json::Value& object, const char* name, std::string* out)
     const json::Value* v = memberOf(object, name);
     if (v == nullptr || v->type() != json::Type::kString) return false;
     *out = v->string();
+    return true;
+}
+
+bool readWholeFile(const std::string& path, std::string* out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    std::ostringstream contents;
+    contents << in.rdbuf();
+    *out = contents.str();
     return true;
 }
 
@@ -123,12 +134,17 @@ std::string renderPairingStatus(const PairingStatus& status) {
 }
 
 PairingWorker::PairingWorker(std::string stateDir, std::string credentialDir, HttpTransport* transport,
-                             CoordinatorUrlSource* urlSource, RandomBytesFn randomBytes)
+                             CoordinatorUrlSource* urlSource, Clock clock, RandomBytesFn randomBytes)
     : stateDir_(std::move(stateDir)),
       credentialDir_(std::move(credentialDir)),
       transport_(transport),
       urlSource_(urlSource),
-      randomBytes_(randomBytes == nullptr ? readRandomBytes : randomBytes) {}
+      clock_(clock),
+      randomBytes_(randomBytes == nullptr ? readRandomBytes : randomBytes) {
+    reconcileStartupState();
+}
+
+PairingWorker::~PairingWorker() { stop(); }
 
 PairingStatus PairingWorker::status() const {
     std::lock_guard<std::mutex> guard(mutex_);
@@ -140,6 +156,89 @@ void PairingWorker::setState(PairingState state, TimeMillis now, std::string las
     status_.state = state;
     status_.lastError = std::move(lastError);
     status_.updatedAtMillis = now;
+    // See the header: code is meaningful only while kWaiting.
+    if (state != PairingState::kWaiting) status_.code.clear();
+}
+
+void PairingWorker::reconcileStartupState() {
+    const std::string statusPath = joinPath(stateDir_, kPairingStatusFilename);
+    std::string raw;
+    if (!readWholeFile(statusPath, &raw)) return;  // no prior status: stays idle
+
+    json::ParseResult parsed = json::parse(raw);
+    if (!parsed.ok || parsed.value.type() != json::Type::kObject) return;
+    std::string state;
+    if (!stringMember(parsed.value, "state", &state)) return;
+
+    // A terminal state from a previous process (paired, expired, failed)
+    // needs no reconciliation: the previous process already forgot its
+    // secret on every one of those paths, so restoring the status this
+    // worker last wrote is enough for it to be reported unchanged. Only a
+    // "waiting" status implies a secret the previous process held only in
+    // memory, which this restart has already lost.
+    if (state != "waiting") {
+        std::string principalId;
+        std::string lastError;
+        double pairedAtMillis = 0;
+        double updatedAtMillis = 0;
+        stringMember(parsed.value, "principalId", &principalId);
+        stringMember(parsed.value, "lastError", &lastError);
+        const json::Value* paired = memberOf(parsed.value, "pairedAtMillis");
+        if (paired != nullptr && paired->type() == json::Type::kNumber) pairedAtMillis = paired->number();
+        const json::Value* updated = memberOf(parsed.value, "updatedAtMillis");
+        if (updated != nullptr && updated->type() == json::Type::kNumber) updatedAtMillis = updated->number();
+
+        std::lock_guard<std::mutex> guard(mutex_);
+        status_.state = state == "paired"   ? PairingState::kPaired
+                       : state == "failed"  ? PairingState::kFailed
+                       : state == "expired" ? PairingState::kExpired
+                                             : PairingState::kIdle;
+        status_.code.clear();
+        status_.principalId = principalId;
+        status_.lastError = lastError;
+        status_.pairedAtMillis = static_cast<TimeMillis>(pairedAtMillis);
+        status_.updatedAtMillis = static_cast<TimeMillis>(updatedAtMillis);
+        return;
+    }
+
+    // A restart during an open wait: the secret that wait needed lived
+    // only in the previous process's memory and is gone now, so it can
+    // never complete. See the constructor's doc comment.
+    std::remove(joinPath(stateDir_, kPairingCodeFilename).c_str());
+    const TimeMillis now = clock_();
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        status_.state = PairingState::kExpired;
+        status_.code.clear();
+        status_.principalId.clear();
+        status_.lastError.clear();
+        status_.updatedAtMillis = now;
+    }
+    writeStatusFile();
+}
+
+void PairingWorker::run() {
+    while (!stopRequested_.load()) {
+        tick(clock_());
+        if (stopRequested_.load()) break;
+        std::unique_lock<std::mutex> lock(wakeMutex_);
+        wake_.wait_for(lock, std::chrono::milliseconds(500), [this] { return stopRequested_.load(); });
+    }
+}
+
+void PairingWorker::start() {
+    if (started_.exchange(true)) return;
+    thread_ = std::thread(&PairingWorker::run, this);
+}
+
+void PairingWorker::requestStop() {
+    stopRequested_.store(true);
+    wake_.notify_all();
+}
+
+void PairingWorker::stop() {
+    requestStop();
+    if (thread_.joinable()) thread_.join();
 }
 
 void PairingWorker::tick(TimeMillis now) {
@@ -158,6 +257,11 @@ void PairingWorker::tick(TimeMillis now) {
         writeStatusFile();
         return;
     }
+    // requestStop() must be able to interrupt a wait about to start a new
+    // claim attempt without waiting out the full 3s interval first. Never
+    // true unless requestStop() was actually called, so a test that never
+    // starts the background thread is unaffected.
+    if (stopRequested_.load()) return;
     if (!everAttemptedClaim_ || now - lastClaimAttemptMillis_ >= kPairingClaimIntervalMillis) {
         attemptClaim(now);
     }
@@ -175,6 +279,12 @@ void PairingWorker::checkPairingRequest(TimeMillis now) {
 }
 
 void PairingWorker::startPairing(TimeMillis now) {
+    // Ends whatever pairing (if any) was already open, unconditionally,
+    // before this one is attempted: a pairing whose own secret or code
+    // derivation fails below must not leave the previous pairing's
+    // pairing-code file or in-memory secret behind.
+    endPairing(true);
+
     const std::string secret = generateSecretHex(randomBytes_);
     if (secret.empty()) {
         setState(PairingState::kFailed, now, "could not generate a pairing secret");
@@ -233,6 +343,10 @@ void PairingWorker::attemptClaim(TimeMillis now) {
     HttpRequest request;
     request.url = joinUrlPath(baseUrl, kPairingClaimPath);
     request.body = body.text;
+    // Bounded so a black-holing coordinator URL can hold this one call for
+    // at most kPairingClaimTimeoutMillis, never the whole pairing window:
+    // see the header and requestStop().
+    request.timeoutMillis = kPairingClaimTimeoutMillis;
     const HttpResponse response = transport_->post(request);
 
     if (!response.transportOk) {
@@ -257,7 +371,12 @@ void PairingWorker::attemptClaim(TimeMillis now) {
     std::string principalId;
     if (!parsed.ok || parsed.value.type() != json::Type::kObject || !stringMember(parsed.value, "token", &token) ||
         token.empty() || !stringMember(parsed.value, "principalId", &principalId)) {
-        setState(PairingState::kWaiting, now, "the coordinator's pairing claim response could not be parsed");
+        // The coordinator already deleted its pending entry when it
+        // answered 200: the claim is spent whether or not this side could
+        // make sense of the body, so the pairing ends here rather than
+        // polling forever for a secret the coordinator no longer holds.
+        endPairing(true);
+        setState(PairingState::kFailed, now, "the coordinator's pairing claim response could not be parsed");
         writeStatusFile();
         return;
     }
@@ -276,6 +395,7 @@ void PairingWorker::attemptClaim(TimeMillis now) {
     {
         std::lock_guard<std::mutex> guard(mutex_);
         status_.state = PairingState::kPaired;
+        status_.code.clear();
         status_.principalId = principalId;
         status_.pairedAtMillis = now;
         status_.lastError.clear();

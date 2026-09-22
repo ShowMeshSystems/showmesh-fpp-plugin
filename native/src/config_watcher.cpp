@@ -2,23 +2,59 @@
 
 #include <sys/stat.h>
 
+#include <fstream>
+#include <sstream>
+
 #include "showmesh/atomic_write.h"
+#include "showmesh/sha256.h"
 
 namespace showmesh {
 
 namespace {
 constexpr const char* kConfigFilename = "config.json";
+
+// struct stat's nanosecond mtime field is spelled differently on BSD-
+// derived platforms (macOS's st_mtimespec) than on Linux (the POSIX.1-2008
+// st_mtim); this is the one place that difference is expressed, since the
+// native core has to build (and its tests have to run) on either.
+long long mtimeNanosOf(const struct ::stat& info) {
+#if defined(__APPLE__)
+    return static_cast<long long>(info.st_mtimespec.tv_sec) * 1000000000LL +
+          static_cast<long long>(info.st_mtimespec.tv_nsec);
+#else
+    return static_cast<long long>(info.st_mtim.tv_sec) * 1000000000LL +
+          static_cast<long long>(info.st_mtim.tv_nsec);
+#endif
+}
+
 }  // namespace
+
+ConfigFileSnapshot snapshotConfigFile(const std::string& path) {
+    ConfigFileSnapshot snapshot;
+    struct ::stat info {};
+    if (::stat(path.c_str(), &info) != 0) return snapshot;
+    snapshot.exists = true;
+    snapshot.mtimeNanos = mtimeNanosOf(info);
+    snapshot.sizeBytes = static_cast<long long>(info.st_size);
+
+    // config.json is a handful of bytes; hashing it on every tick is
+    // negligible next to the stat() call itself, and is what catches two
+    // rewrites landing within one mtime tick (some filesystems only keep
+    // whole-second resolution despite struct stat's nanosecond field)
+    // with the same resulting size.
+    std::ifstream in(path, std::ios::binary);
+    if (in) {
+        std::ostringstream contents;
+        contents << in.rdbuf();
+        snapshot.contentHashHex = sha256Hex(contents.str());
+    }
+    return snapshot;
+}
 
 ConfigWatcher::ConfigWatcher(std::string stateDir, CoordinatorClient* client)
     : stateDir_(std::move(stateDir)), client_(client) {
-    struct ::stat info {};
-    const std::string path = joinPath(stateDir_, kConfigFilename);
-    if (::stat(path.c_str(), &info) == 0) {
-        everObserved_ = true;
-        lastMtimeSeconds_ = static_cast<long long>(info.st_mtime);
-        lastSizeBytes_ = static_cast<long long>(info.st_size);
-    }
+    lastSnapshot_ = snapshotConfigFile(joinPath(stateDir_, kConfigFilename));
+    everObserved_ = lastSnapshot_.exists;
     // Established without applying anything: whatever the caller already
     // loaded from this same file (CoordinatorDelivery's own construction
     // read) is what client currently reflects, and currentBaseUrl_ below
@@ -33,18 +69,12 @@ ConfigWatcher::ConfigWatcher(std::string stateDir, CoordinatorClient* client)
 }
 
 void ConfigWatcher::tick() {
-    struct ::stat info {};
-    const std::string path = joinPath(stateDir_, kConfigFilename);
-    const bool exists = ::stat(path.c_str(), &info) == 0;
-    const long long mtimeSeconds = exists ? static_cast<long long>(info.st_mtime) : 0;
-    const long long sizeBytes = exists ? static_cast<long long>(info.st_size) : -1;
+    const ConfigFileSnapshot snapshot = snapshotConfigFile(joinPath(stateDir_, kConfigFilename));
+    if (everObserved_ && snapshot == lastSnapshot_) return;
+    if (!snapshot.exists && !everObserved_) return;
 
-    if (exists && everObserved_ && mtimeSeconds == lastMtimeSeconds_ && sizeBytes == lastSizeBytes_) return;
-    if (!exists && !everObserved_) return;
-
-    everObserved_ = exists;
-    lastMtimeSeconds_ = mtimeSeconds;
-    lastSizeBytes_ = sizeBytes;
+    everObserved_ = snapshot.exists;
+    lastSnapshot_ = snapshot;
     reload();
 }
 
@@ -55,7 +85,9 @@ void ConfigWatcher::reload() {
         std::lock_guard<std::mutex> guard(mutex_);
         currentBaseUrl_ = load.baseUrl;
     } else {
-        if (client_ != nullptr) client_->setConfigurationError(load.error);
+        // Clears baseUrl_ too, not only the configured flag: see
+        // setUnconfigured()'s own doc comment for the bug this closes.
+        if (client_ != nullptr) client_->setUnconfigured(load.error);
         std::lock_guard<std::mutex> guard(mutex_);
         currentBaseUrl_.clear();
     }

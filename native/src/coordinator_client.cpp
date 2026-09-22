@@ -150,6 +150,16 @@ void CoordinatorClient::setBaseUrl(std::string baseUrl) {
     publishStatus();
 }
 
+void CoordinatorClient::setUnconfigured(std::string error) {
+    baseUrl_.clear();
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        status_.configurationError = std::move(error);
+        status_.configured = false;
+    }
+    publishStatus();
+}
+
 CoordinatorStatus CoordinatorClient::status() const {
     std::lock_guard<std::mutex> guard(mutex_);
     return status_;

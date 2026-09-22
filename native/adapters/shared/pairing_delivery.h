@@ -17,8 +17,8 @@ namespace adapter {
 
 class PairingDelivery {
  public:
-    explicit PairingDelivery(CoordinatorUrlSource* urlSource)
-        : worker_(resolveSequenceStateDir(), resolveCredentialDir(), &transport_, urlSource) {}
+    PairingDelivery(CoordinatorUrlSource* urlSource, Clock clock)
+        : worker_(resolveSequenceStateDir(), resolveCredentialDir(), &transport_, urlSource, clock) {}
 
     PairingWorker* worker() { return &worker_; }
 

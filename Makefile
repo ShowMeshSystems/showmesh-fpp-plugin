@@ -62,6 +62,7 @@ native:
 native-test:
 	$(MAKE) -C native check-host-neutral
 	$(MAKE) -C native test
+	$(MAKE) -C native adapter-syntax-check
 
 .PHONY: check
 check: fmt-check vet lint test native-test

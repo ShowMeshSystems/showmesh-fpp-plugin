@@ -303,10 +303,11 @@ class ShowMeshRuntime {
     // identity resolves, right after entryKey itself is known.
     // pairingWorker and configWatcher are likewise optional and default to
     // nullptr so every existing caller and test compiles unchanged. When
-    // set, workerLoop() ticks both once per pass, on the same tick: config
-    // reload (contract section 2) before pairing (section 1), so a
-    // pairing-request picked up on this same pass already sees whatever
-    // coordinator URL a config.json change just applied.
+    // set: workerLoop() ticks configWatcher once per pass (a local file
+    // stat, cheap enough for this thread); start() and stop() instead
+    // start and stop pairingWorker's own background thread, because its
+    // claim attempt is a blocking network call that must never share this
+    // thread with drainOnce() -- see pairing.h's class comment.
     ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                     SequenceFileStore* sequenceStore = nullptr, DefinitionPublisher* definitions_publisher = nullptr,
                     BrightnessFileStore* brightnessStore = nullptr,
