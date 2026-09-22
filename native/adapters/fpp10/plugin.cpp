@@ -25,8 +25,10 @@
 #include "coordinator_delivery.h"
 #include "fallback_activation_delivery.h"
 #include "fpp_definition_source.h"
+#include "pairing_delivery.h"
 #include "safe_ceiling.h"
 #include "section_names.h"
+#include "showmesh/brightness_query.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
 #include "showmesh/definition_republish.h"
@@ -79,9 +81,13 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
           brightnessStore_(showmesh::resolveSequenceStateDir()),
           delivery_(nowMillis),
           fallbackDelivery_(nowMillis, definitions_.instanceUuid()),
+          // Shares delivery_'s ConfigWatcher as its coordinator URL
+          // source: see pairing_delivery.h.
+          pairingDelivery_(delivery_.configWatcher(), nowMillis),
           safeCeilingPercent_(showmesh::adapter::resolveSafeCeilingPercent()),
           runtime_(&definitions_, delivery_.client(), nowMillis, &sequenceStore_, delivery_.client(),
-                  &brightnessStore_, safeCeilingPercent_, &fallbackDelivery_) {
+                  &brightnessStore_, safeCeilingPercent_, &fallbackDelivery_, pairingDelivery_.worker(),
+                  delivery_.configWatcher()) {
         logBrightnessRestartTrust(runtime_.brightnessRestartTrust(), safeCeilingPercent_);
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
@@ -186,6 +192,16 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
                 callback(makeStringResponse(result.body, result.status, "application/json"));
             },
             { drogon::Post });
+        FPPPlugins::registerPluginApi(
+            showmesh::kBrightnessQueryPath,
+            [this](const HttpRequestPtr&, HttpCallback&& callback) {
+                // Synchronous for the same reason: it locks engineMutex_
+                // and returns, and nothing here is left running once this
+                // returns.
+                const showmesh::BrightnessQueryResponse result = runtime_.queryBrightness();
+                callback(makeStringResponse(result.body, result.status, "application/json"));
+            },
+            { drogon::Get });
     }
 
     // FPP calls this before shutdown() on both teardown paths
@@ -201,6 +217,7 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
     void unregisterApis() override {
         FPPPlugins::unregisterPluginApi(showmesh::kTransitionGainPath);
         FPPPlugins::unregisterPluginApi(showmesh::kDefinitionRepublishPath);
+        FPPPlugins::unregisterPluginApi(showmesh::kBrightnessQueryPath);
     }
 
     void playlistCallback(const Json::Value& playlist, const std::string& action, const std::string& section,
@@ -306,6 +323,10 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
     // a pointer into it), the same two reasons delivery_ above is placed
     // where it is.
     showmesh::adapter::FallbackActivationDelivery fallbackDelivery_;
+    // Declared after delivery_: its constructor holds a pointer into
+    // delivery_'s ConfigWatcher, and before runtime_, which holds a
+    // pointer into this.
+    showmesh::adapter::PairingDelivery pairingDelivery_;
     // Declared before runtime_ for the same reason: resolved from the
     // "ShowMeshSafeCeilingPercent" setting once, here, before runtime_'s
     // constructor uses it to settle an untrusted restart.

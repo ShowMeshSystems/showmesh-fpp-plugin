@@ -85,4 +85,24 @@ class FileCredentialSource : public CredentialSource {
 // Joins a base URL and an absolute path with exactly one separator.
 std::string joinUrlPath(const std::string& baseUrl, const std::string& path);
 
+// Writes token to <credentialDir>/credential, creating credentialDir with
+// mode 0700 if it does not exist (and forcing that mode either way), then
+// writing to a temp file in that same directory, forcing its mode to
+// exactly 0600, and renaming it into place. This is pairing's (contract
+// section 1) only writer of the credential file; loadCoordinatorCredential
+// above is what later reads it back, and the two modes agree on purpose.
+// On failure, error carries an operator-facing reason and never the token.
+bool writeCoordinatorCredentialAtomically(const std::string& credentialDir, const std::string& token,
+                                          std::string* error);
+
+// Where a fresh claim attempt and a config reload both read "the
+// coordinator base URL right now". One implementation, ConfigWatcher
+// (config_watcher.h), is shared between the two so they can never
+// disagree about which URL is current.
+class CoordinatorUrlSource {
+ public:
+    virtual ~CoordinatorUrlSource() = default;
+    virtual std::string currentBaseUrl() const = 0;
+};
+
 }  // namespace showmesh

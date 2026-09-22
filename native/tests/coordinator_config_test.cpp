@@ -4,8 +4,10 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <system_error>
 
 #include "check.h"
 
@@ -148,4 +150,34 @@ TEST(ARouteIsJoinedToTheBaseUrlWithExactlyOneSeparator) {
     CHECK_EQ(joinUrlPath("http://host:8080", "/api/v1/x"), std::string("http://host:8080/api/v1/x"));
     CHECK_EQ(joinUrlPath("http://host:8080/", "/api/v1/x"), std::string("http://host:8080/api/v1/x"));
     CHECK_EQ(joinUrlPath("http://host:8080/base", "/api/v1/x"), std::string("http://host:8080/base/api/v1/x"));
+}
+
+TEST(WritingTheCredentialCreatesTheDirectoryWithTheRequiredModesAndTheFileReadsBackCleanly) {
+    char buffer[] = "/tmp/showmesh-credential-write-XXXXXX";
+    const char* made = ::mkdtemp(buffer);
+    CHECK(made != nullptr);
+    const std::string parent = made != nullptr ? std::string(made) : std::string();
+    const std::string credentialDir = parent + "/nested";
+
+    std::string error;
+    CHECK(showmesh::writeCoordinatorCredentialAtomically(credentialDir, "smsh_a-real-token", &error));
+    CHECK(error.empty());
+
+    const CredentialLoad loaded = loadCoordinatorCredential(credentialDir);
+    CHECK(loaded.ok);
+    CHECK_EQ(loaded.token, std::string("smsh_a-real-token"));
+
+    struct ::stat dirInfo {};
+    CHECK(::stat(credentialDir.c_str(), &dirInfo) == 0);
+    CHECK_EQ(static_cast<int>(dirInfo.st_mode & 07777), 0700);
+
+    // A second write, with the directory already present, still leaves
+    // exactly the new token behind: no stray temp file, no growth.
+    CHECK(showmesh::writeCoordinatorCredentialAtomically(credentialDir, "smsh_replacement", &error));
+    const CredentialLoad replaced = loadCoordinatorCredential(credentialDir);
+    CHECK(replaced.ok);
+    CHECK_EQ(replaced.token, std::string("smsh_replacement"));
+
+    std::error_code ec;
+    std::filesystem::remove_all(parent, ec);
 }

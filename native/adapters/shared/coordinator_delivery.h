@@ -5,6 +5,7 @@
 
 #include "curl_http_transport.h"
 #include "playlist_mismatch_notifier.h"
+#include "showmesh/config_watcher.h"
 #include "showmesh/coordinator_client.h"
 #include "showmesh/coordinator_config.h"
 #include "showmesh/sequence_store.h"
@@ -25,7 +26,12 @@ class CoordinatorDelivery {
           statusSink_(stateDir_),
           credentials_(),
           client_(&transport_, &credentials_, resolveBaseUrl(stateDir_, &configurationError_), clock, &statusSink_,
-                  sleepMillis, RetryPolicy(), &mismatchNotifier_) {
+                  sleepMillis, RetryPolicy(), &mismatchNotifier_),
+          // Constructed after client_: it reads config.json itself, at
+          // construction, only to establish tick()'s baseline mtime/size
+          // for the same file resolveBaseUrl() just read above; it never
+          // re-applies that same snapshot to client_.
+          configWatcher_(stateDir_, &client_) {
         // A host with no coordinator URL yet still loads the plugin and
         // still runs the show; every post then fails visibly in the local
         // status record rather than silently doing nothing.
@@ -33,6 +39,12 @@ class CoordinatorDelivery {
     }
 
     CoordinatorClient* client() { return &client_; }
+    // Contract section 2's config reload. Also PairingWorker's
+    // CoordinatorUrlSource: see PairingDelivery, which is constructed
+    // with a pointer into this same watcher so pairing's claim attempts
+    // and the observation client never disagree about the current
+    // coordinator URL.
+    ConfigWatcher* configWatcher() { return &configWatcher_; }
 
  private:
     static std::string resolveBaseUrl(const std::string& stateDir, std::string* error) {
@@ -54,6 +66,8 @@ class CoordinatorDelivery {
     // order regardless of the initializer list's order.
     WarningHolderMismatchNotifier mismatchNotifier_;
     CoordinatorClient client_;
+    // Declared after client_: its constructor holds a pointer into it.
+    ConfigWatcher configWatcher_;
 };
 
 }  // namespace adapter

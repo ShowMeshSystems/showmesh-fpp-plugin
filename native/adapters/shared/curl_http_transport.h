@@ -54,9 +54,14 @@ class CurlHttpTransport : public HttpTransport {
         // credential does not sit in a long-lived header list.
         curl_slist* headers = nullptr;
         headers = curl_slist_append(headers, ("Content-Type: " + request.contentType).c_str());
-        std::string authorization = "Authorization: Bearer " + request.bearerToken;
-        headers = curl_slist_append(headers, authorization.c_str());
-        authorization.assign(authorization.size(), '\0');
+        // Omitted entirely, not sent with an empty value, when there is no
+        // token: an unauthenticated route (the pairing claim POST) must
+        // never carry a malformed "Authorization: Bearer " header.
+        if (!request.bearerToken.empty()) {
+            std::string authorization = "Authorization: Bearer " + request.bearerToken;
+            headers = curl_slist_append(headers, authorization.c_str());
+            authorization.assign(authorization.size(), '\0');
+        }
 
         BoundedBody bounded;
         bounded.maxBytes = request.maxResponseBytes > 0 ? static_cast<std::size_t>(request.maxResponseBytes) : 0;

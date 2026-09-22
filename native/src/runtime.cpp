@@ -8,6 +8,8 @@
 #include <string>
 
 #include "showmesh/brightness_codec.h"
+#include "showmesh/config_watcher.h"
+#include "showmesh/pairing.h"
 #include "showmesh/saturating_add.h"
 
 namespace showmesh {
@@ -61,7 +63,8 @@ bool playlistNameIsPathSafe(const std::string& name) {
 ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                                  SequenceFileStore* sequenceStore, DefinitionPublisher* definitionPublisher,
                                  BrightnessFileStore* brightnessStore, int safeCeilingPercent,
-                                 FallbackActivationRecorder* fallbackRecorder)
+                                 FallbackActivationRecorder* fallbackRecorder, PairingWorker* pairingWorker,
+                                 ConfigWatcher* configWatcher)
     : definitions_(definitions),
       sink_(sink),
       clock_(clock),
@@ -69,6 +72,8 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
       definitionPublisher_(definitionPublisher),
       fallbackRecorder_(fallbackRecorder),
       brightnessStore_(brightnessStore),
+      pairingWorker_(pairingWorker),
+      configWatcher_(configWatcher),
       handoff_(16) {
     if (definitions_ != nullptr) {
         std::lock_guard<std::mutex> lock(engineMutex_);
@@ -184,6 +189,11 @@ void ShowMeshRuntime::observeCallback(const char* playlistName, const char* acti
 TransitionGainResponse ShowMeshRuntime::applyTransitionGain(const std::string& body) {
     std::lock_guard<std::mutex> lock(engineMutex_);
     return applyTransitionGainRequest(body, &engine_, &lastTransitionGainRequestId_, clock_());
+}
+
+BrightnessQueryResponse ShowMeshRuntime::queryBrightness() {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    return renderBrightnessQuery(engine_, clock_());
 }
 
 void ShowMeshRuntime::RuntimeSweepRecord::requestSweep() {
@@ -472,6 +482,12 @@ void ShowMeshRuntime::workerLoop() {
         // markBrightnessDirty() and flushBrightnessState().
         flushBrightnessIfDirty();
         maybeSweepDefinitions();
+        // Config reload is a local file stat plus, at most, an occasional
+        // small local read: cheap enough to run on this thread every
+        // pass. Pairing's own claim attempt is a blocking network POST and
+        // runs on PairingWorker's own thread instead; see start()/stop()
+        // below and pairing.h's class comment.
+        if (configWatcher_ != nullptr) configWatcher_->tick();
         if (!running_.load()) break;
         if (testHookBeforeWait_) testHookBeforeWait_();
         std::unique_lock<std::mutex> lock(wakeMutex_);
@@ -484,6 +500,9 @@ void ShowMeshRuntime::workerLoop() {
 void ShowMeshRuntime::start() {
     if (running_.exchange(true)) return;
     worker_ = std::thread(&ShowMeshRuntime::workerLoop, this);
+    // Its own thread, independent of worker_: see pairing.h's class
+    // comment for why the claim POST must never run on worker_.
+    if (pairingWorker_ != nullptr) pairingWorker_->start();
 }
 
 void ShowMeshRuntime::stop() {
@@ -496,12 +515,21 @@ void ShowMeshRuntime::stop() {
     if (sink_ != nullptr) sink_->requestStop();
     if (definitionPublisher_ != nullptr) definitionPublisher_->requestStop();
     if (fallbackRecorder_ != nullptr) fallbackRecorder_->requestStop();
+    // Interrupted before worker_'s own join for the identical reason,
+    // even though it joins its own, separate thread below: requestStop()
+    // here means a claim attempt already in flight gives up as soon as
+    // its bounded request timeout returns instead of starting another.
+    if (pairingWorker_ != nullptr) pairingWorker_->requestStop();
     {
         std::lock_guard<std::mutex> lock(wakeMutex_);
         hasWork_ = true;
     }
     wake_.notify_all();
     if (worker_.joinable()) worker_.join();
+    // Joined after worker_: this thread is independent of it, so nothing
+    // orders one join before the other for correctness, but doing it here
+    // keeps every "stop everything" call in this one function.
+    if (pairingWorker_ != nullptr) pairingWorker_->stop();
 }
 
 }  // namespace showmesh

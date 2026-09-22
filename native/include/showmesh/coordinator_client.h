@@ -132,6 +132,27 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // caller detected (a config.json that would not load, for instance).
     void setConfigurationError(std::string error);
 
+    // Applies a coordinator base URL discovered after construction
+    // (contract section 2's config reload): recomputes `configured` and
+    // clears any prior configurationError the same way the constructor
+    // does, so a client that started unconfigured is reported configured
+    // without a restart the first time the operator sets a real URL.
+    // Worker-thread only, like every other member here: ConfigWatcher
+    // calls this from its own tick.
+    void setBaseUrl(std::string baseUrl);
+
+    // The other half of config reload: a config.json rewrite that no
+    // longer parses (contract section 2). Clears baseUrl_ as well as
+    // recording error, so postWithRetry's own configured-check
+    // (baseUrl_.empty()) refuses every subsequent post outright instead
+    // of continuing to send observations to the URL config.json no
+    // longer names. setConfigurationError() alone does not do this: it
+    // leaves baseUrl_ untouched, which is exactly what let a stale URL
+    // keep receiving posts after config.json went bad, with the next
+    // successful one of those silently re-declaring `configured: true`
+    // and erasing the very error that was reported.
+    void setUnconfigured(std::string error);
+
     bool publish(const PlaylistEntryObservation& observation) override;
     bool publishUnavailable(const PlaylistEntryObservation& observation) override;
     bool publishDefinition(const std::string& instanceUuid, const std::string& playlistName,

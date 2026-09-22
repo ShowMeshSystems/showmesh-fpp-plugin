@@ -2,9 +2,14 @@
 
 #include <sys/stat.h>
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "showmesh/atomic_write.h"
 #include "showmesh/json.h"
@@ -151,6 +156,64 @@ CredentialLoad loadCoordinatorCredential(const std::string& credentialDir) {
     load.ok = true;
     load.token = token;
     return load;
+}
+
+bool writeCoordinatorCredentialAtomically(const std::string& credentialDir, const std::string& token,
+                                          std::string* error) {
+    if (::mkdir(credentialDir.c_str(), 0700) != 0 && errno != EEXIST) {
+        if (error != nullptr) *error = "could not create " + credentialDir + ": " + std::strerror(errno);
+        return false;
+    }
+    // Forced regardless of whether this call created the directory: a
+    // directory this program did not create itself is not trusted to
+    // already carry the right mode.
+    if (::chmod(credentialDir.c_str(), 0700) != 0) {
+        if (error != nullptr) *error = "could not set the required mode on " + credentialDir;
+        return false;
+    }
+
+    const std::string path = joinPath(credentialDir, kCredentialFilename);
+    const std::string tmp = path + ".tmp";
+    // Created at exactly the required mode from the instant it exists,
+    // rather than world-or-group-readable under the process umask until a
+    // chmod() lands after the write: a reader racing this open() (a
+    // scheduler or an operator's own `ls`) must never be able to observe
+    // the token under a more permissive mode than the finished file ever
+    // carries. O_TRUNC in case a previous attempt's temp file was left
+    // behind; a leftover has never been trusted content either way.
+    const int fd = ::open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, kRequiredCredentialMode);
+    if (fd < 0) {
+        if (error != nullptr) *error = "could not create a temp file in " + credentialDir;
+        return false;
+    }
+    bool writeOk = true;
+    std::size_t written = 0;
+    while (written < token.size()) {
+        const ::ssize_t n = ::write(fd, token.data() + written, token.size() - written);
+        if (n <= 0) {
+            writeOk = false;
+            break;
+        }
+        written += static_cast<std::size_t>(n);
+    }
+    if (writeOk) writeOk = ::fsync(fd) == 0;
+    ::close(fd);
+    if (!writeOk) {
+        if (error != nullptr) *error = "could not write the credential temp file";
+        std::remove(tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        if (error != nullptr) *error = "could not install the credential file";
+        std::remove(tmp.c_str());
+        return false;
+    }
+    const int dirFd = ::open(credentialDir.c_str(), O_RDONLY);
+    if (dirFd >= 0) {
+        ::fsync(dirFd);
+        ::close(dirFd);
+    }
+    return true;
 }
 
 FileCredentialSource::FileCredentialSource(std::string dir) : dir_(std::move(dir)) {}
