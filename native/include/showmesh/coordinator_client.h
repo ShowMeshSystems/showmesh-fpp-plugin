@@ -88,7 +88,6 @@ struct CoordinatorStatus {
     // Operator-facing text for the last failure. Never the credential.
     std::string lastError;
     // Non-empty exactly while the reports-refused notice is raised: the
-    // coordinator's refusal reason plus the fixed recovery sentence, the
     // same text given to ReportsRefusedNotifier. Empty otherwise.
     std::string reportsRefusedReason;
     TimeMillis lastSuccessAtMillis = 0;
@@ -102,6 +101,9 @@ class StatusSink {
  public:
     virtual ~StatusSink() = default;
     virtual void writeStatus(const std::string& json) = 0;
+    // Returns the last written record, or false when none exists yet.
+    // Defaulted so an existing test sink that only writes still compiles.
+    virtual bool readStatus(std::string*) { return false; }
 };
 
 // Writes <stateDir>/observation-status.json, replacing it atomically.
@@ -110,6 +112,7 @@ class FileStatusSink : public StatusSink {
  public:
     explicit FileStatusSink(std::string stateDir);
     void writeStatus(const std::string& json) override;
+    bool readStatus(std::string* json) override;
 
  private:
     std::string path_;
@@ -202,12 +205,15 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // between the raise and the clear.
     void clearMismatchNotice();
 
-    // Called once per sendObservation() outcome. Raises when the outcome
-    // is a conflict, an unauthorized or forbidden refusal, or a transport
-    // failure; clears on acceptance; otherwise leaves the notice state
-    // untouched, exactly like checkMismatchAgeOut() for the other notice.
+    // Called once per sendObservation() outcome and once at construction
+    // from persisted status. Raises on a conflict, an unauthorized or
+    // forbidden refusal, or a transport failure; clears on acceptance.
     void raiseReportsRefusedNotice(const std::string& message);
     void clearReportsRefusedNotice();
+    // Restores lastOutcome and reportsRefusedReason from statusSink_'s
+    // persisted record, and re-raises the notice if the restored outcome
+    // is still a refusal. Called once, from the constructor.
+    void restoreFromPersistedStatus();
 
     HttpTransport* transport_;
     CredentialSource* credentials_;

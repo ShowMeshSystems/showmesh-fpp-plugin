@@ -120,7 +120,14 @@ class FakeCredentials : public CredentialSource {
 class RecordingStatusSink : public StatusSink {
  public:
     void writeStatus(const std::string& json) override { writes.push_back(json); }
+    bool readStatus(std::string* json) override {
+        if (!hasPersisted) return false;
+        *json = persisted;
+        return true;
+    }
     std::vector<std::string> writes;
+    bool hasPersisted = false;
+    std::string persisted;
 };
 
 // Records every raise/clear call, exact id and message included, so a
@@ -798,4 +805,226 @@ TEST(TheReportsRefusedNoticeClearsOnAcceptance) {
 
     const CoordinatorStatus status = client.status();
     CHECK(status.reportsRefusedReason.empty());
+}
+
+// finding 1: a problem+json body's "detail" field is the reason, not the
+// full raw body (which can carry an unbounded, machine-readable envelope
+// around it).
+TEST(TheReportsRefusedReasonIsTheProblemBodysDetailField) {
+    FakeTransport transport;
+    transport.responses.push_back(FakeTransport::refused(
+        409,
+        "{\"type\":\"https://showmesh.example/problems/sequence-regression\",\"title\":\"Conflict\","
+        "\"detail\":\"playlist observation sequence regression\",\"instance\":\"req-1\"}"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+    CHECK(contains(notifier.raised[0].message, "playlist observation sequence regression"));
+    CHECK(!contains(notifier.raised[0].message, "req-1"));
+}
+
+// A body carrying no "detail" falls back to "title".
+TEST(TheReportsRefusedReasonFallsBackToTheProblemBodysTitleField) {
+    FakeTransport transport;
+    transport.responses.push_back(
+        FakeTransport::refused(403, "{\"type\":\"https://showmesh.example/problems/forbidden\",\"title\":"
+                                     "\"missing fpp:observe scope\"}"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK(contains(notifier.raised[0].message, "missing fpp:observe scope"));
+}
+
+// A body carrying neither field falls back to the status code, so the
+// notice is never blank.
+TEST(TheReportsRefusedReasonFallsBackToTheStatusCodeWhenTheBodyHasNoUsableField) {
+    FakeTransport transport;
+    transport.responses.push_back(FakeTransport::refused(409, "{\"type\":\"opaque\"}"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK(contains(notifier.raised[0].message, "409"));
+}
+
+// A proxy's HTML error page is stripped of markup rather than dumped
+// verbatim into the operator-visible notice.
+TEST(TheReportsRefusedReasonStripsHtmlMarkupFromANonJsonBody) {
+    FakeTransport transport;
+    transport.responses.push_back(FakeTransport::refused(
+        409, "<html><body><h1>409 Conflict</h1><p>nginx</p></body></html>"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK(!contains(notifier.raised[0].message, "<"));
+    CHECK(!contains(notifier.raised[0].message, ">"));
+    CHECK(contains(notifier.raised[0].message, "409 Conflict"));
+    CHECK(contains(notifier.raised[0].message, "nginx"));
+}
+
+// A body over 200 characters is capped, so the notice stays a fixed,
+// bounded size regardless of what the coordinator (or a proxy in front of
+// it) sends.
+TEST(TheReportsRefusedReasonIsCappedAt200Characters) {
+    FakeTransport transport;
+    const std::string longDetail(400, 'x');
+    transport.responses.push_back(
+        FakeTransport::refused(409, "{\"detail\":\"" + longDetail + "\"}"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    const std::string reasonPart = notifier.raised[0].message.substr(0, 200);
+    CHECK_EQ(reasonPart, std::string(200, 'x'));
+}
+
+// The extracted reason is stable across retries even when the raw body
+// varies (a different request id each attempt), so the notice is not
+// cleared and re-raised on every post.
+TEST(TheReportsRefusedNoticeIsNotRaisedTwiceWhenOnlyTheBodysEnvelopeVaries) {
+    FakeTransport transport;
+    transport.responses.push_back(
+        FakeTransport::refused(409, "{\"detail\":\"playlist observation sequence regression\",\"instance\":\"a\"}"));
+    transport.responses.push_back(
+        FakeTransport::refused(409, "{\"detail\":\"playlist observation sequence regression\",\"instance\":\"b\"}"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+    CHECK(notifier.cleared.empty());
+}
+
+TEST(TheReportsRefusedNoticeIsRaisedOnATransportFailure) {
+    FakeTransport transport;  // no scripted responses: always unreachable
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    RetryPolicy policy;
+    policy.maxAttempts = 1;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, policy, nullptr,
+                             &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+    CHECK_EQ(notifier.raised[0].id, ShowMesh_ReportsRefused);
+    CHECK(contains(notifier.raised[0].message, "reset-observation-sequence"));
+}
+
+TEST(TheReportsRefusedNoticeIsRaisedOnAForbiddenRefusal) {
+    FakeTransport transport;
+    transport.responses.push_back(FakeTransport::refused(403, "{\"scope\":\"fpp:observe\"}"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+    CHECK_EQ(notifier.raised[0].id, ShowMesh_ReportsRefused);
+}
+
+// stopped, no-credential, and schema-refused are outcomes this notice does
+// not cover: an operator cannot resolve a schema refusal by clearing a
+// sequence, and stopped/no-credential are local conditions, not the
+// coordinator refusing anything.
+TEST(TheReportsRefusedNoticeIsUntouchedByAStoppedOutcome) {
+    FakeTransport transport;
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+    client.requestStop();
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK(notifier.raised.empty());
+    CHECK(notifier.cleared.empty());
+}
+
+TEST(TheReportsRefusedNoticeIsUntouchedByANoCredentialOutcome) {
+    FakeTransport transport;
+    FakeCredentials credentials;
+    credentials.available = false;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK(notifier.raised.empty());
+    CHECK(notifier.cleared.empty());
+}
+
+TEST(TheReportsRefusedNoticeIsUntouchedByASchemaRefusedOutcome) {
+    FakeTransport transport;
+    transport.responses.push_back(FakeTransport::refused(400, "unsupported-observation-schema-version"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK(notifier.raised.empty());
+    CHECK(notifier.cleared.empty());
+}
+
+// finding 2: after an fppd restart with a refusal standing, the notice
+// must come back from persisted status at construction, before any post
+// happens, rather than waiting for the next refused post.
+TEST(AConstructedClientRestoresAndRaisesTheReportsRefusedNoticeFromPersistedStatus) {
+    FakeTransport transport;
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    RecordingStatusSink statusSink;
+    statusSink.hasPersisted = true;
+    statusSink.persisted =
+        "{\"schemaVersion\":1,\"lastOutcome\":\"conflict\",\"reportsRefusedReason\":"
+        "\"playlist observation sequence regression. Clear the playlist observation on the coordinator's "
+        "Monitor screen, or run showmeshctl fpp reset-observation-sequence\"}";
+
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, &statusSink, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+    CHECK_EQ(notifier.raised[0].id, ShowMesh_ReportsRefused);
+    CHECK(contains(notifier.raised[0].message, "playlist observation sequence regression"));
+    CHECK(client.status().reportsRefusedReason == notifier.raised[0].message);
+    CHECK(client.status().lastOutcome == std::string("conflict"));
+
+    // The next accepted post clears exactly the restored message.
+    transport.responses.push_back(FakeTransport::ok());
+    CHECK(client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.cleared.size(), std::size_t{1});
+    CHECK_EQ(notifier.cleared[0].message, notifier.raised[0].message);
+}
+
+// A persisted accepted outcome restores no notice.
+TEST(AConstructedClientRaisesNoNoticeFromAnAcceptedPersistedStatus) {
+    FakeTransport transport;
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    RecordingStatusSink statusSink;
+    statusSink.hasPersisted = true;
+    statusSink.persisted = "{\"schemaVersion\":1,\"lastOutcome\":\"accepted\"}";
+
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, &statusSink, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(notifier.raised.empty());
+    CHECK(client.status().reportsRefusedReason.empty());
 }

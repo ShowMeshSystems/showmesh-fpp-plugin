@@ -7,8 +7,7 @@
 
 // Raises and clears the reports-refused notice through FPP's own
 // notification centre. Copies WarningHolderMismatchNotifier's pattern
-// rather than sharing it: the two notices have unrelated triggers and
-// unrelated lifetimes.
+// rather than sharing it.
 
 namespace showmesh {
 namespace adapter {

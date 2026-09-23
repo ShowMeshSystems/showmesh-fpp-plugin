@@ -127,11 +127,9 @@ class PlaylistMismatchNotifier {
 // (id, message, plugin) still makes this notice unambiguous.
 constexpr int ShowMesh_PlaylistMismatch = 0;
 
-// ReportsRefusedNotifier surfaces to the operator that the coordinator is
-// refusing this instance's playlist-entry reports (a sequence conflict,
-// a credential problem, or an unreachable coordinator), mirroring
-// PlaylistMismatchNotifier's raise/clear shape under its own identity.
-// Optional; nullptr keeps the previous behavior (no notification).
+// ReportsRefusedNotifier surfaces a standing coordinator refusal of this
+// instance's playlist-entry reports, mirroring PlaylistMismatchNotifier's
+// raise/clear shape. Optional; nullptr keeps the previous behavior.
 class ReportsRefusedNotifier {
  public:
     virtual ~ReportsRefusedNotifier() = default;
