@@ -127,6 +127,25 @@ class PlaylistMismatchNotifier {
 // (id, message, plugin) still makes this notice unambiguous.
 constexpr int ShowMesh_PlaylistMismatch = 0;
 
+// ReportsRefusedNotifier surfaces a standing coordinator refusal of this
+// instance's playlist-entry reports, mirroring PlaylistMismatchNotifier's
+// raise/clear shape. Optional; nullptr keeps the previous behavior.
+class ReportsRefusedNotifier {
+ public:
+    virtual ~ReportsRefusedNotifier() = default;
+    // Called on a transition into the refused state, or when the message
+    // text itself changes while already refused.
+    virtual void raiseRefused(int id, const std::string& message) = 0;
+    // Called on a transition out of the refused state. Always given the
+    // identical id and message the most recent raiseRefused() call gave;
+    // see PlaylistMismatchNotifier::clearMismatch() for why.
+    virtual void clearRefused(int id, const std::string& message) = 0;
+};
+
+// Mirrors ShowMesh_PlaylistMismatch: the same WarningHolder identity
+// scheme, distinguished from it only by message text.
+constexpr int ShowMesh_ReportsRefused = 0;
+
 // PlaylistDefinitionSource resolves a playlist's complete definition. The
 // worker calls it, never the callback thread: on FPP this reads the
 // playlist-definition API, and in a test it returns a fixture.

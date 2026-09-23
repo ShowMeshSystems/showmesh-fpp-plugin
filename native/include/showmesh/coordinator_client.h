@@ -87,6 +87,9 @@ struct CoordinatorStatus {
     std::string lastOutcome;
     // Operator-facing text for the last failure. Never the credential.
     std::string lastError;
+    // Non-empty exactly while the reports-refused notice is raised: the
+    // same text given to ReportsRefusedNotifier. Empty otherwise.
+    std::string reportsRefusedReason;
     TimeMillis lastSuccessAtMillis = 0;
     TimeMillis lastFailureAtMillis = 0;
 };
@@ -98,6 +101,9 @@ class StatusSink {
  public:
     virtual ~StatusSink() = default;
     virtual void writeStatus(const std::string& json) = 0;
+    // Returns the last written record, or false when none exists yet.
+    // Defaulted so an existing test sink that only writes still compiles.
+    virtual bool readStatus(std::string*) { return false; }
 };
 
 // Writes <stateDir>/observation-status.json, replacing it atomically.
@@ -106,6 +112,7 @@ class FileStatusSink : public StatusSink {
  public:
     explicit FileStatusSink(std::string stateDir);
     void writeStatus(const std::string& json) override;
+    bool readStatus(std::string* json) override;
 
  private:
     std::string path_;
@@ -126,7 +133,8 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // this client ever sees.
     CoordinatorClient(HttpTransport* transport, CredentialSource* credentials, std::string baseUrl, Clock clock,
                       StatusSink* statusSink = nullptr, Sleeper sleeper = sleepMillis,
-                      RetryPolicy policy = RetryPolicy(), PlaylistMismatchNotifier* mismatchNotifier = nullptr);
+                      RetryPolicy policy = RetryPolicy(), PlaylistMismatchNotifier* mismatchNotifier = nullptr,
+                      ReportsRefusedNotifier* reportsRefusedNotifier = nullptr);
 
     // Records why the client cannot post, for a configuration failure the
     // caller detected (a config.json that would not load, for instance).
@@ -197,6 +205,16 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // between the raise and the clear.
     void clearMismatchNotice();
 
+    // Called once per sendObservation() outcome and once at construction
+    // from persisted status. Raises on a conflict, an unauthorized or
+    // forbidden refusal, or a transport failure; clears on acceptance.
+    void raiseReportsRefusedNotice(const std::string& message);
+    void clearReportsRefusedNotice();
+    // Restores lastOutcome and reportsRefusedReason from statusSink_'s
+    // persisted record, and re-raises the notice if the restored outcome
+    // is still a refusal. Called once, from the constructor.
+    void restoreFromPersistedStatus();
+
     HttpTransport* transport_;
     CredentialSource* credentials_;
     std::string baseUrl_;
@@ -240,6 +258,14 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // was actually present, so a reachable coordinator whose own verdict
     // lookup keeps failing does not itself trigger an age-out clear.
     TimeMillis lastVerdictAtMillis_ = 0;
+
+    // Worker-thread only, like mismatchNotifier_ above.
+    ReportsRefusedNotifier* reportsRefusedNotifier_;
+    // Whether reportsRefusedNotifier_ currently believes the notice is
+    // raised, and the exact message it was last raised with. See
+    // mismatchActive_ / lastRaisedMessage_ above.
+    bool reportsRefusedActive_ = false;
+    std::string lastRaisedReportsRefusedMessage_;
 };
 
 }  // namespace showmesh
