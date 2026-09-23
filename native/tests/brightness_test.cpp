@@ -921,3 +921,342 @@ TEST(ConvergedNodesWithDivergentPerNodeRenderHistoryStayConverged) {
     CHECK(c.adoptState(sa, kT0) == StateAdoption::kRejectedStaleRevision);
     CHECK(c.adoptState(sb, kT0) == StateAdoption::kRejectedStaleRevision);
 }
+
+// RES-018 / ADR-053 decision 5: a closed gate zeroes every channel the
+// plugin can write, including one outside every apply range and one
+// inside an exclusion, and opening it again is byte-identical to what the
+// ceiling and gain alone would have produced.
+TEST(AClosedGateZeroesAnExcludedChannelAndOpeningRestoresItByteIdentical) {
+    BrightnessEngine engine;
+    RangeConfig config;
+    config.apply.push_back(ChannelRange{1, 16});
+    config.exclude.push_back(ChannelRange{5, 4});  // channels 5,6,7,8
+    CHECK(engine.configureRanges(config, 32).ok);
+    CHECK(engine.setCeiling(50, 0, kT0).ok);
+
+    std::vector<std::uint8_t> before = frame(32, 200);
+    engine.applyToFrame(before.data(), before.size(), kT0);
+    CHECK_EQ(static_cast<int>(before[4]), 200);   // excluded, untouched by the ceiling alone
+    CHECK_EQ(static_cast<int>(before[20]), 200);  // outside every apply range
+
+    engine.setWeatherGate(true, 1, kT0);
+    CHECK(engine.weatherGateClosed());
+    CHECK_EQ(engine.effectivePercentAt(kT0), 0);
+
+    std::vector<std::uint8_t> closed = frame(32, 200);
+    engine.applyToFrame(closed.data(), closed.size(), kT0);
+    for (std::uint8_t v : closed) {
+        CHECK_EQ(static_cast<int>(v), 0);  // every channel, ranges ignored
+    }
+
+    engine.setWeatherGate(false, 2, kT0);
+    CHECK(!engine.weatherGateClosed());
+    std::vector<std::uint8_t> reopened = frame(32, 200);
+    engine.applyToFrame(reopened.data(), reopened.size(), kT0);
+    CHECK(reopened == before);
+}
+
+// The gate has no fade: a ceiling or gain fade keeps running underneath a
+// closed gate, so opening it reveals the current composed value rather
+// than resuming from wherever it was when the gate closed.
+TEST(TheGateHasNoFadeAndAFadeKeepsRunningUnderneathIt) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(100, 0, kT0).ok);
+    CHECK(engine.setCeiling(0, 10, kT0).ok);
+    engine.setWeatherGate(true, 1, kT0);
+
+    CHECK_EQ(engine.effectivePercentAt(kT0 + 5000), 0);  // closed regardless of the fade
+
+    engine.setWeatherGate(false, 2, kT0 + 5000);
+    CHECK_NEAR(engine.ceilingAt(kT0 + 5000), 50.0, 1e-9);
+    CHECK_EQ(engine.effectivePercentAt(kT0 + 5000), 50);
+}
+
+TEST(APeersClosedGateAtANewerGateRevisionIsAdoptedWhateverTheOrderingKeySays) {
+    BrightnessEngine local;
+    local.setInstanceId("local");
+    CHECK(local.setCeiling(80, 0, kT0).ok);  // stateChangedAtMillis == kT0
+
+    // A payload that is otherwise genuinely stale: an earlier
+    // stateChangedAtMillis than what local already holds.
+    BrightnessState stalePeer = local.captureState(kT0);
+    stalePeer.instanceId = "peer";
+    stalePeer.stateChangedAtMillis = kT0 - 500;
+    stalePeer.weatherGateClosed = true;
+    stalePeer.weatherGateRevision = 1;
+
+    CHECK(local.adoptState(stalePeer, kT0) == StateAdoption::kRejectedStaleRevision);
+    // The ceiling did not move -- the payload really was stale -- but the
+    // gate closed anyway.
+    CHECK_NEAR(local.ceilingAt(kT0), 80.0, 1e-9);
+    CHECK(local.weatherGateClosed());
+}
+
+TEST(APeersOpenGateIsNeverAdoptedEvenWithANewerOrderingKey) {
+    BrightnessEngine local;
+    local.setInstanceId("local");
+    CHECK(local.setCeiling(80, 0, kT0).ok);
+    local.setWeatherGate(true, 1, kT0);
+    CHECK(local.weatherGateClosed());
+
+    // A peer payload that is newer by every tier of the ordering key, and
+    // explicitly says the gate is open.
+    BrightnessState newerPeer = local.captureState(kT0);
+    newerPeer.instanceId = "peer";
+    newerPeer.stateChangedAtMillis = kT0 + 1000;
+    newerPeer.ceilingTarget = 60;
+    newerPeer.ceilingStart = 60;
+    newerPeer.weatherGateClosed = false;
+    newerPeer.weatherGateRevision = 99;
+
+    CHECK(local.adoptState(newerPeer, kT0) == StateAdoption::kAdopted);
+    CHECK_NEAR(local.ceilingAt(kT0), 60.0, 1e-9);  // the rest of the state still adopts
+    // Only setWeatherGate (the coordinator write) opens the gate; a peer
+    // never does, no matter how it orders.
+    CHECK(local.weatherGateClosed());
+}
+
+// An older payload that predates this field decodes with it false ("not
+// mentioned"), and for a peer payload that means no change: it must not
+// close a gate that is currently open.
+TEST(APeerPayloadThatNeverMentionsTheGateChangesNothingAboutIt) {
+    BrightnessEngine local;
+    local.setInstanceId("local");
+    CHECK(local.setCeiling(80, 0, kT0).ok);
+
+    BrightnessState peer = local.captureState(kT0);
+    peer.instanceId = "peer";
+    peer.stateChangedAtMillis = kT0 + 1000;
+    peer.ceilingTarget = 60;
+    peer.ceilingStart = 60;
+    // weatherGateClosed left at its decoded default (false), simulating a
+    // payload from a build that never mentions the field.
+
+    CHECK(local.adoptState(peer, kT0) == StateAdoption::kAdopted);
+    CHECK(!local.weatherGateClosed());
+}
+
+TEST(CaptureStateAndDecodeCarryTheGateAndAnUnmentionedFieldDecodesOpen) {
+    BrightnessEngine engine;
+    engine.setWeatherGate(true, 7, kT0);
+    const BrightnessState captured = engine.captureState(kT0);
+    CHECK(captured.weatherGateClosed);
+    CHECK_EQ(captured.weatherGateRevision, std::uint64_t{7});
+
+    const std::string encoded = showmesh::encodeBrightnessState(captured);
+    CHECK(encoded.find("\"weatherGateClosed\":true") != std::string::npos);
+
+    showmesh::BrightnessStateDecode decoded = showmesh::decodeBrightnessState(encoded);
+    CHECK(decoded.ok);
+    CHECK(decoded.state.weatherGateClosed);
+    CHECK_EQ(decoded.state.weatherGateRevision, std::uint64_t{7});
+
+    // A payload from before this field existed has no such key at all.
+    showmesh::BrightnessStateDecode old =
+        showmesh::decodeBrightnessState("not json");
+    CHECK(!old.ok);
+    const std::string withoutGate = "{\"schemaVersion\":1,\"revision\":0,\"stateChangedAtMillis\":0,"
+                                    "\"instanceId\":\"\",\"ceilingStart\":100,\"ceilingTarget\":100,"
+                                    "\"ceilingFadeStartMillis\":0,\"ceilingFadeEndMillis\":0,"
+                                    "\"gainStart\":100,\"gainTarget\":100,\"gainFadeStartMillis\":0,"
+                                    "\"gainFadeEndMillis\":0,\"lastAppliedCeiling\":100,"
+                                    "\"lastAppliedGain\":100,\"persistedAtMillis\":0}";
+    showmesh::BrightnessStateDecode legacy = showmesh::decodeBrightnessState(withoutGate);
+    CHECK(legacy.ok);
+    CHECK(!legacy.state.weatherGateClosed);
+    CHECK_EQ(legacy.state.weatherGateRevision, std::uint64_t{0});
+}
+
+// RES-018 / ADR-053 decision 8: a restart trusts the gate directly off
+// whatever record it can read, independent of whether that record's
+// ceiling/gain timing is trusted for the other two terms.
+TEST(RestoreFromPersistedTrustsTheGateEvenWhenCeilingAndGainSettleSafe) {
+    BrightnessState state;
+    state.schemaVersion = showmesh::kBrightnessStateSchemaVersion + 1;  // forces the unsupported-version settle
+    state.weatherGateClosed = true;
+
+    BrightnessEngine engine;
+    CHECK(engine.restoreFromPersisted(state, kT0) == StateAdoption::kRejectedUnsupportedVersion);
+    CHECK(engine.weatherGateClosed());
+}
+
+TEST(RestoreFromPersistedLeavesTheGateOpenWhenNoRecordEverMentionedIt) {
+    BrightnessState state = BrightnessEngine().captureState(kT0);
+    state.weatherGateClosed = false;
+
+    BrightnessEngine engine;
+    CHECK(engine.restoreFromPersisted(state, kT0) == StateAdoption::kAdopted);
+    CHECK(!engine.weatherGateClosed());
+}
+
+TEST(SettleSafeAfterUntrustedRestartHonorsAPreviousGoodRecordsGate) {
+    BrightnessEngine defaulted;
+    defaulted.settleSafeAfterUntrustedRestart(25, kT0);
+    CHECK(!defaulted.weatherGateClosed());
+
+    BrightnessEngine closed;
+    closed.settleSafeAfterUntrustedRestart(25, kT0, true);
+    CHECK(closed.weatherGateClosed());
+    CHECK_NEAR(closed.ceilingAt(kT0), 25.0, 1e-9);
+}
+
+// The gate ignores the ordering key entirely, including its plausibility:
+// a peer whose clock is skewed still closes this host's gate.
+TEST(APeersClosedGateIsAdoptedEvenWithAnImplausibleTimestamp) {
+    for (TimeMillis skewed : {TimeMillis{1000}, kT0 + showmesh::kMaxOrderingKeyAheadOfNowMillis + 60'000}) {
+        BrightnessEngine local;
+        local.setInstanceId("local");
+        CHECK(local.setCeiling(80, 0, kT0).ok);
+
+        BrightnessState peer = local.captureState(kT0);
+        peer.instanceId = "peer";
+        peer.stateChangedAtMillis = skewed;
+        peer.weatherGateClosed = true;
+        peer.weatherGateRevision = 1;
+
+        CHECK(local.adoptState(peer, kT0) == StateAdoption::kRejectedImplausibleTimestamp);
+        CHECK_NEAR(local.ceilingAt(kT0), 80.0, 1e-9);
+        CHECK(local.weatherGateClosed());
+    }
+}
+
+
+namespace {
+
+// Delivers each engine's current state to the other, several rounds, the way
+// two MultiSync peers keep republishing after every change.
+void exchange(BrightnessEngine& a, BrightnessEngine& b, TimeMillis now, int rounds = 6) {
+    for (int i = 0; i < rounds; ++i) {
+        b.adoptState(a.captureState(now), now);
+        a.adoptState(b.captureState(now), now);
+    }
+}
+
+}  // namespace
+
+// Opening closed hosts one at a time must open the group: a host still closed
+// at the older gate revision cannot re-close one the coordinator already opened.
+TEST(OpeningClosedHostsOneAtATimeOpensTheGroupAndALaterCloseStillPropagates) {
+    for (const char* firstId : {"a", "b"}) {
+        BrightnessEngine a;
+        BrightnessEngine b;
+        a.setInstanceId(firstId);
+        b.setInstanceId(std::string(firstId) == "a" ? "b" : "a");
+        constexpr std::uint64_t kN = 5;
+        a.setWeatherGate(true, kN, kT0);
+        b.setWeatherGate(true, kN, kT0);
+        exchange(a, b, kT0);
+
+        a.setWeatherGate(false, kN + 1, kT0 + 10);
+        exchange(a, b, kT0 + 20);
+        CHECK(!a.weatherGateClosed());
+        CHECK(b.weatherGateClosed());
+        CHECK_EQ(a.weatherGateRevision(), kN + 1);
+
+        b.setWeatherGate(false, kN + 1, kT0 + 30);
+        exchange(a, b, kT0 + 40);
+        CHECK(!a.weatherGateClosed());
+        CHECK(!b.weatherGateClosed());
+
+        a.setWeatherGate(true, kN + 2, kT0 + 50);
+        exchange(a, b, kT0 + 60);
+        CHECK(a.weatherGateClosed());
+        CHECK(b.weatherGateClosed());
+        CHECK_EQ(a.weatherGateRevision(), kN + 2);
+        CHECK_EQ(b.weatherGateRevision(), kN + 2);
+
+        // The adopted close republishes at the origin's own revision, which the
+        // origin ignores, so the exchange settles instead of climbing.
+        const std::uint64_t settledA = a.revision();
+        const std::uint64_t settledB = b.revision();
+        exchange(a, b, kT0 + 70);
+        CHECK_EQ(a.revision(), settledA);
+        CHECK_EQ(b.revision(), settledB);
+    }
+}
+
+TEST(ACoordinatorCloseWithALowerRevisionStillClosesAndStoresAHigherRevision) {
+    BrightnessEngine engine;
+    engine.setWeatherGate(false, 40, kT0);
+    engine.setWeatherGate(true, 3, kT0 + 1);
+    CHECK(engine.weatherGateClosed());
+    CHECK_EQ(engine.weatherGateRevision(), std::uint64_t{41});
+
+    engine.setWeatherGate(false, 0, kT0 + 2);
+    CHECK(!engine.weatherGateClosed());
+    CHECK_EQ(engine.weatherGateRevision(), std::uint64_t{42});
+}
+
+TEST(TheGateRevisionSaturatesAtTheLargestExactJsonInteger) {
+    BrightnessEngine engine;
+    engine.setWeatherGate(true, showmesh::kMaxWeatherGateRevision, kT0);
+    engine.setWeatherGate(false, 0, kT0 + 1);
+    CHECK(!engine.weatherGateClosed());
+    CHECK_EQ(engine.weatherGateRevision(), showmesh::kMaxWeatherGateRevision);
+}
+
+TEST(APeersOpenGateWithAHugeRevisionIsIgnored) {
+    BrightnessEngine local;
+    local.setInstanceId("local");
+    local.setWeatherGate(true, 3, kT0);
+
+    BrightnessState peer = local.captureState(kT0);
+    peer.instanceId = "peer";
+    peer.stateChangedAtMillis = kT0 + 1000;
+    peer.weatherGateClosed = false;
+    peer.weatherGateRevision = showmesh::kMaxWeatherGateRevision;
+
+    CHECK(local.adoptState(peer, kT0) == StateAdoption::kAdopted);
+    CHECK(local.weatherGateClosed());
+    CHECK_EQ(local.weatherGateRevision(), std::uint64_t{3});
+}
+
+TEST(APeersClosedGateAtAnEqualRevisionIsIgnored) {
+    BrightnessEngine local;
+    local.setInstanceId("local");
+    local.setWeatherGate(false, 6, kT0);
+    const std::uint64_t before = local.revision();
+
+    BrightnessState peer = local.captureState(kT0);
+    peer.instanceId = "peer";
+    peer.stateChangedAtMillis = kT0 - 1000;
+    peer.weatherGateClosed = true;
+    peer.weatherGateRevision = 6;
+
+    CHECK(local.adoptState(peer, kT0) == StateAdoption::kRejectedStaleRevision);
+    CHECK(!local.weatherGateClosed());
+    CHECK_EQ(local.revision(), before);
+}
+
+TEST(APeersClosedGateAtANewerRevisionMovesTheLocalRevisionWithoutTouchingTheOrderingKey) {
+    BrightnessEngine local;
+    local.setInstanceId("local");
+    local.setWeatherGate(true, 2, kT0);
+    const BrightnessState before = local.captureState(kT0);
+
+    BrightnessState peer = before;
+    peer.instanceId = "peer";
+    peer.stateChangedAtMillis = kT0 - 1000;
+    peer.weatherGateRevision = 9;
+
+    CHECK(local.adoptState(peer, kT0) == StateAdoption::kRejectedStaleRevision);
+    CHECK_EQ(local.weatherGateRevision(), std::uint64_t{9});
+    CHECK_EQ(local.captureState(kT0).stateChangedAtMillis, before.stateChangedAtMillis);
+}
+
+TEST(AGateRevisionOutsideItsDomainFailsTheDecode) {
+    BrightnessEngine engine;
+    const std::string encoded = showmesh::encodeBrightnessState(engine.captureState(kT0));
+    const std::string key = "\"weatherGateRevision\":0";
+    CHECK(encoded.find(key) != std::string::npos);
+    for (const char* bad : {"-1", "1.5", "9007199254740992", "\"3\""}) {
+        std::string text = encoded;
+        text.replace(text.find(key), key.size(), std::string("\"weatherGateRevision\":") + bad);
+        CHECK(!showmesh::decodeBrightnessState(text).ok);
+    }
+    std::string largest = encoded;
+    largest.replace(largest.find(key), key.size(), "\"weatherGateRevision\":9007199254740991");
+    const showmesh::BrightnessStateDecode decoded = showmesh::decodeBrightnessState(largest);
+    CHECK(decoded.ok);
+    CHECK_EQ(decoded.state.weatherGateRevision, showmesh::kMaxWeatherGateRevision);
+}

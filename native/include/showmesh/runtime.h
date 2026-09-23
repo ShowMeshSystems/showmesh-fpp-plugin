@@ -18,6 +18,7 @@
 #include "showmesh/playlist_identity.h"
 #include "showmesh/sequence_store.h"
 #include "showmesh/transition_gain.h"
+#include "showmesh/weather_gate.h"
 
 // The adapter-facing runtime. Everything here is shared by the FPP 9 and
 // FPP 10 adapters and knows nothing about either one's plugin lifecycle or
@@ -334,6 +335,18 @@ class ShowMeshRuntime {
     // it and make the plugin unsafe to unload. Keep this synchronous.
     TransitionGainResponse applyTransitionGain(const std::string& body);
 
+    // Serves the weather-gate write registered beside the transition-gain
+    // route. Synchronous for the same reason. Unlike applyTransitionGain,
+    // an applied write also flushes brightness state immediately: a
+    // closed gate must survive a restart even when fppd is not currently
+    // outputting frames, so it cannot wait for modifyChannelData's own
+    // per-frame dirty mark the way a ceiling or gain change can.
+    WeatherGateResponse applyWeatherGate(const std::string& body);
+
+    // Serves the GET route registered beside the write: the current state,
+    // never a write.
+    WeatherGateResponse weatherGateState();
+
     // Serves one contract section 3.9 republish. Called from fppd's own
     // web thread, and synchronous for exactly the reason
     // applyTransitionGain() is. It clears the publisher's held set and
@@ -402,9 +415,8 @@ class ShowMeshRuntime {
     // state; the store's actual write -- a read, a hash, two fsyncs, and
     // a rename -- runs with the lock released, so a caller never blocks
     // modifyChannelData, or another flush caller, for the duration of a
-    // slow write. Safe to call from any thread; callers do not need to
-    // serialize against each other, only against engine_ itself the way
-    // every other engine_ access already does.
+    // slow write. Safe to call from any thread: concurrent callers are
+    // serialized on brightnessFlushMutex_, never on engineMutex_.
     bool flushBrightnessState();
 
     // Marks the engine's brightness state as needing to be persisted,
@@ -521,6 +533,12 @@ class ShowMeshRuntime {
     // backup slot for nothing.
     std::uint64_t flushedBrightnessRevision_ = 0;
     bool brightnessEverFlushed_ = false;
+    // Held across a whole flushBrightnessState(), capture through store.
+    std::mutex brightnessFlushMutex_;
+    // Guarded by brightnessFlushMutex_: the gate both on-disk records last
+    // agreed on. No readable record reads as open, which is what restart does.
+    bool storedGateClosed_ = false;
+    std::uint64_t storedGateRevision_ = 0;
     std::atomic<bool> running_{false};
     // True only while workerLoop() is on the stack. It is what lets a
     // sweep abandon its remaining definitions when stop() is waiting to

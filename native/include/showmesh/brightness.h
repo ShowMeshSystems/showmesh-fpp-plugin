@@ -111,7 +111,21 @@ struct BrightnessState {
     double lastAppliedCeiling = 100.0;
     double lastAppliedGain = 100.0;
     TimeMillis persistedAtMillis = 0;
+
+    // The weather gate: closed forces every output channel dark,
+    // independent of the ceiling and gain. Optional on decode: a payload
+    // written before this field existed decodes with it false ("not
+    // mentioned"), which is also the correct default for a genuine first
+    // run. See BrightnessEngine::adoptState and ::restoreFromPersisted for
+    // what "not mentioned" means on each path.
+    bool weatherGateClosed = false;
+    // Issued by the coordinator; orders peer gate adoption. Missing reads as 0.
+    std::uint64_t weatherGateRevision = 0;
 };
+
+// The largest gate revision a coordinator write or peer payload may carry:
+// every value up to it survives the JSON number round trip exactly.
+constexpr std::uint64_t kMaxWeatherGateRevision = (std::uint64_t{1} << 53) - 1;
 
 enum class StateAdoption {
     kAdopted,
@@ -168,14 +182,28 @@ class BrightnessEngine {
     double ceilingAt(TimeMillis now) const { return ceiling_.valueAt(now); }
     double gainAt(TimeMillis now) const { return gain_.valueAt(now); }
 
-    // The composed percentage actually applied to channel data.
+    // The composed percentage actually applied to channel data: 0 whenever
+    // the weather gate is closed, round(ceiling * gain / 100) otherwise.
     int effectivePercentAt(TimeMillis now) const;
 
     bool fadingAt(TimeMillis now) const { return ceiling_.fadingAt(now) || gain_.fadingAt(now); }
 
     // Scales one frame in place. Channels outside the configured ranges,
-    // and channels inside an exclusion, are not written at all.
+    // and channels inside an exclusion, are not written at all -- unless
+    // the weather gate is closed, in which case every channel the plugin
+    // can write goes to 0 regardless of range configuration.
     void applyToFrame(std::uint8_t* channelData, std::size_t channelCount, TimeMillis now);
+
+    // Whether the weather gate is currently closed. See setWeatherGate.
+    bool weatherGateClosed() const { return gateClosed_; }
+    std::uint64_t weatherGateRevision() const { return gateRevision_; }
+
+    // The coordinator-facing weather-gate write (showmesh/weather_gate.h).
+    // No fade: closing and opening are immediate, and a ceiling or gain
+    // fade keeps running underneath so opening reveals its current value.
+    // Always applies; the stored gate revision becomes
+    // max(stored + 1, revision), so a peer holding an older gate cannot undo it.
+    void setWeatherGate(bool closed, std::uint64_t revision, TimeMillis now);
 
     // Full-state exchange. captureState is what this node publishes and
     // persists; adoptState is what it does with another node's or a
@@ -211,7 +239,14 @@ class BrightnessEngine {
     // rule bumpRevision applies elsewhere), so the settle is published
     // and a MultiSync group can converge on it instead of a settled node
     // sitting silent forever.
-    void settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now);
+    //
+    // gateClosed carries whatever the best record this restart could find
+    // said about the weather gate, independent of whether that record's
+    // ceiling/gain timing is trusted: an unreadable primary does not mean
+    // an unreadable gate when a recovered backup still names one. Defaults
+    // to false (open) for the case where no record exists to read at all.
+    void settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now, bool gateClosed = false,
+                                         std::uint64_t gateRevision = 0);
 
     std::uint64_t revision() const { return revision_; }
 
@@ -238,6 +273,10 @@ class BrightnessEngine {
     std::string instanceId_;
     double lastAppliedCeiling_ = 100.0;
     double lastAppliedGain_ = 100.0;
+    // Defaults open. See setWeatherGate, adoptState, and
+    // restoreFromPersisted for how each path may change it.
+    bool gateClosed_ = false;
+    std::uint64_t gateRevision_ = 0;
 
     // The MultiSync ordering key of the state this engine currently holds,
     // stored rather than recomputed on every comparison: see
