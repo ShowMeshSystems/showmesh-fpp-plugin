@@ -20,8 +20,10 @@ using showmesh::kMismatchVerdictAgeOutMillis;
 using showmesh::PlaylistAction;
 using showmesh::PlaylistEntryObservation;
 using showmesh::PlaylistMismatchNotifier;
+using showmesh::ReportsRefusedNotifier;
 using showmesh::RetryPolicy;
 using showmesh::ShowMesh_PlaylistMismatch;
+using showmesh::ShowMesh_ReportsRefused;
 using showmesh::StatusSink;
 using showmesh::TimeMillis;
 
@@ -134,6 +136,22 @@ class RecordingMismatchNotifier : public PlaylistMismatchNotifier {
 
     void raiseMismatch(int id, const std::string& message) override { raised.push_back(Call{id, message}); }
     void clearMismatch(int id, const std::string& message) override { cleared.push_back(Call{id, message}); }
+
+    std::vector<Call> raised;
+    std::vector<Call> cleared;
+};
+
+// Same recording shape as RecordingMismatchNotifier, for the unrelated
+// reports-refused notice.
+class RecordingReportsRefusedNotifier : public ReportsRefusedNotifier {
+ public:
+    struct Call {
+        int id;
+        std::string message;
+    };
+
+    void raiseRefused(int id, const std::string& message) override { raised.push_back(Call{id, message}); }
+    void clearRefused(int id, const std::string& message) override { cleared.push_back(Call{id, message}); }
 
     std::vector<Call> raised;
     std::vector<Call> cleared;
@@ -707,4 +725,77 @@ TEST(AMismatchOutcomeWithNoOperatorInstructionIsNotRaised) {
     CHECK(client.publish(resolvedObservation()));
     CHECK(notifier.raised.empty());
     CHECK(notifier.cleared.empty());
+}
+
+TEST(TheReportsRefusedNoticeIsRaisedOnAConflict) {
+    FakeTransport transport;
+    transport.responses.push_back(FakeTransport::refused(409, "playlist observation sequence regression"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+    CHECK_EQ(notifier.raised[0].id, ShowMesh_ReportsRefused);
+    CHECK(contains(notifier.raised[0].message, "playlist observation sequence regression"));
+    CHECK(contains(notifier.raised[0].message, "reset-observation-sequence"));
+    CHECK(notifier.cleared.empty());
+
+    const CoordinatorStatus status = client.status();
+    CHECK_EQ(status.reportsRefusedReason, notifier.raised[0].message);
+}
+
+TEST(TheReportsRefusedNoticeIsNotRaisedTwiceForTheSameReason) {
+    FakeTransport transport;
+    transport.responses.push_back(FakeTransport::refused(409, "playlist observation sequence regression"));
+    transport.responses.push_back(FakeTransport::refused(409, "playlist observation sequence regression"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+    CHECK(notifier.cleared.empty());
+}
+
+TEST(TheReportsRefusedNoticeIsReplacedWhenTheReasonChanges) {
+    FakeTransport transport;
+    transport.responses.push_back(FakeTransport::refused(409, "playlist observation sequence regression"));
+    transport.responses.push_back(FakeTransport::refused(401, "the bearer token was rejected"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.cleared.size(), std::size_t{1});
+    CHECK_EQ(notifier.cleared[0].message, notifier.raised[0].message);
+    CHECK_EQ(notifier.raised.size(), std::size_t{2});
+    CHECK(notifier.raised[1].message != notifier.raised[0].message);
+}
+
+TEST(TheReportsRefusedNoticeClearsOnAcceptance) {
+    FakeTransport transport;
+    transport.responses.push_back(FakeTransport::refused(409, "playlist observation sequence regression"));
+    transport.responses.push_back(FakeTransport::ok(202));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+
+    CHECK(client.publish(resolvedObservation()));
+    CHECK_EQ(notifier.cleared.size(), std::size_t{1});
+    CHECK_EQ(notifier.cleared[0].message, notifier.raised[0].message);
+
+    const CoordinatorStatus status = client.status();
+    CHECK(status.reportsRefusedReason.empty());
 }

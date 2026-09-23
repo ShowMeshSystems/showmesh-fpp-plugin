@@ -15,6 +15,31 @@ namespace {
 
 constexpr const char* kStatusFilename = "observation-status.json";
 
+// The fixed half of the reports-refused notice. The coordinator's own
+// refusal reason (or the transport error) is prepended to this.
+constexpr const char* kReportsRefusedInstruction =
+    "Clear the playlist observation on the coordinator's Monitor screen, or run showmeshctl fpp "
+    "reset-observation-sequence";
+
+// True for the outcome labels postWithRetry() assigns to a conflict, an
+// unauthorized or forbidden refusal, or a transport failure -- the four
+// causes an operator cannot resolve by simply waiting.
+bool isReportsRefusedOutcome(const std::string& label) {
+    return label == "conflict" || label == "unauthorized" || label == "coordinator-unreachable" ||
+           label.rfind("forbidden", 0) == 0;
+}
+
+std::string composeReportsRefusedMessage(const std::string& reason) {
+    std::string message = reason;
+    if (!message.empty()) {
+        const char last = message.back();
+        if (last != '.' && last != '!' && last != '?') message += '.';
+        message += ' ';
+    }
+    message += kReportsRefusedInstruction;
+    return message;
+}
+
 bool isSuccess(int statusCode) { return statusCode >= 200 && statusCode < 300; }
 
 // Retryable means "the same bytes could still be accepted later". A 4xx
@@ -99,6 +124,7 @@ std::string renderCoordinatorStatus(const CoordinatorStatus& status) {
     addNumber(&members, "coalescedAcknowledged", static_cast<double>(status.coalescedAcknowledged));
     addNumber(&members, "lastStatusCode", status.lastStatusCode);
     addString(&members, "lastOutcome", status.lastOutcome);
+    addString(&members, "reportsRefusedReason", status.reportsRefusedReason);
     addString(&members, "lastError", status.lastError);
     addNumber(&members, "lastSuccessAtMillis", static_cast<double>(status.lastSuccessAtMillis));
     addNumber(&members, "lastFailureAtMillis", static_cast<double>(status.lastFailureAtMillis));
@@ -113,7 +139,8 @@ void FileStatusSink::writeStatus(const std::string& json) { writeFileAtomically(
 
 CoordinatorClient::CoordinatorClient(HttpTransport* transport, CredentialSource* credentials, std::string baseUrl,
                                      Clock clock, StatusSink* statusSink, Sleeper sleeper, RetryPolicy policy,
-                                     PlaylistMismatchNotifier* mismatchNotifier)
+                                     PlaylistMismatchNotifier* mismatchNotifier,
+                                     ReportsRefusedNotifier* reportsRefusedNotifier)
     : transport_(transport),
       credentials_(credentials),
       baseUrl_(std::move(baseUrl)),
@@ -121,7 +148,8 @@ CoordinatorClient::CoordinatorClient(HttpTransport* transport, CredentialSource*
       statusSink_(statusSink),
       sleeper_(sleeper == nullptr ? sleepMillis : sleeper),
       policy_(policy),
-      mismatchNotifier_(mismatchNotifier) {
+      mismatchNotifier_(mismatchNotifier),
+      reportsRefusedNotifier_(reportsRefusedNotifier) {
     status_.configured = transport_ != nullptr && credentials_ != nullptr && !baseUrl_.empty();
     if (!status_.configured && status_.configurationError.empty()) {
         status_.configurationError = "no coordinator base URL or credential source is configured";
@@ -203,16 +231,28 @@ bool CoordinatorClient::sendObservation(const PlaylistEntryObservation& observat
     }
 
     const Outcome outcome = postWithRetry(kObservationPath, payload.body);
+    const bool raiseReportsRefused = !outcome.accepted && isReportsRefusedOutcome(outcome.label);
+    const std::string reportsRefusedMessage =
+        raiseReportsRefused ? composeReportsRefusedMessage(outcome.error) : std::string();
     {
         std::lock_guard<std::mutex> guard(mutex_);
         if (outcome.accepted) {
             ++status_.observationsAccepted;
             status_.coalescedAcknowledged += observation.coalescedSincePreviousAcknowledged;
+            status_.reportsRefusedReason.clear();
         } else {
             ++status_.observationsRefused;
+            if (raiseReportsRefused) status_.reportsRefusedReason = reportsRefusedMessage;
         }
     }
     publishStatus();
+    if (reportsRefusedNotifier_ != nullptr) {
+        if (raiseReportsRefused) {
+            raiseReportsRefusedNotice(reportsRefusedMessage);
+        } else if (outcome.accepted) {
+            clearReportsRefusedNotice();
+        }
+    }
     if (mismatchNotifier_ != nullptr) {
         // Every accepted receipt carries this instance's current
         // reconciliation verdict, including on an idempotent replay, so
@@ -269,6 +309,23 @@ void CoordinatorClient::clearMismatchNotice() {
     mismatchNotifier_->clearMismatch(ShowMesh_PlaylistMismatch, lastRaisedMessage_);
     mismatchActive_ = false;
     lastRaisedMessage_.clear();
+}
+
+void CoordinatorClient::raiseReportsRefusedNotice(const std::string& message) {
+    if (reportsRefusedActive_ && lastRaisedReportsRefusedMessage_ == message) return;
+    if (reportsRefusedActive_) {
+        reportsRefusedNotifier_->clearRefused(ShowMesh_ReportsRefused, lastRaisedReportsRefusedMessage_);
+    }
+    reportsRefusedNotifier_->raiseRefused(ShowMesh_ReportsRefused, message);
+    lastRaisedReportsRefusedMessage_ = message;
+    reportsRefusedActive_ = true;
+}
+
+void CoordinatorClient::clearReportsRefusedNotice() {
+    if (!reportsRefusedActive_) return;
+    reportsRefusedNotifier_->clearRefused(ShowMesh_ReportsRefused, lastRaisedReportsRefusedMessage_);
+    reportsRefusedActive_ = false;
+    lastRaisedReportsRefusedMessage_.clear();
 }
 
 bool CoordinatorClient::publishDefinition(const std::string& instanceUuid, const std::string& playlistName,

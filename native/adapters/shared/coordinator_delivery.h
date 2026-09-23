@@ -5,6 +5,7 @@
 
 #include "curl_http_transport.h"
 #include "playlist_mismatch_notifier.h"
+#include "reports_refused_notifier.h"
 #include "showmesh/coordinator_client.h"
 #include "showmesh/coordinator_config.h"
 #include "showmesh/sequence_store.h"
@@ -25,7 +26,7 @@ class CoordinatorDelivery {
           statusSink_(stateDir_),
           credentials_(),
           client_(&transport_, &credentials_, resolveBaseUrl(stateDir_, &configurationError_), clock, &statusSink_,
-                  sleepMillis, RetryPolicy(), &mismatchNotifier_) {
+                  sleepMillis, RetryPolicy(), &mismatchNotifier_, &reportsRefusedNotifier_) {
         // A host with no coordinator URL yet still loads the plugin and
         // still runs the show; every post then fails visibly in the local
         // status record rather than silently doing nothing.
@@ -53,6 +54,7 @@ class CoordinatorDelivery {
     // construction onward, and member initialization follows declaration
     // order regardless of the initializer list's order.
     WarningHolderMismatchNotifier mismatchNotifier_;
+    WarningHolderReportsRefusedNotifier reportsRefusedNotifier_;
     CoordinatorClient client_;
 };
 

@@ -87,6 +87,10 @@ struct CoordinatorStatus {
     std::string lastOutcome;
     // Operator-facing text for the last failure. Never the credential.
     std::string lastError;
+    // Non-empty exactly while the reports-refused notice is raised: the
+    // coordinator's refusal reason plus the fixed recovery sentence, the
+    // same text given to ReportsRefusedNotifier. Empty otherwise.
+    std::string reportsRefusedReason;
     TimeMillis lastSuccessAtMillis = 0;
     TimeMillis lastFailureAtMillis = 0;
 };
@@ -126,7 +130,8 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // this client ever sees.
     CoordinatorClient(HttpTransport* transport, CredentialSource* credentials, std::string baseUrl, Clock clock,
                       StatusSink* statusSink = nullptr, Sleeper sleeper = sleepMillis,
-                      RetryPolicy policy = RetryPolicy(), PlaylistMismatchNotifier* mismatchNotifier = nullptr);
+                      RetryPolicy policy = RetryPolicy(), PlaylistMismatchNotifier* mismatchNotifier = nullptr,
+                      ReportsRefusedNotifier* reportsRefusedNotifier = nullptr);
 
     // Records why the client cannot post, for a configuration failure the
     // caller detected (a config.json that would not load, for instance).
@@ -197,6 +202,13 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // between the raise and the clear.
     void clearMismatchNotice();
 
+    // Called once per sendObservation() outcome. Raises when the outcome
+    // is a conflict, an unauthorized or forbidden refusal, or a transport
+    // failure; clears on acceptance; otherwise leaves the notice state
+    // untouched, exactly like checkMismatchAgeOut() for the other notice.
+    void raiseReportsRefusedNotice(const std::string& message);
+    void clearReportsRefusedNotice();
+
     HttpTransport* transport_;
     CredentialSource* credentials_;
     std::string baseUrl_;
@@ -240,6 +252,14 @@ class CoordinatorClient : public ObservationSink, public DefinitionPublisher {
     // was actually present, so a reachable coordinator whose own verdict
     // lookup keeps failing does not itself trigger an age-out clear.
     TimeMillis lastVerdictAtMillis_ = 0;
+
+    // Worker-thread only, like mismatchNotifier_ above.
+    ReportsRefusedNotifier* reportsRefusedNotifier_;
+    // Whether reportsRefusedNotifier_ currently believes the notice is
+    // raised, and the exact message it was last raised with. See
+    // mismatchActive_ / lastRaisedMessage_ above.
+    bool reportsRefusedActive_ = false;
+    std::string lastRaisedReportsRefusedMessage_;
 };
 
 }  // namespace showmesh
