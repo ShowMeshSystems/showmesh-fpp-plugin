@@ -64,11 +64,9 @@ std::string stripControlAndMarkup(const std::string& text) {
 
 constexpr std::size_t kRefusalReasonMaxChars = 200;
 
-// Reduces a refusal's raw error text (a problem+json body, an HTML error
-// page, or a transport error string) to a short, stable reason: a
+// Reduces a refusal's raw error text to a short, stable reason: a
 // problem+json "detail", falling back to "title", falling back to the
-// status code, then stripped and capped. Stable across retries even when
-// the coordinator's own body varies request to request.
+// status code, then stripped and capped.
 std::string extractRefusalReason(int statusCode, const std::string& rawError) {
     std::string reason;
     const json::ParseResult parsed = json::parse(rawError);
@@ -92,7 +90,13 @@ std::string extractRefusalReason(int statusCode, const std::string& rawError) {
     }
     if (reason.empty()) reason = "coordinator returned HTTP " + std::to_string(statusCode);
     reason = stripControlAndMarkup(reason);
-    if (reason.size() > kRefusalReasonMaxChars) reason.resize(kRefusalReasonMaxChars);
+    if (reason.size() > kRefusalReasonMaxChars) {
+        std::size_t cut = kRefusalReasonMaxChars;
+        // Back up over any UTF-8 continuation bytes (10xxxxxx) so the cap
+        // cannot split a multi-byte character in the middle.
+        while (cut > 0 && (static_cast<unsigned char>(reason[cut]) & 0xc0) == 0x80) --cut;
+        reason.resize(cut);
+    }
     return reason;
 }
 
@@ -233,7 +237,10 @@ void CoordinatorClient::restoreFromPersistedStatus() {
     }
     if (lastOutcome.empty()) return;
     status_.lastOutcome = lastOutcome;
-    if (isReportsRefusedOutcome(lastOutcome) && !reportsRefusedReason.empty()) {
+    // Gated on the reason alone: lastOutcome can be overwritten by a later
+    // "stopped" or definition post, but the refusal itself stays unresolved
+    // until reportsRefusedReason is cleared by an accepted observation.
+    if (!reportsRefusedReason.empty()) {
         status_.reportsRefusedReason = reportsRefusedReason;
         if (reportsRefusedNotifier_ != nullptr) raiseReportsRefusedNotice(reportsRefusedReason);
     }

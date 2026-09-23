@@ -807,9 +807,8 @@ TEST(TheReportsRefusedNoticeClearsOnAcceptance) {
     CHECK(status.reportsRefusedReason.empty());
 }
 
-// finding 1: a problem+json body's "detail" field is the reason, not the
-// full raw body (which can carry an unbounded, machine-readable envelope
-// around it).
+// A problem+json body's "detail" field is the reason, not the full raw body
+// (which can carry an unbounded, machine-readable envelope around it).
 TEST(TheReportsRefusedReasonIsTheProblemBodysDetailField) {
     FakeTransport transport;
     transport.responses.push_back(FakeTransport::refused(
@@ -890,6 +889,27 @@ TEST(TheReportsRefusedReasonIsCappedAt200Characters) {
     CHECK(!client.publish(resolvedObservation()));
     const std::string reasonPart = notifier.raised[0].message.substr(0, 200);
     CHECK_EQ(reasonPart, std::string(200, 'x'));
+}
+
+// A multi-byte UTF-8 character straddling the 200-byte cap is dropped
+// whole rather than split, so the reason never ends in an invalid partial
+// character.
+TEST(TheReportsRefusedReasonCapDoesNotSplitAMultiByteCharacter) {
+    FakeTransport transport;
+    // 199 ASCII bytes followed by a 3-byte UTF-8 character (U+2603 SNOWMAN)
+    // straddling the 200-byte cap at byte 199.
+    const std::string detail = std::string(199, 'x') + "\xe2\x98\x83" + std::string(50, 'y');
+    transport.responses.push_back(FakeTransport::refused(409, "{\"detail\":\"" + detail + "\"}"));
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, nullptr, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK(!client.publish(resolvedObservation()));
+    const std::string reasonPart = notifier.raised[0].message.substr(0, 199);
+    CHECK_EQ(reasonPart, std::string(199, 'x'));
+    CHECK(!contains(notifier.raised[0].message, "\xe2\x98\x83"));
+    CHECK(!contains(notifier.raised[0].message, std::string(50, 'y')));
 }
 
 // The extracted reason is stable across retries even when the raw body
@@ -983,9 +1003,9 @@ TEST(TheReportsRefusedNoticeIsUntouchedByASchemaRefusedOutcome) {
     CHECK(notifier.cleared.empty());
 }
 
-// finding 2: after an fppd restart with a refusal standing, the notice
-// must come back from persisted status at construction, before any post
-// happens, rather than waiting for the next refused post.
+// After an fppd restart with a refusal standing, the notice must come back
+// from persisted status at construction, before any post happens, rather
+// than waiting for the next refused post.
 TEST(AConstructedClientRestoresAndRaisesTheReportsRefusedNoticeFromPersistedStatus) {
     FakeTransport transport;
     FakeCredentials credentials;
@@ -1027,4 +1047,48 @@ TEST(AConstructedClientRaisesNoNoticeFromAnAcceptedPersistedStatus) {
 
     CHECK(notifier.raised.empty());
     CHECK(client.status().reportsRefusedReason.empty());
+}
+
+// A refusal raised, then fppd stopped mid-backoff: lastOutcome is "stopped",
+// not a refusal label, but the reason is still unresolved and must restore.
+TEST(AConstructedClientRestoresTheNoticeWhenLastOutcomeIsStoppedButTheReasonStands) {
+    FakeTransport transport;
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    RecordingStatusSink statusSink;
+    statusSink.hasPersisted = true;
+    statusSink.persisted =
+        "{\"schemaVersion\":1,\"lastOutcome\":\"stopped\",\"reportsRefusedReason\":"
+        "\"playlist observation sequence regression. Clear the playlist observation on the coordinator's "
+        "Monitor screen, or run showmeshctl fpp reset-observation-sequence\"}";
+
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, &statusSink, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+    CHECK(contains(notifier.raised[0].message, "playlist observation sequence regression"));
+    CHECK(client.status().lastOutcome == std::string("stopped"));
+}
+
+// A definition post can overwrite lastOutcome to "accepted" while an
+// observation refusal's reason is still standing (:628 writes lastOutcome
+// on every post, :453 on definitions specifically). The restore is gated on
+// the reason, not on lastOutcome, so it still comes back here.
+TEST(AConstructedClientRestoresTheNoticeWhenLastOutcomeIsAcceptedButTheReasonStands) {
+    FakeTransport transport;
+    FakeCredentials credentials;
+    RecordingReportsRefusedNotifier notifier;
+    RecordingStatusSink statusSink;
+    statusSink.hasPersisted = true;
+    statusSink.persisted =
+        "{\"schemaVersion\":1,\"lastOutcome\":\"accepted\",\"reportsRefusedReason\":"
+        "\"playlist observation sequence regression. Clear the playlist observation on the coordinator's "
+        "Monitor screen, or run showmeshctl fpp reset-observation-sequence\"}";
+
+    CoordinatorClient client(&transport, &credentials, kBaseUrl, testClock, &statusSink, recordSleep, fastPolicy(),
+                             nullptr, &notifier);
+
+    CHECK_EQ(notifier.raised.size(), std::size_t{1});
+    CHECK(contains(notifier.raised[0].message, "playlist observation sequence regression"));
+    CHECK(client.status().lastOutcome == std::string("accepted"));
 }
