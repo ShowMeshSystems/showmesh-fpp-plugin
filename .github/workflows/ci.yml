@@ -285,8 +285,8 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # A clearly-non-release version: the pinned tag format is
-      # fpp-plugin-v<VERSION> and this is not that. It exists only so the
+      # A clearly-non-release version: the release tag format is
+      # v<VERSION> and this is not that. It exists only so the
       # artifact filenames and manifest are exercised end to end.
       - name: Build and self-verify the release artifacts
         run: make release VERSION=0.0.0-ci.${{ github.sha }}
