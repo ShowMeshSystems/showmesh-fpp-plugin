@@ -11,6 +11,12 @@ namespace showmesh {
 const char* const kBrightnessQueryPath = "/showmesh/brightness";
 const char* const kBrightnessQueryLanPath = "/api/plugin-apis/showmesh/brightness";
 
+BrightnessQueryResponse brightnessQueryResponseFor(const json::CanonicalResult& rendered) {
+    // No numbers on failure: a zeroed document would be read as a real ceiling of 0.
+    if (!rendered.ok) return BrightnessQueryResponse{500, std::string()};
+    return BrightnessQueryResponse{200, rendered.text};
+}
+
 BrightnessQueryResponse renderBrightnessQuery(const BrightnessEngine& engine, TimeMillis now) {
     std::vector<json::Value::Member> members;
     members.emplace_back("schemaVersion", json::Value::makeNumber(kBrightnessQuerySchemaVersion));
@@ -21,12 +27,7 @@ BrightnessQueryResponse renderBrightnessQuery(const BrightnessEngine& engine, Ti
     members.emplace_back("weatherGateClosed", json::Value::makeBool(engine.weatherGateClosed()));
     members.emplace_back("updatedAtMillis", json::Value::makeNumber(static_cast<double>(now)));
     json::CanonicalResult rendered = json::canonicalize(json::Value::makeObject(std::move(members)));
-    if (!rendered.ok) {
-        return BrightnessQueryResponse{200,
-                                       R"({"schemaVersion":1,"ceiling":0,"transitionGain":0,)"
-                                       R"("effectiveOutput":0,"fadeActive":false,"weatherGateClosed":false,"updatedAtMillis":0})"};
-    }
-    return BrightnessQueryResponse{200, rendered.text};
+    return brightnessQueryResponseFor(rendered);
 }
 
 }  // namespace showmesh
