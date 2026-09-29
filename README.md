@@ -138,10 +138,11 @@ The test harness is a hundred lines in `native/tests/check.h`, for the same
 reason there are no library dependencies: this source is compiled on an FPP
 host with whatever toolchain that host has, and nothing may need fetching.
 
-**Brightness.** Two independently owned values, each with its own fade:
+**Brightness.** Two independently owned values, each with its own fade, and one
+weather gate that is not a value at all:
 
 ```text
-effective output = round(ceiling * transition_gain / 100)
+effective output = gate closed ? 0 : round(ceiling * transition_gain / 100)
 ```
 
 The ceiling is what FPP's scheduler and operator commands write; the transition
@@ -153,12 +154,44 @@ A fade started while another is running begins at the current interpolated
 value, so replacement introduces no jump. Channels outside the configured apply
 ranges, and channels inside an exclusion, are never written.
 
-Full state, including any active fade, is what nodes exchange and what is
-persisted: never a relative adjustment, so a duplicated or delayed payload is
-harmless and a stale or unreadable one is rejected rather than guessed at.
-After a restart the engine resumes a fade whose recorded timing it can place,
-and otherwise settles on the darker of the last applied value and the target.
-It never comes back brighter than what it was already applying.
+The weather gate is a coordinator-written open/closed switch, default open,
+with no fade of its own: closing and opening are immediate, and a ceiling or
+gain fade keeps running underneath a closed gate, so opening it reveals
+whatever that fade has reached rather than a cached value from before it
+closed. Closed forces every channel the plugin can write to 0, including a
+channel outside every apply range or inside an exclusion; it is the one case
+where range configuration is ignored. It is written at
+`/showmesh/brightness/weather-gate`, registered beside the transition-gain
+route with the same registration, authentication, body-size, and refusal
+handling, and is deliberately not reachable from any FPP action or schedule
+for the same reason the transition gain is not. The body is exactly
+`{"closed": true|false, "revision": <integer 0..2^53-1>}`, where the
+coordinator issues the revision; a missing or out-of-range revision is
+refused without changing state. A valid write always applies, whatever its
+revision, and leaves the stored gate revision at
+max(stored revision + 1, the given revision), so a coordinator that restarts
+its numbering can still close the gate. The response and the `GET` document
+report it as `weatherGateRevision`.
+
+Full state, including any active fade and the weather gate, is what nodes
+exchange and what is persisted: never a relative adjustment, so a duplicated
+or delayed payload is harmless and a stale or unreadable one is rejected
+rather than guessed at. After a restart the engine resumes a fade whose
+recorded timing it can place, and otherwise settles on the darker of the last
+applied value and the target. It never comes back brighter than what it was
+already applying. The gate is not part of that darker-only comparison; it is
+its own switch, trusted directly off whatever record can be read regardless
+of whether that record's fade timing is trusted. Over MultiSync, a peer's
+closed gate is adopted only when its gate revision is strictly greater than
+this host's, and adopting it takes that revision; this is independent of the
+ordering key and its timestamp checks. A peer's open gate is never adopted,
+since only the coordinator's own write may open a gate. Because a resume
+opens each host at a newer revision than the close, a host still closed at
+the older revision cannot re-close one the coordinator already opened, and
+a later close at a newer revision still spreads. A payload from before this
+field existed decodes with it absent, which is treated as "not mentioned"
+rather than "open": for a peer payload that means no change, and for a persisted record it means no
+record has ever said closed.
 
 **Playlist identity.** The canonical playlist hash is SHA-256 over the RFC 8785
 canonicalization of the complete definition FPP returned, with no field
@@ -303,6 +336,20 @@ timing can be trusted, and otherwise settles at the darker of the recorded
 target and the recorded last-applied value. `ShowMeshRuntime` restores from
 the store on construction and exposes `flushBrightnessState()` alongside
 `flushSequenceState()`; both adapters call it at the same teardown point.
+
+The weather gate rides the same record but is not subject to that darker-only
+comparison: a restart trusts it directly off whatever record it can read,
+including a recovered backup whose ceiling and gain are not trusted for
+timing purposes, so a restart with a persisted closed gate comes back closed
+before the first frame is written. A flush that changes the gate or its
+revision writes the record twice, so the rotated backup always agrees with the primary on the
+gate and its revision. A record without a revision reads as revision 0.
+With both records unreadable the gate restarts open at revision 0.
+`ShowMeshRuntime::applyWeatherGate()` also
+flushes brightness state synchronously on an applied write, unlike the
+transition-gain write: a closed gate must survive a restart even when `fppd`
+is not currently outputting frames and would otherwise never reach the
+per-frame dirty mark `modifyChannelData` relies on.
 
 ## The FPP adapters
 

@@ -141,9 +141,17 @@ ValidationResult BrightnessEngine::setGain(int targetPercent, std::int64_t fadeS
 }
 
 int BrightnessEngine::effectivePercentAt(TimeMillis now) const {
+    if (gateClosed_) return 0;
     const double composed = ceiling_.valueAt(now) * gain_.valueAt(now) / 100.0;
     const long rounded = std::lround(clampPercent(composed));
     return static_cast<int>(rounded);
+}
+
+void BrightnessEngine::setWeatherGate(bool closed, std::uint64_t revision, TimeMillis now) {
+    gateClosed_ = closed;
+    const std::uint64_t next = std::min(gateRevision_ + 1, kMaxWeatherGateRevision);
+    gateRevision_ = std::max(next, std::min(revision, kMaxWeatherGateRevision));
+    bumpRevision(now);
 }
 
 void BrightnessEngine::recomputeScaledSpans() {
@@ -184,6 +192,14 @@ void BrightnessEngine::applyToFrame(std::uint8_t* channelData, std::size_t chann
     lastAppliedGain_ = gain_.valueAt(now);
     if (channelData == nullptr || channelCount == 0) return;
 
+    if (gateClosed_) {
+        // Every channel the plugin can write, not just the configured
+        // spans: this is the one case where range configuration is
+        // ignored.
+        std::fill(channelData, channelData + channelCount, std::uint8_t{0});
+        return;
+    }
+
     const int percent = effectivePercentAt(now);
     if (percent == kMaxPercent) return;
 
@@ -219,6 +235,8 @@ BrightnessState BrightnessEngine::captureState(TimeMillis now) const {
     s.lastAppliedCeiling = lastAppliedCeiling_;
     s.lastAppliedGain = lastAppliedGain_;
     s.persistedAtMillis = now;
+    s.weatherGateClosed = gateClosed_;
+    s.weatherGateRevision = gateRevision_;
     return s;
 }
 
@@ -244,6 +262,14 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state, TimeMil
     if (state.schemaVersion != kBrightnessStateSchemaVersion) {
         return StateAdoption::kRejectedUnsupportedVersion;
     }
+    // A peer's closed gate is adopted only at a strictly newer gate revision,
+    // before and independent of the ordering-key checks. An open gate never
+    // is: only setWeatherGate (the coordinator write) opens it.
+    if (state.weatherGateClosed && state.weatherGateRevision > gateRevision_) {
+        gateClosed_ = true;
+        gateRevision_ = std::min(state.weatherGateRevision, kMaxWeatherGateRevision);
+        ++revision_;
+    }
     if (!timestampIsPlausible(state.stateChangedAtMillis)) {
         return StateAdoption::kRejectedImplausibleTimestamp;
     }
@@ -267,6 +293,7 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state, TimeMil
         !fadeWindowIsPlausible(state.gainFadeStartMillis, state.gainFadeEndMillis)) {
         return StateAdoption::kRejectedInvalidFadeWindow;
     }
+
     // Full state is ordered by (stateChangedAtMillis, instanceId,
     // canonicalStateHash) compared lexicographically as a total order, not
     // by the sender's local revision counter, so two nodes that each ran
@@ -346,6 +373,14 @@ FadeWindowShape classifyFadeWindow(TimeMillis startMillis, TimeMillis endMillis)
 StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& state, TimeMillis now) {
     const double safeCeiling = std::min(clampPercent(state.lastAppliedCeiling), clampPercent(state.ceilingTarget));
     const double safeGain = std::min(clampPercent(state.lastAppliedGain), clampPercent(state.gainTarget));
+
+    // The gate is trusted directly off this record, independent of
+    // whether its ceiling/gain timing is trusted below: a record whose
+    // fade timing cannot be placed still said what it said about the
+    // gate. A record that never mentions it decodes with the field false,
+    // which is exactly "no record ever said closed".
+    gateClosed_ = state.weatherGateClosed;
+    gateRevision_ = std::min(state.weatherGateRevision, kMaxWeatherGateRevision);
 
     if (state.schemaVersion != kBrightnessStateSchemaVersion) {
         // The field meanings may have changed, so no fade is resumed and
@@ -446,12 +481,15 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
     return StateAdoption::kAdopted;
 }
 
-void BrightnessEngine::settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now) {
+void BrightnessEngine::settleSafeAfterUntrustedRestart(int safeCeilingPercent, TimeMillis now, bool gateClosed,
+                                                       std::uint64_t gateRevision) {
     const double safeCeiling = clampPercent(static_cast<double>(safeCeilingPercent));
     ceiling_.settle(safeCeiling);
     gain_.settle(kMaxPercent);
     lastAppliedCeiling_ = safeCeiling;
     lastAppliedGain_ = kMaxPercent;
+    gateClosed_ = gateClosed;
+    gateRevision_ = std::min(gateRevision, kMaxWeatherGateRevision);
     bumpRevision(now);
 }
 

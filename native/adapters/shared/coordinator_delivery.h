@@ -5,6 +5,7 @@
 
 #include "curl_http_transport.h"
 #include "playlist_mismatch_notifier.h"
+#include "reports_refused_notifier.h"
 #include "showmesh/config_watcher.h"
 #include "showmesh/coordinator_client.h"
 #include "showmesh/coordinator_config.h"
@@ -26,7 +27,7 @@ class CoordinatorDelivery {
           statusSink_(stateDir_),
           credentials_(),
           client_(&transport_, &credentials_, resolveBaseUrl(stateDir_, &configurationError_), clock, &statusSink_,
-                  sleepMillis, RetryPolicy(), &mismatchNotifier_),
+                  sleepMillis, RetryPolicy(), &mismatchNotifier_, &reportsRefusedNotifier_),
           // Constructed after client_: it reads config.json itself, at
           // construction, only to establish tick()'s baseline mtime/size
           // for the same file resolveBaseUrl() just read above; it never
@@ -65,6 +66,7 @@ class CoordinatorDelivery {
     // construction onward, and member initialization follows declaration
     // order regardless of the initializer list's order.
     WarningHolderMismatchNotifier mismatchNotifier_;
+    WarningHolderReportsRefusedNotifier reportsRefusedNotifier_;
     CoordinatorClient client_;
     // Declared after client_: its constructor holds a pointer into it.
     ConfigWatcher configWatcher_;

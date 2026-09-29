@@ -361,7 +361,7 @@ TEST(BothAdaptersRegisterAndWithdrawBothRoutes) {
     // pointer to a destroyed member, and on FPP 10 a handler left
     // registered pins the .so and defeats FPP_PLUGIN_SUPPORTS_UNLOAD().
     const char* kAdapters[] = {"adapters/fpp9/plugin.cpp", "adapters/fpp10/plugin.cpp"};
-    const char* kConstants[] = {"kTransitionGainPath", "kDefinitionRepublishPath"};
+    const char* kConstants[] = {"kTransitionGainPath", "kWeatherGatePath", "kDefinitionRepublishPath"};
     for (const char* adapter : kAdapters) {
         const std::string source = readFileOrFail(adapter);
         for (const char* constant : kConstants) {

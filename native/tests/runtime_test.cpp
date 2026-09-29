@@ -1710,3 +1710,148 @@ TEST(ThePassCounterRidesAnUnavailableObservationToo) {
     CHECK(sink.unavailable[0].playlistLoop.has_value());
     CHECK_EQ(*sink.unavailable[0].playlistLoop, 4);
 }
+
+// The weather-gate write's own acceptance property: a closed gate must be
+// durable immediately, not only once a frame happens to pass through
+// modifyChannelData, because a host can be closed for weather ahead of a
+// show that has not started outputting yet.
+TEST(ApplyWeatherGateFlushesImmediatelyWithoutAFrame) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    BrightnessFileStore store(dir.path());
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+
+    const showmesh::WeatherGateResponse r = runtime.applyWeatherGate(R"({"closed":true,"revision":1})");
+    CHECK_EQ(r.status, 200);
+
+    showmesh::BrightnessStateLoad loaded = store.load();
+    CHECK(loaded.ok);
+    CHECK(loaded.state.weatherGateClosed);
+}
+
+TEST(WeatherGateStateReadsWithoutWritingAnything) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+
+    const showmesh::WeatherGateResponse r = runtime.weatherGateState();
+    CHECK_EQ(r.status, 200);
+    CHECK(r.body.find(R"("applied":false)") != std::string::npos);
+    CHECK(r.body.find(R"("weatherGateClosed":false)") != std::string::npos);
+}
+
+// The full observable acceptance property: a plugin restart with a
+// persisted closed gate is dark on the very first frame, before any
+// command or MultiSync payload could reopen it.
+TEST(ARestartWithAPersistedClosedGateIsDarkOnTheFirstFrame) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    const TimeMillis savedNow = gNow;
+    std::vector<std::uint8_t> frame(4, 0xff);
+
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+        CHECK(runtime.applyBrightnessCommand("100", "0").ok);
+        CHECK_EQ(runtime.applyWeatherGate(R"({"closed":true,"revision":1})").status, 200);
+    }
+
+    RecordingSink secondSink;
+    BrightnessFileStore secondStore(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &secondStore);
+
+    CHECK(restarted.brightness()->weatherGateClosed());
+    restarted.modifyChannelData(frame.data(), frame.size());
+    for (std::uint8_t v : frame) {
+        CHECK_EQ(static_cast<int>(v), 0);
+    }
+
+    gNow = savedNow;
+}
+
+// A gate closed by a peer must reach disk without waiting for a frame:
+// an idle host restarted before its next frame would otherwise come back
+// open while the rest of the group is closed.
+TEST(APeerClosedGateIsPersistedWithoutAFrame) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+        CHECK(runtime.flushBrightnessState());
+
+        showmesh::BrightnessEngine peer;
+        peer.setInstanceId("peer");
+        peer.setWeatherGate(true, 1, gNow);
+        const std::string payload = showmesh::encodeBrightnessState(peer.captureState(gNow));
+        runtime.adoptEncodedFullState(reinterpret_cast<const std::uint8_t*>(payload.data()),
+                                      static_cast<int>(payload.size()));
+        CHECK(runtime.brightness()->weatherGateClosed());
+        CHECK(runtime.flushBrightnessIfDirty());
+    }
+    BrightnessFileStore store(dir.path());
+    const showmesh::BrightnessStateLoad loaded = store.load();
+    CHECK(loaded.ok);
+    CHECK(loaded.state.weatherGateClosed);
+    CHECK_EQ(loaded.state.weatherGateRevision, std::uint64_t{1});
+}
+
+namespace {
+
+// Writes the gate through the route, optionally corrupts the primary
+// (and the backup), then reports the gate a restarted runtime comes back with.
+struct RestartedGate {
+    bool closed;
+    std::uint64_t revision;
+};
+
+RestartedGate gateAfterRestart(const std::vector<bool>& writes, bool corruptPrimary, bool corruptBackup) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    {
+        BrightnessFileStore store(dir.path());
+        ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+        CHECK(runtime.applyBrightnessCommand("100", "0").ok);
+        CHECK(runtime.flushBrightnessState());
+        int revision = 0;
+        for (bool closed : writes) {
+            ++gNow;
+            const std::string body = std::string(R"({"closed":)") + (closed ? "true" : "false") +
+                                     R"(,"revision":)" + std::to_string(++revision) + "}";
+            CHECK_EQ(runtime.applyWeatherGate(body).status, 200);
+        }
+    }
+    if (corruptPrimary) std::ofstream(dir.path() + "/brightness-state", std::ios::trunc) << "not a valid record";
+    if (corruptBackup) std::ofstream(dir.path() + "/brightness-state.bak", std::ios::trunc) << "not a valid record";
+    RecordingSink secondSink;
+    BrightnessFileStore store(dir.path());
+    ShowMeshRuntime restarted(&definitions, &secondSink, testClock, nullptr, nullptr, &store);
+    const bool closed = restarted.brightness()->weatherGateClosed();
+    return RestartedGate{closed, restarted.brightness()->weatherGateRevision()};
+}
+
+}  // namespace
+
+// The backup is what a restart falls back to when the primary is
+// unreadable, so it must never disagree with the primary about the gate.
+TEST(AnUnreadablePrimaryRestoresTheGateFromTheBackupInBothDirections) {
+    for (bool corruptPrimary : {false, true}) {
+        RestartedGate g = gateAfterRestart({true}, corruptPrimary, false);
+        CHECK(g.closed);
+        CHECK_EQ(g.revision, std::uint64_t{1});
+        g = gateAfterRestart({true, false}, corruptPrimary, false);
+        CHECK(!g.closed);
+        CHECK_EQ(g.revision, std::uint64_t{2});
+        g = gateAfterRestart({true, false, true}, corruptPrimary, false);
+        CHECK(g.closed);
+        CHECK_EQ(g.revision, std::uint64_t{3});
+    }
+    // Both records unreadable: the gate restarts open at revision 0, as before this change.
+    const RestartedGate lost = gateAfterRestart({true}, true, true);
+    CHECK(!lost.closed);
+    CHECK_EQ(lost.revision, std::uint64_t{0});
+}

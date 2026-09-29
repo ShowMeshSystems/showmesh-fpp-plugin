@@ -18,12 +18,13 @@ BrightnessQueryResponse renderBrightnessQuery(const BrightnessEngine& engine, Ti
     members.emplace_back("transitionGain", json::Value::makeNumber(std::lround(engine.gainAt(now))));
     members.emplace_back("effectiveOutput", json::Value::makeNumber(engine.effectivePercentAt(now)));
     members.emplace_back("fadeActive", json::Value::makeBool(engine.fadingAt(now)));
+    members.emplace_back("weatherGateClosed", json::Value::makeBool(engine.weatherGateClosed()));
     members.emplace_back("updatedAtMillis", json::Value::makeNumber(static_cast<double>(now)));
     json::CanonicalResult rendered = json::canonicalize(json::Value::makeObject(std::move(members)));
     if (!rendered.ok) {
         return BrightnessQueryResponse{200,
                                        R"({"schemaVersion":1,"ceiling":0,"transitionGain":0,)"
-                                       R"("effectiveOutput":0,"fadeActive":false,"updatedAtMillis":0})"};
+                                       R"("effectiveOutput":0,"fadeActive":false,"weatherGateClosed":false,"updatedAtMillis":0})"};
     }
     return BrightnessQueryResponse{200, rendered.text};
 }

@@ -224,6 +224,7 @@ func coordinatorConfigPath(stateDir string) string { return filepath.Join(stateD
 func statusPath(stateDir string) string            { return filepath.Join(stateDir, "status.json") }
 func failureBufferPath(stateDir string) string     { return filepath.Join(stateDir, "failures.json") }
 func macroCachePath(stateDir string) string        { return filepath.Join(stateDir, "macro-cache.json") }
+func nightStatusPath(stateDir string) string       { return filepath.Join(stateDir, "night-status.json") }
 
 // loadCredential reads the bearer token from credentialPath() and
 // enforces the mode-0600 rule. The token is never logged, never included

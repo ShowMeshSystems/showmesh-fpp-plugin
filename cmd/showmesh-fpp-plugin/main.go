@@ -62,6 +62,8 @@ func run(args []string, stdout, stderr io.Writer, clock func() time.Time) int {
 		return exitOK
 	case "run":
 		return cmdRun(rest, stdout, stderr, clock)
+	case "night":
+		return cmdNight(rest, stdout, stderr, clock)
 	case "status":
 		return cmdStatus(rest, stdout, stderr, clock)
 	case "version":
@@ -83,6 +85,11 @@ Usage:
 
 Commands:
   run <macroId>   submit a macro run and record the outcome locally
+  night <command> send a night lifecycle command (prepare-site,
+                  run-readiness, start-preshow, start-night,
+                  request-final-show, fade-out-night,
+                  power-down-presentation) and record the outcome
+                  locally in night-status.json
   status          print the local record of the most recent run attempt
   version         show this binary's version
   help            show this help

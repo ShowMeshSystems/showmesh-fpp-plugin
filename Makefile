@@ -137,15 +137,14 @@ clean:
 # prebuilt, sha256-verified static binary. The artifact contract is pinned
 # so the packaging repository can fetch and verify against it without a
 # coordinated second change:
-#   tag:   fpp-plugin-v<VERSION>
+#   tag:   v<VERSION>, a release on this repository
 #   asset: showmesh-fpp-plugin_<VERSION>_linux_<ARCH>.tar.gz, ARCH in
 #          {amd64, arm64, armv7}
 #   sums:  showmesh-fpp-plugin_<VERSION>_SHA256SUMS, standard sha256sum
 #          format ("<hex>  <filename>")
 #
-# Nothing here publishes anything. Candidate artifacts stay private until
-# the first real-host install gate passes and the owner approves
-# publication.
+# Nothing here publishes anything. A release is published by hand as a
+# GitHub pre-release on this repository, with these exact files.
 # ---------------------------------------------------------------------------
 DIST         := ./dist
 DIST_VERSION ?= $(VERSION)
