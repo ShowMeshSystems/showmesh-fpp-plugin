@@ -274,7 +274,29 @@ bool ShowMeshRuntime::drainOnce() {
     if (!handoff_.take(&evidence, &coalesced)) return false;
     unacknowledgedCoalesced_ = saturatingAdd(unacknowledgedCoalesced_, coalesced);
 
+    // FPP reports the end of a run as `stop` or `playing` with an empty
+    // playlist name. Report it once, as the entry that was playing.
+    const bool runEnded = evidence.playlistName[0] == '\0' || evidence.action == PlaylistAction::kStop;
+    if (runEnded && playlistEnded_ && !lastPlaying_.has_value()) return true;
+    if (evidence.playlistName[0] != '\0') playlistEnded_ = false;
+
     PlaylistEntryObservation observation;
+    if (runEnded && lastPlaying_.has_value()) {
+        observation = *lastPlaying_;
+        observation.action = PlaylistAction::kStop;
+        observation.observedAtMillis = std::max(evidence.observedAtMillis, observation.observedAtMillis);
+        observation.sequence = sequence_.next();
+        observation.coalescedSincePreviousAcknowledged = unacknowledgedCoalesced_;
+        if (sequenceStore_ != nullptr && !sequenceStore_->store(observation.sequence)) ++sequencePersistFailures_;
+        lastPlaying_.reset();
+        playlistEnded_ = true;
+        if (sink_ != nullptr && sink_->publish(observation)) {
+            ++published_;
+            unacknowledgedCoalesced_ = 0;
+        }
+        return true;
+    }
+
     observation.schemaVersion = kObservationSchemaVersion;
     observation.sequenceFilename = evidence.sequenceFilename;
     observation.mediaFilename = evidence.mediaFilename;
@@ -368,6 +390,7 @@ bool ShowMeshRuntime::drainOnce() {
                                                 resolution.identity.playlistHash, resolution.canonicalDefinition,
                                                 evidence.observedAtMillis);
     }
+    if (observation.action == PlaylistAction::kPlaying) lastPlaying_ = observation;
     const bool accepted = sink_ != nullptr && sink_->publish(observation);
     if (accepted) {
         ++published_;
