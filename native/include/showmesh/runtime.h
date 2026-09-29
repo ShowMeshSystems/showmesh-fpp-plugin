@@ -617,7 +617,7 @@ class ShowMeshRuntime {
     // successful publish. It is carried forward rather than cleared, so a
     // failed publish does not erase the record of what was dropped.
     std::uint32_t unacknowledgedCoalesced_ = 0;
-    // Worker thread only. The last resolved `playing` entry of the current
+    // Worker thread only. The last resolved `start` or `playing` entry of the current
     // run, replayed as the `stop` post when FPP reports the run over with
     // no playlist name; playlistEnded_ then silences the idle callbacks.
     std::optional<PlaylistEntryObservation> lastPlaying_;

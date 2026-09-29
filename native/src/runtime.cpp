@@ -390,7 +390,10 @@ bool ShowMeshRuntime::drainOnce() {
                                                 resolution.identity.playlistHash, resolution.canonicalDefinition,
                                                 evidence.observedAtMillis);
     }
-    if (observation.action == PlaylistAction::kPlaying) lastPlaying_ = observation;
+    // FPP 9 announces a run's first entry as `start`; query_next names the next entry, so it is not kept.
+    if (observation.action == PlaylistAction::kPlaying || observation.action == PlaylistAction::kStart) {
+        lastPlaying_ = observation;
+    }
     const bool accepted = sink_ != nullptr && sink_->publish(observation);
     if (accepted) {
         ++published_;

@@ -376,6 +376,38 @@ TEST(AnOperatorStopDuringTheFirstEntryIsAStopOnThatEntry) {
     CHECK_EQ(sink.published[1].entryKey, sink.published[0].entryKey);
 }
 
+TEST(AOneEntryRunThatStartsWithStartEndsAsAStopOnThatEntry) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+
+    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "", 0);
+    runtime.observeCallback("Main Show", "query_next", "mainPlaylist", 0, "a.fseq", "", 0);
+    runtime.observeCallback("", "stop", "", 0, "", "", std::nullopt);
+    runtime.observeCallback("", "playing", "", 0, "", "", std::nullopt);
+    for (int i = 0; i < 4; ++i) CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(3));
+    CHECK_EQ(sink.unavailable.size(), static_cast<std::size_t>(0));
+    CHECK(sink.published[2].action == showmesh::PlaylistAction::kStop);
+    CHECK_EQ(sink.published[2].identity.position, 0);
+    CHECK_EQ(sink.published[2].entryKey, sink.published[0].entryKey);
+}
+
+TEST(AStopDuringTheFirstEntryOfAStartedRunIsAStopOnThatEntry) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+
+    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "", 0);
+    runtime.observeCallback("", "stop", "", 0, "", "", std::nullopt);
+    CHECK(runtime.drainOnce());
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(sink.unavailable.size(), static_cast<std::size_t>(0));
+    CHECK(sink.published[1].action == showmesh::PlaylistAction::kStop);
+    CHECK_EQ(sink.published[1].identity.position, 0);
+}
+
 TEST(AnEndCallbackWithNoEarlierPlayingEntryStaysUnavailable) {
     FakeDefinitions definitions;
     RecordingSink sink;
