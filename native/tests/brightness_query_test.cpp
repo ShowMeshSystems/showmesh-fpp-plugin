@@ -60,3 +60,11 @@ TEST(ACeilingWriteWhileTheWeatherGateIsClosedDoesNotRaiseOutput) {
     CHECK_EQ(engine.effectivePercentAt(3000), 100);
     CHECK(contains(renderBrightnessQuery(engine, 3000).body, "\"weatherGateClosed\":false"));
 }
+
+TEST(AQueryThatCannotBeRenderedAnswers500WithNoNumbers) {
+    showmesh::json::CanonicalResult failed;
+    failed.ok = false;
+    const BrightnessQueryResponse response = showmesh::brightnessQueryResponseFor(failed);
+    CHECK_EQ(response.status, 500);
+    CHECK(response.body.empty());
+}
