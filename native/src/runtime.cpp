@@ -106,14 +106,20 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
     const int clampedSafeCeilingPercent = std::min(std::max(safeCeilingPercent, kMinPercent), kMaxPercent);
     if (brightnessStore_ != nullptr) {
         BrightnessStateLoad loaded = brightnessStore_->load();
+        storedGateClosed_ = loaded.ok && loaded.state.weatherGateClosed;
+        storedGateRevision_ = loaded.ok ? loaded.state.weatherGateRevision : 0;
         if (loaded.ok && loaded.trustedAsCurrent) {
             std::lock_guard<std::mutex> lock(engineMutex_);
             engine_.restoreFromPersisted(loaded.state, clock_());
         } else if (loaded.ok) {
-            // Primary unreadable; only the superseded backup parsed.
+            // Primary unreadable; only the superseded backup parsed. The
+            // backup is still a previous good record for the gate's own
+            // purposes, so it stays closed here if the backup said so,
+            // even though the ceiling and gain settle to the safe value.
             brightnessRestartTrust_ = BrightnessRestartTrust::kPrimaryUnreadableBackupRecovered;
             std::lock_guard<std::mutex> lock(engineMutex_);
-            engine_.settleSafeAfterUntrustedRestart(clampedSafeCeilingPercent, clock_());
+            engine_.settleSafeAfterUntrustedRestart(clampedSafeCeilingPercent, clock_(), loaded.state.weatherGateClosed,
+                                                    loaded.state.weatherGateRevision);
         } else if (loaded.recordExpectedButUnreadable) {
             // Neither file parsed, despite one existing.
             brightnessRestartTrust_ = BrightnessRestartTrust::kNeitherRecordReadable;
@@ -186,6 +192,24 @@ TransitionGainResponse ShowMeshRuntime::applyTransitionGain(const std::string& b
     return applyTransitionGainRequest(body, &engine_, &lastTransitionGainRequestId_, clock_());
 }
 
+WeatherGateResponse ShowMeshRuntime::applyWeatherGate(const std::string& body) {
+    WeatherGateResponse result;
+    {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        result = applyWeatherGateRequest(body, &engine_, clock_());
+    }
+    // See the declaration's comment: an applied gate change must be
+    // durable before this returns, not merely marked dirty for the next
+    // output frame, which may never come if fppd is not currently playing.
+    if (result.status == 200) flushBrightnessState();
+    return result;
+}
+
+WeatherGateResponse ShowMeshRuntime::weatherGateState() {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    return renderWeatherGateState(&engine_, clock_());
+}
+
 void ShowMeshRuntime::RuntimeSweepRecord::requestSweep() {
     runtime_->sweepRequested_.fetch_add(1);
     // Woken the same way an observation wakes it, so the sweep starts now
@@ -221,8 +245,17 @@ StateAdoption ShowMeshRuntime::adoptEncodedFullState(const std::uint8_t* data, i
     BrightnessStateDecode decoded =
         decodeBrightnessState(std::string(reinterpret_cast<const char*>(data), static_cast<std::size_t>(length)));
     if (!decoded.ok) return StateAdoption::kRejectedUnsupportedVersion;
-    std::lock_guard<std::mutex> lock(engineMutex_);
-    return engine_.adoptState(decoded.state, clock_());
+    bool gateAdopted;
+    StateAdoption result;
+    {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        const std::uint64_t gateRevisionBefore = engine_.weatherGateRevision();
+        result = engine_.adoptState(decoded.state, clock_());
+        gateAdopted = engine_.weatherGateRevision() != gateRevisionBefore;
+    }
+    // Persisted by the worker now, not at the next frame, which an idle host may never output.
+    if (gateAdopted) markBrightnessDirty();
+    return result;
 }
 
 bool ShowMeshRuntime::drainOnce() {
@@ -346,6 +379,9 @@ bool ShowMeshRuntime::flushSequenceState() {
 
 bool ShowMeshRuntime::flushBrightnessState() {
     if (brightnessStore_ == nullptr) return true;
+    // The weather-gate route flushes from the web thread while the worker may
+    // be flushing too; both share one temp file, and the later capture must land last.
+    std::lock_guard<std::mutex> flushLock(brightnessFlushMutex_);
     BrightnessState state;
     {
         std::lock_guard<std::mutex> lock(engineMutex_);
@@ -361,8 +397,15 @@ bool ShowMeshRuntime::flushBrightnessState() {
     // with engineMutex_ already released: a slow write against a real SD
     // card must never hold modifyChannelData (or another flush caller)
     // waiting on the same mutex for its duration.
-    const bool ok = brightnessStore_->store(state);
+    bool ok = brightnessStore_->store(state);
+    // A gate change is written twice so rotation leaves the backup agreeing
+    // with the primary on the gate: a recovered backup then restores it too.
+    if (ok && (storedGateClosed_ != state.weatherGateClosed || storedGateRevision_ != state.weatherGateRevision)) {
+        ok = brightnessStore_->store(state);
+    }
     if (ok) {
+        storedGateClosed_ = state.weatherGateClosed;
+        storedGateRevision_ = state.weatherGateRevision;
         std::lock_guard<std::mutex> lock(engineMutex_);
         flushedBrightnessRevision_ = state.revision;
         brightnessEverFlushed_ = true;

@@ -31,6 +31,7 @@
 #include "showmesh/runtime.h"
 #include "showmesh/definition_republish.h"
 #include "showmesh/transition_gain.h"
+#include "showmesh/weather_gate.h"
 
 namespace {
 
@@ -174,6 +175,19 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
                 callback(makeStringResponse(result.body, result.status, "application/json"));
             },
             { drogon::Post });
+        // GET reads the current state, POST writes it: one registration
+        // carrying both methods, so this constant is registered and
+        // withdrawn exactly once like every other route here.
+        FPPPlugins::registerPluginApi(
+            showmesh::kWeatherGatePath,
+            [this](const HttpRequestPtr& req, HttpCallback&& callback) {
+                // Synchronous for the same reason as the gain route above.
+                const showmesh::WeatherGateResponse result = req->method() == drogon::Get
+                    ? runtime_.weatherGateState()
+                    : runtime_.applyWeatherGate(getRequestContent(req));
+                callback(makeStringResponse(result.body, result.status, "application/json"));
+            },
+            { drogon::Get, drogon::Post });
         FPPPlugins::registerPluginApi(
             showmesh::kDefinitionRepublishPath,
             [this](const HttpRequestPtr& req, HttpCallback&& callback) {
@@ -200,6 +214,7 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
     // FPP_PLUGIN_SUPPORTS_UNLOAD() below.
     void unregisterApis() override {
         FPPPlugins::unregisterPluginApi(showmesh::kTransitionGainPath);
+        FPPPlugins::unregisterPluginApi(showmesh::kWeatherGatePath);
         FPPPlugins::unregisterPluginApi(showmesh::kDefinitionRepublishPath);
     }
 

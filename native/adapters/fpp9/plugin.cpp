@@ -31,6 +31,7 @@
 #include "section_names.h"
 #include "showmesh/definition_republish.h"
 #include "showmesh/transition_gain.h"
+#include "showmesh/weather_gate.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
 
@@ -178,6 +179,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     void registerApis(httpserver::webserver* ws) override {
         if (ws == nullptr) return;
         ws->register_resource(showmesh::kTransitionGainPath, &gainResource_, false);
+        ws->register_resource(showmesh::kWeatherGatePath, &weatherGateResource_, false);
         ws->register_resource(showmesh::kDefinitionRepublishPath, &republishResource_, false);
     }
 
@@ -188,6 +190,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     void unregisterApis(httpserver::webserver* ws) override {
         if (ws == nullptr) return;
         ws->unregister_resource(showmesh::kTransitionGainPath);
+        ws->unregister_resource(showmesh::kWeatherGatePath);
         ws->unregister_resource(showmesh::kDefinitionRepublishPath);
     }
 
@@ -210,6 +213,35 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
             // it later cannot race a request still inside it.
             const showmesh::TransitionGainResponse result =
                 runtime_->applyTransitionGain(std::string(req.get_content()));
+            return std::shared_ptr<httpserver::http_response>(new httpserver::string_response(
+                result.body, result.status, "application/json"));
+        }
+
+     private:
+        showmesh::ShowMeshRuntime* runtime_;
+    };
+
+    // The libhttpserver side of the weather-gate route: GET reads the
+    // current state, POST writes it, both registered at the same path and
+    // withdrawn together. A member for the same lifetime reason
+    // gainResource_ is.
+    class WeatherGateResource : public httpserver::http_resource {
+     public:
+        explicit WeatherGateResource(showmesh::ShowMeshRuntime* runtime) : runtime_(runtime) {
+            disallow_all();
+            set_allowing("GET", true);
+            set_allowing("POST", true);
+        }
+
+        std::shared_ptr<httpserver::http_response> render_GET(const httpserver::http_request&) override {
+            const showmesh::WeatherGateResponse result = runtime_->weatherGateState();
+            return std::shared_ptr<httpserver::http_response>(new httpserver::string_response(
+                result.body, result.status, "application/json"));
+        }
+
+        std::shared_ptr<httpserver::http_response> render_POST(const httpserver::http_request& req) override {
+            // Synchronous, for the same reason render_POST above is.
+            const showmesh::WeatherGateResponse result = runtime_->applyWeatherGate(std::string(req.get_content()));
             return std::shared_ptr<httpserver::http_response>(new httpserver::string_response(
                 result.body, result.status, "application/json"));
         }
@@ -302,6 +334,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // Declared after runtime_ on purpose: members initialise in
     // declaration order, so this captures a runtime_ that already exists.
     TransitionGainResource gainResource_{&runtime_};
+    WeatherGateResource weatherGateResource_{&runtime_};
     DefinitionRepublishResource republishResource_{&runtime_};
     Command* command_ = nullptr;
     std::uint64_t publishedRevision_ = 0;
