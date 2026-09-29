@@ -8,6 +8,8 @@
 #include <string>
 
 #include "showmesh/brightness_codec.h"
+#include "showmesh/config_watcher.h"
+#include "showmesh/pairing.h"
 #include "showmesh/saturating_add.h"
 
 namespace showmesh {
@@ -61,7 +63,8 @@ bool playlistNameIsPathSafe(const std::string& name) {
 ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, ObservationSink* sink, Clock clock,
                                  SequenceFileStore* sequenceStore, DefinitionPublisher* definitionPublisher,
                                  BrightnessFileStore* brightnessStore, int safeCeilingPercent,
-                                 FallbackActivationRecorder* fallbackRecorder)
+                                 FallbackActivationRecorder* fallbackRecorder, PairingWorker* pairingWorker,
+                                 ConfigWatcher* configWatcher)
     : definitions_(definitions),
       sink_(sink),
       clock_(clock),
@@ -69,6 +72,8 @@ ShowMeshRuntime::ShowMeshRuntime(PlaylistDefinitionSource* definitions, Observat
       definitionPublisher_(definitionPublisher),
       fallbackRecorder_(fallbackRecorder),
       brightnessStore_(brightnessStore),
+      pairingWorker_(pairingWorker),
+      configWatcher_(configWatcher),
       handoff_(16) {
     if (definitions_ != nullptr) {
         std::lock_guard<std::mutex> lock(engineMutex_);
@@ -192,6 +197,11 @@ TransitionGainResponse ShowMeshRuntime::applyTransitionGain(const std::string& b
     return applyTransitionGainRequest(body, &engine_, &lastTransitionGainRequestId_, clock_());
 }
 
+BrightnessQueryResponse ShowMeshRuntime::queryBrightness() {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    return renderBrightnessQuery(engine_, clock_());
+}
+
 WeatherGateResponse ShowMeshRuntime::applyWeatherGate(const std::string& body) {
     WeatherGateResponse result;
     {
@@ -264,7 +274,29 @@ bool ShowMeshRuntime::drainOnce() {
     if (!handoff_.take(&evidence, &coalesced)) return false;
     unacknowledgedCoalesced_ = saturatingAdd(unacknowledgedCoalesced_, coalesced);
 
+    // FPP reports the end of a run as `stop` or `playing` with an empty
+    // playlist name. Report it once, as the entry that was playing.
+    const bool runEnded = evidence.playlistName[0] == '\0' || evidence.action == PlaylistAction::kStop;
+    if (runEnded && playlistEnded_ && !lastPlaying_.has_value()) return true;
+    if (evidence.playlistName[0] != '\0') playlistEnded_ = false;
+
     PlaylistEntryObservation observation;
+    if (runEnded && lastPlaying_.has_value()) {
+        observation = *lastPlaying_;
+        observation.action = PlaylistAction::kStop;
+        observation.observedAtMillis = std::max(evidence.observedAtMillis, observation.observedAtMillis);
+        observation.sequence = sequence_.next();
+        observation.coalescedSincePreviousAcknowledged = unacknowledgedCoalesced_;
+        if (sequenceStore_ != nullptr && !sequenceStore_->store(observation.sequence)) ++sequencePersistFailures_;
+        lastPlaying_.reset();
+        playlistEnded_ = true;
+        if (sink_ != nullptr && sink_->publish(observation)) {
+            ++published_;
+            unacknowledgedCoalesced_ = 0;
+        }
+        return true;
+    }
+
     observation.schemaVersion = kObservationSchemaVersion;
     observation.sequenceFilename = evidence.sequenceFilename;
     observation.mediaFilename = evidence.mediaFilename;
@@ -357,6 +389,10 @@ bool ShowMeshRuntime::drainOnce() {
         definitionPublisher_->publishDefinition(resolution.identity.instanceUuid, resolution.identity.playlistName,
                                                 resolution.identity.playlistHash, resolution.canonicalDefinition,
                                                 evidence.observedAtMillis);
+    }
+    // FPP 9 announces a run's first entry as `start`; query_next names the next entry, so it is not kept.
+    if (observation.action == PlaylistAction::kPlaying || observation.action == PlaylistAction::kStart) {
+        lastPlaying_ = observation;
     }
     const bool accepted = sink_ != nullptr && sink_->publish(observation);
     if (accepted) {
@@ -515,6 +551,12 @@ void ShowMeshRuntime::workerLoop() {
         // markBrightnessDirty() and flushBrightnessState().
         flushBrightnessIfDirty();
         maybeSweepDefinitions();
+        // Config reload is a local file stat plus, at most, an occasional
+        // small local read: cheap enough to run on this thread every
+        // pass. Pairing's own claim attempt is a blocking network POST and
+        // runs on PairingWorker's own thread instead; see start()/stop()
+        // below and pairing.h's class comment.
+        if (configWatcher_ != nullptr) configWatcher_->tick();
         if (!running_.load()) break;
         if (testHookBeforeWait_) testHookBeforeWait_();
         std::unique_lock<std::mutex> lock(wakeMutex_);
@@ -527,6 +569,9 @@ void ShowMeshRuntime::workerLoop() {
 void ShowMeshRuntime::start() {
     if (running_.exchange(true)) return;
     worker_ = std::thread(&ShowMeshRuntime::workerLoop, this);
+    // Its own thread, independent of worker_: see pairing.h's class
+    // comment for why the claim POST must never run on worker_.
+    if (pairingWorker_ != nullptr) pairingWorker_->start();
 }
 
 void ShowMeshRuntime::stop() {
@@ -539,12 +584,21 @@ void ShowMeshRuntime::stop() {
     if (sink_ != nullptr) sink_->requestStop();
     if (definitionPublisher_ != nullptr) definitionPublisher_->requestStop();
     if (fallbackRecorder_ != nullptr) fallbackRecorder_->requestStop();
+    // Interrupted before worker_'s own join for the identical reason,
+    // even though it joins its own, separate thread below: requestStop()
+    // here means a claim attempt already in flight gives up as soon as
+    // its bounded request timeout returns instead of starting another.
+    if (pairingWorker_ != nullptr) pairingWorker_->requestStop();
     {
         std::lock_guard<std::mutex> lock(wakeMutex_);
         hasWork_ = true;
     }
     wake_.notify_all();
     if (worker_.joinable()) worker_.join();
+    // Joined after worker_: this thread is independent of it, so nothing
+    // orders one join before the other for correctness, but doing it here
+    // keeps every "stop everything" call in this one function.
+    if (pairingWorker_ != nullptr) pairingWorker_->stop();
 }
 
 }  // namespace showmesh

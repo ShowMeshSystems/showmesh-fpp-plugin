@@ -61,6 +61,44 @@ $(CONVERGENCE_HARNESS_BINARY): tools/convergence_harness.cpp tools/convergence_m
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -Itools tools/convergence_harness.cpp src/brightness.cpp src/json.cpp src/sha256.cpp -o $@
 
+CXXSTD_ADAPTERS ?= -std=c++20
+
+JSONCPP_INCLUDE := $(shell pkg-config --cflags-only-I jsoncpp 2>/dev/null | sed 's/-I/-isystem /g')
+ifeq ($(strip $(JSONCPP_INCLUDE)),)
+JSONCPP_INCLUDE := -isystem /usr/include/jsoncpp
+endif
+
+OPENSSL_INCLUDE := $(shell pkg-config --cflags-only-I libcrypto 2>/dev/null | sed 's/-I/-isystem /g')
+ifeq ($(strip $(OPENSSL_INCLUDE)),)
+OPENSSL_INCLUDE := -isystem /usr/include
+endif
+
+# -fsyntax-only against adapters/syntax_stubs/ (see its README.md):
+# neither plugin.cpp is otherwise compiled by anything `make check` runs,
+# so a broken include, a typo'd FPP symbol, or a signature drift between
+# this repository's own code and the shared adapter headers went
+# unnoticed until bench/fpp-plugin-load next ran, or a real release build.
+# This is not a substitute for that bench: the stubs describe the shapes
+# these two files reference, not the real FPP API. Real jsoncpp headers
+# are used, not stubbed, because both real adapter builds already require
+# them and the API is too large to usefully fake. No -Werror: the stubs'
+# own minimal bodies are not written to satisfy every warning real FPP
+# headers happen to silence, and a spurious warning here must never be
+# indistinguishable from a real one in the adapter's own code.
+.PHONY: adapter-syntax-check
+adapter-syntax-check:
+	$(CXX) $(CXXSTD_ADAPTERS) -fsyntax-only -Wall -Iinclude -Iadapters/shared \
+		-Iadapters/syntax_stubs/common -Iadapters/syntax_stubs/fpp9 \
+		$(JSONCPP_INCLUDE) $(OPENSSL_INCLUDE) adapters/fpp9/plugin.cpp
+	$(CXX) $(CXXSTD_ADAPTERS) -fsyntax-only -Wall -Iinclude -Iadapters/shared \
+		-Iadapters/syntax_stubs/common -Iadapters/syntax_stubs/fpp10 \
+		$(JSONCPP_INCLUDE) $(OPENSSL_INCLUDE) adapters/fpp10/plugin.cpp
+	$(CXX) $(CXXSTD_ADAPTERS) -fsyntax-only -Wall -Iinclude -Iadapters/shared \
+		-Iadapters/syntax_stubs/common adapters/syntax_stubs/probe_coordinator_delivery.cpp
+	$(CXX) $(CXXSTD_ADAPTERS) -fsyntax-only -Wall -Iinclude -Iadapters/shared \
+		-Iadapters/syntax_stubs/common adapters/syntax_stubs/probe_pairing_delivery.cpp
+	@echo "adapter-syntax-check: OK"
+
 .PHONY: clean
 clean:
 	rm -rf $(BUILD)

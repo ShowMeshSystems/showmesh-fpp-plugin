@@ -734,6 +734,25 @@ TEST(AMismatchOutcomeWithNoOperatorInstructionIsNotRaised) {
     CHECK(notifier.cleared.empty());
 }
 
+// Config reload (contract section 2): ConfigWatcher calls setBaseUrl()
+// after construction, without a restart, and this is what it relies on.
+TEST(SetBaseUrlAppliesAndReportsConfiguredWithoutARestart) {
+    FakeTransport transport;
+    FakeCredentials credentials;
+    CoordinatorClient client(&transport, &credentials, std::string(), testClock, nullptr, recordSleep, fastPolicy());
+
+    CHECK(!client.status().configured);
+
+    client.setBaseUrl(kBaseUrl);
+    CHECK(client.status().configured);
+    CHECK(client.status().configurationError.empty());
+
+    transport.responses.push_back(FakeTransport::okWithBody(receiptBody("", "")));
+    CHECK(client.publish(resolvedObservation()));
+    CHECK_EQ(transport.requests.back().url,
+             std::string(kBaseUrl) + "/api/v1/integrations/fpp/playlist-entry-observations");
+}
+
 TEST(TheReportsRefusedNoticeIsRaisedOnAConflict) {
     FakeTransport transport;
     transport.responses.push_back(FakeTransport::refused(409, "playlist observation sequence regression"));
