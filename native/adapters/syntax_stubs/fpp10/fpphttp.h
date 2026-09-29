@@ -9,11 +9,14 @@
 
 namespace drogon {
 
-class HttpRequest {};
+enum HttpMethod { Get, Post, Put, Delete, Head, Options, Patch };
+
+class HttpRequest {
+ public:
+    HttpMethod method() const { return Get; }
+};
 class HttpResponse {};
 using HttpResponsePtr = std::shared_ptr<HttpResponse>;
-
-enum HttpMethod { Get, Post, Put, Delete, Head, Options, Patch };
 
 class HttpAppFramework {};
 HttpAppFramework& app();

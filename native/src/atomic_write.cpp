@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <fstream>
+#include <iterator>
 #include <unistd.h>
 
 namespace showmesh {
@@ -55,6 +56,13 @@ bool writeFileAtomically(const std::string& path, const std::string& contents) {
     if (!fsyncFileRequired(tmp)) return false;
     if (std::rename(tmp.c_str(), path.c_str()) != 0) return false;
     fsyncPathBestEffort(directoryOf(path), true);
+    return true;
+}
+
+bool readFileWhole(const std::string& path, std::string* contents) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    contents->assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
     return true;
 }
 

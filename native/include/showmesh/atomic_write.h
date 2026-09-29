@@ -19,6 +19,11 @@ namespace showmesh {
 // within this same boot sees it regardless.
 bool writeFileAtomically(const std::string& path, const std::string& contents);
 
+// Reads path whole into *contents. Returns false, leaving *contents
+// untouched, when path does not exist or cannot be opened; a missing
+// record is the normal first-run case, not an error a caller need report.
+bool readFileWhole(const std::string& path, std::string* contents);
+
 // Joins a directory and a file name with exactly one separator.
 std::string joinPath(const std::string& dir, const std::string& name);
 

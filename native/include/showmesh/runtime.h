@@ -19,6 +19,7 @@
 #include "showmesh/playlist_identity.h"
 #include "showmesh/sequence_store.h"
 #include "showmesh/transition_gain.h"
+#include "showmesh/weather_gate.h"
 
 // Forward declared only: PairingWorker (pairing.h) and ConfigWatcher
 // (config_watcher.h) are optional, ticked components the same way
@@ -137,6 +138,25 @@ class PlaylistMismatchNotifier {
 // own ad hoc, plugin-sourced warnings. RemoveWarning's exact-triple match
 // (id, message, plugin) still makes this notice unambiguous.
 constexpr int ShowMesh_PlaylistMismatch = 0;
+
+// ReportsRefusedNotifier surfaces a standing coordinator refusal of this
+// instance's playlist-entry reports, mirroring PlaylistMismatchNotifier's
+// raise/clear shape. Optional; nullptr keeps the previous behavior.
+class ReportsRefusedNotifier {
+ public:
+    virtual ~ReportsRefusedNotifier() = default;
+    // Called on a transition into the refused state, or when the message
+    // text itself changes while already refused.
+    virtual void raiseRefused(int id, const std::string& message) = 0;
+    // Called on a transition out of the refused state. Always given the
+    // identical id and message the most recent raiseRefused() call gave;
+    // see PlaylistMismatchNotifier::clearMismatch() for why.
+    virtual void clearRefused(int id, const std::string& message) = 0;
+};
+
+// Mirrors ShowMesh_PlaylistMismatch: the same WarningHolder identity
+// scheme, distinguished from it only by message text.
+constexpr int ShowMesh_ReportsRefused = 0;
 
 // PlaylistDefinitionSource resolves a playlist's complete definition. The
 // worker calls it, never the callback thread: on FPP this reads the
@@ -338,6 +358,18 @@ class ShowMeshRuntime {
     // thread; locks engineMutex_ and returns, same as applyTransitionGain.
     BrightnessQueryResponse queryBrightness();
 
+    // Serves the weather-gate write registered beside the transition-gain
+    // route. Synchronous for the same reason. Unlike applyTransitionGain,
+    // an applied write also flushes brightness state immediately: a
+    // closed gate must survive a restart even when fppd is not currently
+    // outputting frames, so it cannot wait for modifyChannelData's own
+    // per-frame dirty mark the way a ceiling or gain change can.
+    WeatherGateResponse applyWeatherGate(const std::string& body);
+
+    // Serves the GET route registered beside the write: the current state,
+    // never a write.
+    WeatherGateResponse weatherGateState();
+
     // Serves one contract section 3.9 republish. Called from fppd's own
     // web thread, and synchronous for exactly the reason
     // applyTransitionGain() is. It clears the publisher's held set and
@@ -406,9 +438,8 @@ class ShowMeshRuntime {
     // state; the store's actual write -- a read, a hash, two fsyncs, and
     // a rename -- runs with the lock released, so a caller never blocks
     // modifyChannelData, or another flush caller, for the duration of a
-    // slow write. Safe to call from any thread; callers do not need to
-    // serialize against each other, only against engine_ itself the way
-    // every other engine_ access already does.
+    // slow write. Safe to call from any thread: concurrent callers are
+    // serialized on brightnessFlushMutex_, never on engineMutex_.
     bool flushBrightnessState();
 
     // Marks the engine's brightness state as needing to be persisted,
@@ -529,6 +560,12 @@ class ShowMeshRuntime {
     // backup slot for nothing.
     std::uint64_t flushedBrightnessRevision_ = 0;
     bool brightnessEverFlushed_ = false;
+    // Held across a whole flushBrightnessState(), capture through store.
+    std::mutex brightnessFlushMutex_;
+    // Guarded by brightnessFlushMutex_: the gate both on-disk records last
+    // agreed on. No readable record reads as open, which is what restart does.
+    bool storedGateClosed_ = false;
+    std::uint64_t storedGateRevision_ = 0;
     std::atomic<bool> running_{false};
     // True only while workerLoop() is on the stack. It is what lets a
     // sweep abandon its remaining definitions when stop() is waiting to

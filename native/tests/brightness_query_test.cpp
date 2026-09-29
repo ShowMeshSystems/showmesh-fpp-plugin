@@ -34,3 +34,29 @@ TEST(TheQueryRouteReportsAnActiveFade) {
     CHECK_EQ(response.status, 200);
     CHECK(contains(response.body, "\"fadeActive\":true"));
 }
+
+TEST(AClosedWeatherGateReportsZeroOutputWhateverTheCeilingIs) {
+    BrightnessEngine engine;
+    engine.setCeiling(90, 0, 1000);
+    engine.setWeatherGate(true, 1, 1000);
+    const BrightnessQueryResponse response = renderBrightnessQuery(engine, 1000);
+    CHECK(contains(response.body, "\"ceiling\":90"));
+    CHECK(contains(response.body, "\"effectiveOutput\":0"));
+    CHECK(contains(response.body, "\"weatherGateClosed\":true"));
+}
+
+TEST(ACeilingWriteWhileTheWeatherGateIsClosedDoesNotRaiseOutput) {
+    BrightnessEngine engine;
+    engine.setCeiling(20, 0, 1000);
+    engine.setWeatherGate(true, 1, 1000);
+    engine.setCeiling(100, 0, 2000);
+    CHECK_EQ(engine.effectivePercentAt(2000), 0);
+    CHECK(engine.weatherGateClosed());
+    const BrightnessQueryResponse response = renderBrightnessQuery(engine, 2000);
+    CHECK(contains(response.body, "\"ceiling\":100"));
+    CHECK(contains(response.body, "\"effectiveOutput\":0"));
+
+    engine.setWeatherGate(false, 2, 3000);
+    CHECK_EQ(engine.effectivePercentAt(3000), 100);
+    CHECK(contains(renderBrightnessQuery(engine, 3000).body, "\"weatherGateClosed\":false"));
+}
