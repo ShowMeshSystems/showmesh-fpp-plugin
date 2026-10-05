@@ -86,6 +86,9 @@ class FallbackActivationDelivery {
         options.credentialDir = std::move(credentialDir);
         options.installPath = showmesh::fallback::DefaultFallbackProgramPath();
         options.detector = resolveOutageDetectorConfig();
+        options.programRefetchIntervalMillis =
+            resolveOutageSetting(showmesh::fallback::kProgramRefetchIntervalSettingName, 5000, 3600000,
+                                 showmesh::fallback::kHypothesisProgramRefetchIntervalMillis);
         options.notifier = notifier;
         options.log = [](bool isError, const std::string& line) {
             if (isError) {

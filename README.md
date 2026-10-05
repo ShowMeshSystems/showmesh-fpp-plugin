@@ -365,9 +365,19 @@ into both adapters by `FallbackActivationDelivery`.
 - creates an Ed25519 executor key once the plugin holds a pairing token, stores
   the private key as `/etc/showmesh-fpp-plugin/fallback-executor-key` at mode
   0600, and registers the public key on every start and after every pairing;
-- refetches the signed program after one third of its own validity
-  (`expiresAt` minus `compiledAt`), verifies, installs and acknowledges it; and
-- hands the installed program to every distinct node address it names.
+- asks for the signed program again every
+  `ShowMeshFallbackProgramRefetchIntervalMillis` (default 60000, a hypothesis),
+  and never later than one third of the installed program's own validity
+  (`expiresAt` minus `compiledAt`);
+- verifies, installs and acknowledges a program that changed, and hands it to
+  every distinct node address it names. The same program again is not
+  rewritten, acknowledged or handed out.
+
+A registration the coordinator answers `409` is asked again at every program
+fetch, because it clears once the coordinator has read this player. Any other
+failed registration, and a registration that succeeded while the published
+program still lacks this player's key, is tried again after one refetch
+interval and then at double the wait each time, up to ten minutes.
 
 **Deciding the coordinator is lost.** The same thread probes
 `GET {coordinatorUrl}/healthz`. Only a 2xx counts as reached. Loss is confirmed
@@ -400,9 +410,17 @@ time.
 
 **What an operator can read.** `<state-dir>/fallback-status.json` holds the
 mode, whether the coordinator is reachable, the installed program, the count of
-skipped posts, and the 50 most recent deliveries and refusals with the node's
-outcome word and reason. The same lines go to FPP's log, and FPP's warning list
-carries one notice while the coordinator is lost.
+skipped posts, the 50 most recent deliveries and refusals, and separately the
+20 most recent program hand-offs. Each record carries an outcome word, who
+answered (`node` or `player`), and a reason: the node's own, or a whole
+sentence from this player. The same lines go to FPP's log.
+
+FPP's warning list carries one notice while the coordinator is lost, and the
+status file's `message` is the same text. It says this player is starting the
+planned cues only while that is true. When the player holds nothing it could
+send (no coordinator key, no plan, a plan that has run out or does not carry
+its key, no key of its own) or no node started the last cue, the notice says
+the cues are not being started and why.
 
 Routes this depends on, beyond the two the sending half uses:
 

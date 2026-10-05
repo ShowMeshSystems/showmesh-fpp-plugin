@@ -35,24 +35,134 @@
 namespace showmesh {
 namespace fallback {
 
-// The program is refetched after this fraction of its own validity
-// (expiresAt minus compiledAt) has passed since it was installed.
+// HYPOTHESIS, not a measurement: how often the program is asked for again.
+constexpr int kHypothesisProgramRefetchIntervalMillis = 60000;
+constexpr const char* kProgramRefetchIntervalSettingName = "ShowMeshFallbackProgramRefetchIntervalMillis";
+// The refetch is never later than this fraction of the installed program's
+// own validity (expiresAt minus compiledAt).
 constexpr int kRefetchValidityNumerator = 1;
 constexpr int kRefetchValidityDenominator = 3;
-// How soon to ask again when a fetch installed nothing, or installed a
-// program that does not yet carry this host's executor key.
-constexpr TimeMillis kRefetchRetryMillis = 30000;
+// A registration that makes no progress is tried again after one refetch
+// interval, then double that each time, up to this cap.
+constexpr TimeMillis kRegistrationBackoffCapMillis = 600000;
 constexpr int kExecutorRegistrationTimeoutMillis = 10000;
-constexpr std::size_t kRecentFallbackRecords = 50;
+// 409: the coordinator has not read this player's identity yet. It clears by waiting.
+constexpr int kRegistrationNotYetStatus = 409;
+constexpr std::size_t kRecentActivationRecords = 50;
+constexpr std::size_t kRecentProgramHandOffRecords = 20;
 constexpr const char* kFallbackStatusFilename = "fallback-status.json";
 
-// Words this plugin records for a target it sent nothing to.
+// Outcome words this player records when it decided itself, in the same shape
+// as the words a node sends.
+constexpr const char* kOutcomeNoCoordinatorKey = "no-coordinator-key";
+constexpr const char* kOutcomeNoProgram = "no-program";
+constexpr const char* kOutcomeProgramNotVerified = "program-not-verified";
+constexpr const char* kOutcomeProgramExpired = "program-expired";
+constexpr const char* kOutcomeUnknownEntry = "unknown-entry";
+constexpr const char* kOutcomeAmbiguousEntry = "ambiguous-entry";
+constexpr const char* kOutcomeNoTarget = "no-target";
+constexpr const char* kOutcomeNoPlayerKey = "no-player-key";
+constexpr const char* kOutcomePlayerKeyNotInProgram = "player-key-not-in-program";
 constexpr const char* kOutcomeNoAddress = "no-address";
 constexpr const char* kOutcomeIncompleteProgram = "incomplete-program";
-constexpr const char* kOutcomeNoExecutorKey = "no-executor-key";
-constexpr const char* kOutcomeExecutorKeyNotInProgram = "executor-key-not-in-program";
 constexpr const char* kOutcomeEntryNotIdentified = "entry-not-identified";
 constexpr const char* kOutcomeSigningFailed = "signing-failed";
+
+// What an operator reads for one of this player's own outcome words: a whole
+// sentence for the status file, and the clause the notice puts after "because".
+struct PlayerOutcomeCopy {
+    const char* word;
+    const char* reason;
+    const char* noticeClause;
+};
+
+constexpr PlayerOutcomeCopy kPlayerOutcomeCopy[] = {
+    {kOutcomeNoCoordinatorKey,
+     "This player has no coordinator key to check a plan with. Install the coordinator's key on this player.",
+     "it has no coordinator key to check a plan with"},
+    {kOutcomeNoProgram,
+     "This player holds no plan for running the show without the coordinator. Check this player on the coordinator "
+     "once it is back.",
+     "it holds no plan for running the show without the coordinator"},
+    {kOutcomeProgramNotVerified,
+     "The saved plan on this player no longer passes its check. Restore the coordinator so it can send a fresh one.",
+     "its saved plan no longer passes its check"},
+    {kOutcomeProgramExpired,
+     "This player's plan for running the show without the coordinator has run out. Restore the coordinator to start "
+     "the planned cues again.",
+     "its plan for running the show without the coordinator has run out"},
+    {kOutcomeUnknownEntry,
+     "The plan has no cue for this playlist entry, so nothing was started for it. No action is needed if the entry "
+     "has no cue in the show.",
+     "the plan has no cue for the last playlist entry"},
+    {kOutcomeAmbiguousEntry,
+     "The plan names more than one cue for this playlist entry, so none was started. Check the show's playlist on "
+     "the coordinator.",
+     "the plan names more than one cue for the last playlist entry"},
+    {kOutcomeNoTarget, "The plan names no node for this playlist entry's cue. Check the cue on the coordinator.",
+     "the plan names no node for the last cue"},
+    {kOutcomeNoPlayerKey,
+     "This player has no key of its own for starting cues on nodes. Check that it is paired with the coordinator.",
+     "it has no key of its own for the nodes"},
+    {kOutcomePlayerKeyNotInProgram,
+     "The plan does not carry this player's key, so no node would accept a cue from it. Check that the coordinator "
+     "can reach this player.",
+     "its plan does not carry this player's key"},
+    {kOutcomeNoAddress,
+     "The plan gives no address for this node. Check that the node is connected to the coordinator.",
+     "the plan gives no address for a node"},
+    {kOutcomeIncompleteProgram,
+     "The plan is missing details for this node. Restore the coordinator so it can send a fresh one.",
+     "the plan is missing details for a node"},
+    {kOutcomeEntryNotIdentified,
+     "FPP's playlist entry could not be identified. Check that the playlist still exists on this player.",
+     "FPP's playlist entry could not be identified"},
+    {kOutcomeSigningFailed, "The request for this node could not be signed. Check FPP's log on this player.",
+     "a request could not be signed"},
+};
+// For a boundary where nodes were asked and none started the cue.
+constexpr PlayerOutcomeCopy kNoNodeStartedCopy = {"", "", "no node started the last planned cue"};
+
+inline const PlayerOutcomeCopy& PlayerOutcomeCopyFor(const std::string& word) {
+    for (const PlayerOutcomeCopy& copy : kPlayerOutcomeCopy) {
+        if (word == copy.word) return copy;
+    }
+    return kNoNodeStartedCopy;
+}
+
+inline const char* PlayerOutcomeWord(ActivationResolveKind kind) {
+    switch (kind) {
+        case ActivationResolveKind::kNoProgramInstalled:
+            return kOutcomeNoProgram;
+        case ActivationResolveKind::kProgramFailedReverification:
+            return kOutcomeProgramNotVerified;
+        case ActivationResolveKind::kProgramExpired:
+            return kOutcomeProgramExpired;
+        case ActivationResolveKind::kUnknownEntry:
+            return kOutcomeUnknownEntry;
+        case ActivationResolveKind::kAmbiguousEntry:
+            return kOutcomeAmbiguousEntry;
+        case ActivationResolveKind::kNoActivatableTarget:
+            return kOutcomeNoTarget;
+        case ActivationResolveKind::kMatch:
+            return "";
+    }
+    return "";
+}
+
+enum class FallbackMode { kNormal, kFallback };
+
+inline const char* FallbackModeName(FallbackMode mode) { return mode == FallbackMode::kFallback ? "fallback" : "normal"; }
+
+// What the last entry boundary in fallback came to.
+enum class BoundaryResult {
+    kNone,
+    kStarted,
+    // The plan maps this entry to no cue. Ordinary, and not a failure.
+    kNothingToStart,
+    kStartedOnSomeNodes,
+    kNotStarted,
+};
 
 constexpr const char* kCoordinatorLostMessage =
     "The coordinator has stopped answering, and this player will start the planned cues on the nodes itself from "
@@ -60,10 +170,33 @@ constexpr const char* kCoordinatorLostMessage =
 constexpr const char* kFallbackActiveMessage =
     "The coordinator stopped answering, so this player is starting the planned cues on the nodes itself until this "
     "playlist stops. Check the coordinator.";
+constexpr const char* kStartedOnSomeNodesMessage =
+    "The coordinator stopped answering, and this player started the last planned cue on only some of its nodes. "
+    "Check the nodes and restore the coordinator.";
+constexpr const char* kCannotStartPrefix =
+    "The coordinator has stopped answering, and this player cannot start the planned cues itself because ";
+constexpr const char* kNotStartingPrefix =
+    "The coordinator stopped answering, and this player is not starting the planned cues because ";
+constexpr const char* kRestoreCoordinatorAction = ". Restore the coordinator to start them again.";
 
-enum class FallbackMode { kNormal, kFallback };
-
-inline const char* FallbackModeName(FallbackMode mode) { return mode == FallbackMode::kFallback ? "fallback" : "normal"; }
+// The notice an operator sees, true to what this player can do and last did.
+// problem is one of this player's outcome words, or empty when nothing
+// stands in the way.
+inline std::string FallbackNotice(FallbackMode mode, bool coordinatorLost, const std::string& problem,
+                                  BoundaryResult lastBoundary) {
+    if (mode == FallbackMode::kNormal) {
+        if (!coordinatorLost) return std::string();
+        if (problem.empty()) return kCoordinatorLostMessage;
+        return std::string(kCannotStartPrefix) + PlayerOutcomeCopyFor(problem).noticeClause +
+               kRestoreCoordinatorAction;
+    }
+    if (!problem.empty() || lastBoundary == BoundaryResult::kNotStarted) {
+        return std::string(kNotStartingPrefix) + PlayerOutcomeCopyFor(problem).noticeClause +
+               kRestoreCoordinatorAction;
+    }
+    if (lastBoundary == BoundaryResult::kStartedOnSomeNodes) return kStartedOnSomeNodesMessage;
+    return kFallbackActiveMessage;
+}
 
 // The one record of where this host stands in ADR-048's Normal, Fallback and
 // Resting states. The cutoff, rest or hold rules and the hand-back at the
@@ -72,6 +205,9 @@ struct FallbackExecutionState {
     FallbackMode mode = FallbackMode::kNormal;
     TimeMillis enteredAtMillis = 0;
     std::string enteredAtEntryKey;
+    BoundaryResult lastBoundary = BoundaryResult::kNone;
+    // This player's outcome word for a boundary that started nothing. Empty when a node refused.
+    std::string lastBoundaryProblem;
 
     void enter(TimeMillis now, const std::string& entryKey) {
         mode = FallbackMode::kFallback;
@@ -93,13 +229,14 @@ class FallbackStateNotifier {
 // One delivery, refusal or program hand-off, as an operator reads it afterwards.
 struct FallbackRecord {
     TimeMillis atMillis = 0;
-    std::string kind;  // "activation" or "program"
     std::string entryKey;
     std::string nodeId;
     std::string address;
     std::string executionId;
+    // A node's word when nodeAnswered, otherwise one of this player's own.
     std::string outcome;
     std::string reason;
+    bool nodeAnswered = false;
     int attempts = 0;
 };
 
@@ -118,7 +255,8 @@ struct FallbackStatusSnapshot {
     std::uint64_t activationsAuthorized = 0;
     std::uint64_t activationsNotDelivered = 0;
     std::uint64_t coordinatorPostsSkipped = 0;
-    std::vector<FallbackRecord> recent;
+    std::vector<FallbackRecord> recentActivations;
+    std::vector<FallbackRecord> recentProgramHandOffs;
 };
 
 struct FallbackExecutorOptions {
@@ -131,6 +269,7 @@ struct FallbackExecutorOptions {
     std::string installPath;
     PinnedKeyLoadResult pinnedKey;
     OutageDetectorConfig detector;
+    int programRefetchIntervalMillis = kHypothesisProgramRefetchIntervalMillis;
     showmesh::RandomBytesFn randomBytes = showmesh::readRandomBytes;
     // Receives one line per event. isError marks what an operator must act on.
     std::function<void(bool isError, const std::string& line)> log;
@@ -177,12 +316,15 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
 
     // One step of the background thread: probe when due, then, only while the
     // coordinator answers and this host is not in fallback, register and refetch.
+    // A stop request is honored between every network call.
     void tick(TimeMillis now) {
         // The second test keeps a clock stepped backwards from stalling the probe.
         const TimeMillis interval = options_.detector.probeIntervalMillis;
         if (probedOnce_ && now < nextProbeAtMillis_ && nextProbeAtMillis_ - now <= interval) return;
         nextProbeAtMillis_ = now + interval;
         probedOnce_ = true;
+        refreshCredentialAndKey();
+        loadProgramSummaryOnce();
         const showmesh::CoordinatorUrlLoad url = showmesh::loadCoordinatorBaseUrl(options_.stateDir);
         // No coordinator is configured, so there is nothing to lose and nothing to fetch.
         if (!url.ok) return;
@@ -204,10 +346,8 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         } else if (wasLost && !isLost) {
             log(false, "coordinator is answering again");
         }
-        refreshNotice();
-
-        refreshCredentialAndKey();
-        if (reached && !inFallback) keepCurrent(url.baseUrl, now);
+        if (reached && !inFallback && !stopRequested_.load()) keepCurrent(url.baseUrl, now);
+        refreshNotice(now);
         publishStatus(now);
     }
 
@@ -232,6 +372,7 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
             std::lock_guard<std::mutex> lock(mutex_);
             ++coordinatorPostsSkipped_;
         }
+        refreshNotice(event.observedAtMillis);
         publishStatus(event.observedAtMillis);
         return lost;
     }
@@ -252,8 +393,15 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         snapshot.activationsAuthorized = activationsAuthorized_;
         snapshot.activationsNotDelivered = activationsNotDelivered_;
         snapshot.coordinatorPostsSkipped = coordinatorPostsSkipped_;
-        snapshot.recent.assign(recent_.begin(), recent_.end());
+        snapshot.recentActivations.assign(recentActivations_.begin(), recentActivations_.end());
+        snapshot.recentProgramHandOffs.assign(recentProgramHandOffs_.begin(), recentProgramHandOffs_.end());
         return snapshot;
+    }
+
+    // The notice currently raised, empty when none is.
+    std::string notice() const {
+        std::lock_guard<std::mutex> lock(noticeMutex_);
+        return raisedNotice_;
     }
 
  private:
@@ -263,7 +411,6 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         std::optional<int> playlistLoop;
     };
 
-    // What a refetch needs from the program it just installed.
     struct InstalledProgram {
         bool present = false;
         std::string signedDocument;
@@ -294,11 +441,12 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         if (tokenHash != tokenHash_) {
             tokenHash_ = tokenHash;
             credentials_.invalidate();
+            resetRegistrationBackoff();
             std::lock_guard<std::mutex> lock(mutex_);
             registered_ = false;
             registrationAttemptDue_ = true;
         }
-        if (keyUsable()) return;
+        if (keyCopy().usable()) return;
         ExecutorKeyResult loaded = LoadOrCreateExecutorKey(options_.credentialDir, options_.randomBytes);
         if (loaded.status == ExecutorKeyStatus::kCreated) log(false, "created this player's executor key");
         if (loaded.status == ExecutorKeyStatus::kUnusable && loaded.detail != keyProblem_) log(true, loaded.detail);
@@ -307,57 +455,114 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         key_ = std::move(loaded);
     }
 
-    bool keyUsable() const {
+    ExecutorKeyResult keyCopy() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return key_.usable();
+        return key_;
+    }
+
+    // What is on disk from before this start, so the status is true before the first fetch.
+    void loadProgramSummaryOnce() {
+        if (programSummaryLoaded_) return;
+        programSummaryLoaded_ = true;
+        rememberProgram(readInstalledProgram(), keyCopy());
+    }
+
+    // Returns whether the program carries this host's key.
+    bool rememberProgram(const InstalledProgram& program, const ExecutorKeyResult& key) {
+        const bool enrolled =
+            program.present && key.usable() && program.executorPublicKey == key.key.publicKeyBase64;
+        std::lock_guard<std::mutex> lock(mutex_);
+        programPackageId_ = program.packageId;
+        programRevision_ = program.revision;
+        programExpiresAt_ = program.expiresAt;
+        programEnrollsThisExecutor_ = enrolled;
+        return enrolled;
+    }
+
+    bool registeredNow() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return registered_;
     }
 
     void keepCurrent(const std::string& baseUrl, TimeMillis now) {
-        bool fetchDue = !fetchedOnce_ || now >= nextFetchAtMillis_ || nextFetchAtMillis_ - now > latestFetchDelayMillis_;
-        ExecutorKeyResult key;
-        bool attemptRegistration = false;
+        // The last test asks again at once when the clock stepped backwards.
+        bool fetchDue =
+            !fetchedOnce_ || now >= nextFetchAtMillis_ || nextFetchAtMillis_ - now > latestFetchDelayMillis_;
+        const ExecutorKeyResult key = keyCopy();
+        bool attemptDue = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            key = key_;
-            attemptRegistration = key_.usable() && !registered_ && (registrationAttemptDue_ || fetchDue);
+            attemptDue = registrationAttemptDue_;
             registrationAttemptDue_ = false;
         }
-        if (attemptRegistration && registerKey(baseUrl, key.key)) fetchDue = true;
-        if (fetchDue) fetchInstallAndDistribute(baseUrl, now, key);
+        if (key.usable() && !registeredNow() && (attemptDue || fetchDue) && now >= nextRegistrationAtMillis_) {
+            if (registerKey(baseUrl, key.key, now)) fetchDue = true;
+            if (stopRequested_.load()) return;
+        }
+        if (!fetchDue) return;
+
+        const bool enrolled = fetchAndInstall(baseUrl, now, key);
+        if (stopRequested_.load()) return;
+        // Registered, yet the published program does not carry the key: the
+        // coordinator may have lost it, so the flag in memory is not trusted.
+        if (programPublished_ && key.usable() && registeredNow() && !enrolled && now >= nextRegistrationAtMillis_) {
+            if (registerKey(baseUrl, key.key, now)) nextFetchAtMillis_ = now;
+        }
+    }
+
+    void resetRegistrationBackoff() {
+        registrationBackoffMillis_ = 0;
+        nextRegistrationAtMillis_ = 0;
     }
 
     // True when the coordinator stored a first or different key, so its program changes at once.
-    bool registerKey(const std::string& baseUrl, const ExecutorKey& key) {
+    bool registerKey(const std::string& baseUrl, const ExecutorKey& key, TimeMillis now) {
         const ExecutorRegistration registration =
             RegisterExecutorKey(transport_, &credentials_, baseUrl, options_.fppInstanceUuid, key.publicKeyBase64,
                                 kExecutorRegistrationTimeoutMillis);
+        const bool ok = registration.kind == ExecutorRegistrationKind::kRegistered;
         std::string problem;
-        switch (registration.kind) {
-            case ExecutorRegistrationKind::kRegistered:
-                log(false, std::string("executor key registered") + (registration.changed ? " (new)" : ""));
-                break;
-            case ExecutorRegistrationKind::kRefused:
-                problem = "The coordinator answered " + std::to_string(registration.statusCode) +
-                          (registration.detail.empty() ? std::string(".") : ": " + registration.detail);
-                break;
-            case ExecutorRegistrationKind::kCredentialUnavailable:
-            case ExecutorRegistrationKind::kUnreachable:
-                problem = registration.detail;
-                break;
+        if (registration.kind == ExecutorRegistrationKind::kRefused) {
+            problem = "The coordinator answered " + std::to_string(registration.statusCode) +
+                      (registration.detail.empty() ? std::string(".") : ": " + registration.detail);
+        } else if (!ok) {
+            problem = registration.detail;
         }
-        if (!problem.empty()) {
-            log(true, "executor key not registered, tried again at the next program fetch: " + problem);
+
+        // Any change in the answer starts the backoff over. A 409 is asked
+        // again at every program fetch, because it clears by waiting.
+        const std::string answer = std::to_string(static_cast<int>(registration.kind)) + "/" +
+                                   std::to_string(registration.statusCode) + "/" + (registration.changed ? "c" : "");
+        if (answer != lastRegistrationAnswer_) resetRegistrationBackoff();
+        lastRegistrationAnswer_ = answer;
+        if (registration.kind == ExecutorRegistrationKind::kRefused &&
+            registration.statusCode == kRegistrationNotYetStatus) {
+            resetRegistrationBackoff();
+        } else {
+            registrationBackoffMillis_ =
+                registrationBackoffMillis_ == 0
+                    ? static_cast<TimeMillis>(options_.programRefetchIntervalMillis)
+                    : std::min<TimeMillis>(registrationBackoffMillis_ * 2, kRegistrationBackoffCapMillis);
+            nextRegistrationAtMillis_ = now + registrationBackoffMillis_;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
-        registered_ = registration.kind == ExecutorRegistrationKind::kRegistered;
-        registrationProblem_ = problem;
-        return registered_ && registration.changed;
+
+        std::string previousProblem;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            previousProblem = registrationProblem_;
+            registered_ = ok;
+            registrationProblem_ = problem;
+        }
+        if (ok && registration.changed) log(false, "executor key registered");
+        if (!problem.empty() && problem != previousProblem) log(true, "executor key not registered: " + problem);
+        return ok && registration.changed;
     }
 
-    void fetchInstallAndDistribute(const std::string& baseUrl, TimeMillis now, const ExecutorKeyResult& key) {
+    // Returns whether the installed program carries this host's key.
+    bool fetchAndInstall(const std::string& baseUrl, TimeMillis now, const ExecutorKeyResult& key) {
         fetchedOnce_ = true;
-        nextFetchAtMillis_ = now + kRefetchRetryMillis;
-        latestFetchDelayMillis_ = kRefetchRetryMillis;
+        const InstalledProgram before = readInstalledProgram();
+        scheduleNextFetch(now, before);
         if (options_.pinnedKey.status != PinnedKeyLoadStatus::kLoaded) {
             if (!pinnedKeyProblemLogged_) {
                 log(true, std::string("no usable fallback program: ") +
@@ -365,59 +570,64 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
                               ")");
             }
             pinnedKeyProblemLogged_ = true;
-            return;
+            return false;
         }
 
-        const FallbackFetchOutcome outcome =
-            FetchAndInstallFallbackProgram(transport_, &credentials_, baseUrl, options_.fppInstanceUuid,
-                                           options_.pinnedKey.publicKey, options_.installPath, options_.clock);
-        log(false, std::string("program fetch: ") + FallbackFetchOutcomeKindName(outcome.kind) + ": " + outcome.detail);
-        if (ShouldAcknowledgeFallbackFetchOutcome(outcome)) {
+        const FallbackFetchOutcome outcome = FetchAndInstallFallbackProgram(
+            transport_, &credentials_, baseUrl, options_.fppInstanceUuid, options_.pinnedKey.publicKey,
+            options_.installPath, options_.clock, before.present ? &before.signedDocument : nullptr);
+        const std::string outcomeLine =
+            std::string("program fetch: ") + FallbackFetchOutcomeKindName(outcome.kind) + ": " + outcome.detail;
+        if (outcomeLine != lastFetchOutcomeLine_) log(false, outcomeLine);
+        lastFetchOutcomeLine_ = outcomeLine;
+        programPublished_ = outcome.kind == FallbackFetchOutcomeKind::kInstalled ||
+                            outcome.kind == FallbackFetchOutcomeKind::kUnchanged;
+        // The same program again: nothing is rewritten, acknowledged or handed out.
+        if (outcome.kind == FallbackFetchOutcomeKind::kUnchanged) return rememberProgram(before, key);
+
+        // One acknowledge per verdict on a program, not one per fetch of a program still refused.
+        const std::string verdict = outcome.packageId + "/" + outcome.revision + "/" +
+                                    FallbackFetchOutcomeVerificationResult(outcome.kind);
+        const bool newVerdict = outcome.kind == FallbackFetchOutcomeKind::kInstalled || verdict != lastAcknowledged_;
+        if (ShouldAcknowledgeFallbackFetchOutcome(outcome) && newVerdict && !stopRequested_.load()) {
             const AcknowledgeResult ack = AcknowledgeFallbackProgram(transport_, &credentials_, baseUrl,
                                                                      options_.fppInstanceUuid, outcome, options_.clock);
+            if (ack.ok) lastAcknowledged_ = verdict;
             if (!ack.ok) log(true, "acknowledge failed: " + ack.error);
         }
-        if (outcome.kind != FallbackFetchOutcomeKind::kInstalled) return;
+        if (outcome.kind != FallbackFetchOutcomeKind::kInstalled) return rememberProgram(before, key);
 
         const InstalledProgram program = readInstalledProgram();
-        if (!program.present) return;
-        const bool enrolled = key.usable() && program.executorPublicKey == key.key.publicKeyBase64;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            programPackageId_ = program.packageId;
-            programRevision_ = program.revision;
-            programExpiresAt_ = program.expiresAt;
-            programEnrollsThisExecutor_ = enrolled;
-        }
-        if (enrolled || !key.usable()) nextFetchAtMillis_ = now + refetchDelayMillis(program);
-        latestFetchDelayMillis_ = nextFetchAtMillis_ - now;
+        const bool enrolled = rememberProgram(program, key);
+        scheduleNextFetch(now, program);
+        resetRegistrationBackoff();
         for (const std::string& address : program.addresses) {
-            if (stopRequested_.load()) return;
+            if (stopRequested_.load()) break;
             const NodeAnswer answer =
                 HandProgramToNode(transport_, address, options_.fppInstanceUuid, program.signedDocument);
             FallbackRecord record;
             record.atMillis = now;
-            record.kind = "program";
             record.address = address;
-            record.outcome = !answer.outcome.empty() ? answer.outcome
-                             : answer.responded      ? kOutcomeUnrecognizedAnswer
-                                                     : kOutcomeNoResponse;
-            record.reason = answer.reason;
+            record.nodeAnswered = !answer.outcome.empty();
+            DescribeNodeAnswer(answer, &record.outcome, &record.reason);
             record.attempts = 1;
-            appendRecord(record);
+            appendRecord(record, "program", &recentProgramHandOffs_, kRecentProgramHandOffRecords);
         }
+        return enrolled;
     }
 
-    TimeMillis refetchDelayMillis(const InstalledProgram& program) const {
+    // The configured interval, or one third of the program's validity when that is sooner.
+    void scheduleNextFetch(TimeMillis now, const InstalledProgram& program) {
+        TimeMillis delay = options_.programRefetchIntervalMillis;
         std::int64_t compiledAt = 0;
         std::int64_t expiresAt = 0;
-        if (!detail::parseRfc3339ToEpochSeconds(program.compiledAt, &compiledAt) ||
-            !detail::parseRfc3339ToEpochSeconds(program.expiresAt, &expiresAt) || expiresAt <= compiledAt) {
-            return kRefetchRetryMillis;
+        if (program.present && detail::parseRfc3339ToEpochSeconds(program.compiledAt, &compiledAt) &&
+            detail::parseRfc3339ToEpochSeconds(program.expiresAt, &expiresAt) && expiresAt > compiledAt) {
+            const TimeMillis validityMillis = static_cast<TimeMillis>(expiresAt - compiledAt) * 1000;
+            delay = std::min(delay, validityMillis * kRefetchValidityNumerator / kRefetchValidityDenominator);
         }
-        const TimeMillis validityMillis = static_cast<TimeMillis>(expiresAt - compiledAt) * 1000;
-        const TimeMillis delay = validityMillis * kRefetchValidityNumerator / kRefetchValidityDenominator;
-        return std::max<TimeMillis>(delay, options_.detector.probeIntervalMillis);
+        latestFetchDelayMillis_ = std::max<TimeMillis>(delay, options_.detector.probeIntervalMillis);
+        nextFetchAtMillis_ = now + latestFetchDelayMillis_;
     }
 
     InstalledProgram readInstalledProgram() const {
@@ -456,6 +666,24 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         return program;
     }
 
+    // This player's outcome word for what stops it starting any cue right
+    // now, or empty when it holds everything a delivery needs.
+    std::string readinessProblem(TimeMillis nowMillis) const {
+        if (options_.pinnedKey.status != PinnedKeyLoadStatus::kLoaded) return kOutcomeNoCoordinatorKey;
+        const auto now = std::chrono::system_clock::time_point(std::chrono::milliseconds(nowMillis));
+        const ActivationResolution probe =
+            ResolveInstalledActivation(std::string(), options_.installPath, options_.pinnedKey.publicKey, now);
+        if (probe.kind == ActivationResolveKind::kNoProgramInstalled ||
+            probe.kind == ActivationResolveKind::kProgramFailedReverification ||
+            probe.kind == ActivationResolveKind::kProgramExpired) {
+            return PlayerOutcomeWord(probe.kind);
+        }
+        const ExecutorKeyResult key = keyCopy();
+        if (!key.usable()) return kOutcomeNoPlayerKey;
+        if (readInstalledProgram().executorPublicKey != key.key.publicKeyBase64) return kOutcomePlayerKeyNotInProgram;
+        return std::string();
+    }
+
     // A repeated `playing` for the entry already playing is FPP resuming it,
     // not a new occurrence, unless FPP reported the entry finished in between.
     bool isNewOccurrence(const showmesh::FallbackEntryEvent& event) {
@@ -472,7 +700,6 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
     void onEntryBoundary(const showmesh::FallbackEntryEvent& event) {
         bool entered = false;
         FallbackMode mode = FallbackMode::kNormal;
-        ExecutorKeyResult key;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (state_.mode == FallbackMode::kNormal && detector_.confirmedLost()) {
@@ -480,47 +707,46 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
                 entered = true;
             }
             mode = state_.mode;
-            key = key_;
         }
-        if (entered) {
-            log(true, "entered fallback at entryKey=" + event.entryKey);
-            refreshNotice();
-        }
+        if (entered) log(true, "entered fallback at entryKey=" + event.entryKey);
+        const ExecutorKeyResult key = keyCopy();
 
-        const bool havePinnedKey = options_.pinnedKey.status == PinnedKeyLoadStatus::kLoaded;
         ActivationResolution resolution;
-        std::string resolutionName = kOutcomeEntryNotIdentified;
-        std::string resolutionReason = "FPP's playlist entry could not be identified";
-        if (event.identityResolved && !havePinnedKey) {
-            resolutionName = PinnedKeyLoadStatusName(options_.pinnedKey.status);
-            resolutionReason = options_.pinnedKey.error;
+        std::string problem = kOutcomeEntryNotIdentified;
+        std::string detailForLog = "identity not resolved";
+        if (event.identityResolved && options_.pinnedKey.status != PinnedKeyLoadStatus::kLoaded) {
+            problem = kOutcomeNoCoordinatorKey;
+            detailForLog =
+                std::string(PinnedKeyLoadStatusName(options_.pinnedKey.status)) + " " + options_.pinnedKey.error;
         } else if (event.identityResolved) {
             const auto now = std::chrono::system_clock::time_point(std::chrono::milliseconds(event.observedAtMillis));
             resolution =
                 ResolveInstalledActivation(event.entryKey, options_.installPath, options_.pinnedKey.publicKey, now);
-            resolutionName = ActivationResolveKindName(resolution.kind);
-            resolutionReason = resolution.reason;
+            problem = PlayerOutcomeWord(resolution.kind);
+            detailForLog = std::string(ActivationResolveKindName(resolution.kind)) + " " + resolution.reason;
         }
-        log(false, resolutionName + " entryKey=" + event.entryKey +
+        log(false, detailForLog + " entryKey=" + event.entryKey +
                        " observedAtMillis=" + std::to_string(static_cast<long long>(event.observedAtMillis)));
         if (mode != FallbackMode::kFallback) return;
 
-        if (resolution.kind != ActivationResolveKind::kMatch || !resolution.match.has_value()) {
-            recordRefusal(event, std::string(), std::string(), resolutionName, resolutionReason);
+        if (problem.empty() && !key.usable()) problem = kOutcomeNoPlayerKey;
+        if (problem.empty() && resolution.match->executorPublicKey() != key.key.publicKeyBase64) {
+            problem = kOutcomePlayerKeyNotInProgram;
+        }
+        if (!problem.empty()) {
+            const bool nothingMapped = problem == kOutcomeUnknownEntry;
+            recordPlayerDecision(event, std::string(), std::string(), problem);
+            setBoundaryResult(nothingMapped ? BoundaryResult::kNothingToStart : BoundaryResult::kNotStarted,
+                              nothingMapped ? std::string() : problem);
             return;
         }
-        const ActivationMatch& match = *resolution.match;
-        if (!key.usable()) {
-            recordRefusal(event, std::string(), std::string(), kOutcomeNoExecutorKey,
-                          "this player holds no executor key");
-            return;
-        }
-        if (match.executorPublicKey() != key.key.publicKeyBase64) {
-            recordRefusal(event, std::string(), std::string(), kOutcomeExecutorKeyNotInProgram,
-                          "the installed program does not carry this player's executor key");
-            return;
-        }
-        deliverMatch(event, match, key.key);
+        deliverMatch(event, *resolution.match, key.key);
+    }
+
+    void setBoundaryResult(BoundaryResult result, const std::string& problem) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        state_.lastBoundary = result;
+        state_.lastBoundaryProblem = problem;
     }
 
     void deliverMatch(const showmesh::FallbackEntryEvent& event, const ActivationMatch& match,
@@ -530,29 +756,32 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
             std::string body;
         };
         std::vector<Delivery> deliveries;
+        std::string firstProblem;
         for (const ActivationTarget& target : match.targets()) {
-            if (!target.address.has_value()) {
-                recordRefusal(event, target.nodeId, std::string(), kOutcomeNoAddress,
-                              "the installed program gives no address for this node");
-                continue;
-            }
+            std::string problem;
             uint8_t random[16];
             std::string signature;
-            const bool haveId = options_.randomBytes != nullptr && options_.randomBytes(random, sizeof(random));
-            const std::string executionId = haveId ? formatExecutionId(random) : std::string();
-            const ActivationRequestBuild build = BuildActivationRequest(match, target, executionId);
-            if (!build.ok) {
-                recordRefusal(event, target.nodeId, *target.address, kOutcomeIncompleteProgram, build.refusal);
-                continue;
+            std::string executionId;
+            ActivationRequestBuild build;
+            if (!target.address.has_value()) {
+                problem = kOutcomeNoAddress;
+            } else {
+                const bool haveId = options_.randomBytes != nullptr && options_.randomBytes(random, sizeof(random));
+                executionId = haveId ? formatExecutionId(random) : std::string();
+                build = BuildActivationRequest(match, target, executionId);
+                if (!build.ok) {
+                    problem = kOutcomeIncompleteProgram;
+                } else if (!haveId || !signWithExecutorKey(key, build.canonical, &signature)) {
+                    problem = kOutcomeSigningFailed;
+                }
             }
-            if (!haveId || !signWithExecutorKey(key, build.canonical, &signature)) {
-                recordRefusal(event, target.nodeId, *target.address, kOutcomeSigningFailed,
-                              "the request could not be signed");
+            if (!problem.empty()) {
+                if (firstProblem.empty()) firstProblem = problem;
+                recordPlayerDecision(event, target.nodeId, target.address.value_or(std::string()), problem);
                 continue;
             }
             Delivery delivery;
             delivery.record.atMillis = event.observedAtMillis;
-            delivery.record.kind = "activation";
             delivery.record.entryKey = event.entryKey;
             delivery.record.nodeId = target.nodeId;
             delivery.record.address = *target.address;
@@ -568,13 +797,23 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
                 options_.pause ? options_.pause : DeliveryPause([this](int millis) { return waitOrStop(millis); }));
             delivery->record.outcome = result.outcome;
             delivery->record.reason = result.reason;
+            delivery->record.nodeAnswered = result.nodeAnswered();
             delivery->record.attempts = result.attempts;
         };
         std::vector<std::thread> threads;
         for (std::size_t i = 1; i < deliveries.size(); ++i) threads.emplace_back(run, &deliveries[i]);
         if (!deliveries.empty()) run(&deliveries[0]);
         for (std::thread& thread : threads) thread.join();
-        for (const Delivery& delivery : deliveries) appendRecord(delivery.record);
+
+        std::size_t started = 0;
+        for (const Delivery& delivery : deliveries) {
+            if (delivery.record.outcome == "authorized") ++started;
+            appendRecord(delivery.record, "activation", &recentActivations_, kRecentActivationRecords);
+        }
+        setBoundaryResult(started == match.targets().size() ? BoundaryResult::kStarted
+                          : started > 0                     ? BoundaryResult::kStartedOnSomeNodes
+                                                            : BoundaryResult::kNotStarted,
+                          deliveries.empty() ? firstProblem : std::string());
     }
 
     bool waitOrStop(int millis) {
@@ -582,29 +821,29 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         return !wake_.wait_for(lock, std::chrono::milliseconds(millis), [this] { return stopRequested_.load(); });
     }
 
-    void recordRefusal(const showmesh::FallbackEntryEvent& event, const std::string& nodeId,
-                       const std::string& address, const std::string& outcome, const std::string& reason) {
+    void recordPlayerDecision(const showmesh::FallbackEntryEvent& event, const std::string& nodeId,
+                              const std::string& address, const std::string& outcome) {
         FallbackRecord record;
         record.atMillis = event.observedAtMillis;
-        record.kind = "activation";
         record.entryKey = event.entryKey;
         record.nodeId = nodeId;
         record.address = address;
         record.outcome = outcome;
-        record.reason = reason;
-        appendRecord(record);
+        record.reason = PlayerOutcomeCopyFor(outcome).reason;
+        appendRecord(record, "activation", &recentActivations_, kRecentActivationRecords);
     }
 
-    void appendRecord(const FallbackRecord& record) {
-        const bool authorized = record.kind == "activation" && record.outcome == "authorized";
-        log(record.outcome != "authorized" && record.outcome != "installed",
-            record.kind + " entryKey=" + record.entryKey + " nodeId=" + record.nodeId + " address=" + record.address +
-                " executionId=" + record.executionId + " outcome=" + record.outcome +
-                " attempts=" + std::to_string(record.attempts) + " reason=" + record.reason);
+    void appendRecord(const FallbackRecord& record, const char* kind, std::deque<FallbackRecord>* list,
+                      std::size_t limit) {
+        const bool good = record.outcome == "authorized" || record.outcome == "installed";
+        log(!good, std::string(kind) + " entryKey=" + record.entryKey + " nodeId=" + record.nodeId +
+                       " address=" + record.address + " executionId=" + record.executionId +
+                       " outcome=" + record.outcome + " attempts=" + std::to_string(record.attempts) +
+                       " reason=" + record.reason);
         std::lock_guard<std::mutex> lock(mutex_);
-        if (record.kind == "activation") ++(authorized ? activationsAuthorized_ : activationsNotDelivered_);
-        recent_.push_back(record);
-        while (recent_.size() > kRecentFallbackRecords) recent_.pop_front();
+        if (list == &recentActivations_) ++(good ? activationsAuthorized_ : activationsNotDelivered_);
+        list->push_back(record);
+        while (list->size() > limit) list->pop_front();
     }
 
     void leaveFallbackOnPlaylistStop(TimeMillis now) {
@@ -614,21 +853,28 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
             state_.leaveOnPlaylistStop();
         }
         log(false, "left fallback: the playlist stopped at " + std::to_string(static_cast<long long>(now)));
-        refreshNotice();
     }
 
-    // Keeps exactly one notice raised: the one for the current state, or none.
-    void refreshNotice() {
-        std::string wanted;
+    // Keeps exactly one notice raised: the one that is true now, or none.
+    // The state is read while holding the lock that guards the raise, so the
+    // last caller to finish is the one with the newest state.
+    void refreshNotice(TimeMillis now) {
+        std::lock_guard<std::mutex> noticeLock(noticeMutex_);
+        FallbackExecutionState state;
+        bool lost = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (state_.mode == FallbackMode::kFallback) {
-                wanted = kFallbackActiveMessage;
-            } else if (detector_.confirmedLost()) {
-                wanted = kCoordinatorLostMessage;
+            state = state_;
+            lost = detector_.confirmedLost();
+        }
+        std::string problem;
+        if (state.mode == FallbackMode::kFallback || lost) {
+            problem = readinessProblem(now);
+            if (problem.empty() && state.lastBoundary == BoundaryResult::kNotStarted) {
+                problem = state.lastBoundaryProblem;
             }
         }
-        std::lock_guard<std::mutex> lock(noticeMutex_);
+        const std::string wanted = FallbackNotice(state.mode, lost, problem, state.lastBoundary);
         if (wanted == raisedNotice_) return;
         if (options_.notifier != nullptr) {
             if (!raisedNotice_.empty()) options_.notifier->clear(raisedNotice_);
@@ -637,32 +883,36 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         raisedNotice_ = wanted;
     }
 
-    void publishStatus(TimeMillis now) {
-        if (options_.stateDir.empty()) return;
-        const FallbackStatusSnapshot snapshot = status();
+    static showmesh::json::Value recordsJson(const std::vector<FallbackRecord>& records) {
         using showmesh::json::Value;
-        auto number = [](std::uint64_t n) { return Value::makeNumber(static_cast<double>(n)); };
-        std::vector<Value> recent;
-        for (const FallbackRecord& record : snapshot.recent) {
-            recent.push_back(Value::makeObject({
+        std::vector<Value> items;
+        for (const FallbackRecord& record : records) {
+            items.push_back(Value::makeObject({
                 {"atMillis", Value::makeNumber(static_cast<double>(record.atMillis))},
-                {"kind", Value::makeString(record.kind)},
                 {"entryKey", Value::makeString(record.entryKey)},
                 {"nodeId", Value::makeString(record.nodeId)},
                 {"address", Value::makeString(record.address)},
                 {"executionId", Value::makeString(record.executionId)},
                 {"outcome", Value::makeString(record.outcome)},
+                {"answeredBy", Value::makeString(record.nodeAnswered ? "node" : "player")},
                 {"reason", Value::makeString(record.reason)},
                 {"attempts", Value::makeNumber(record.attempts)},
             }));
         }
-        const bool inFallback = snapshot.state.mode == FallbackMode::kFallback;
-        const std::string message = inFallback                 ? kFallbackActiveMessage
-                                    : snapshot.coordinatorLost ? kCoordinatorLostMessage
-                                                               : "";
+        return Value::makeArray(std::move(items));
+    }
+
+    // The snapshot is taken while holding the lock that guards the write, for
+    // the same reason refreshNotice() reads its state under its own.
+    void publishStatus(TimeMillis now) {
+        if (options_.stateDir.empty()) return;
+        std::lock_guard<std::mutex> fileLock(statusFileMutex_);
+        const FallbackStatusSnapshot snapshot = status();
+        using showmesh::json::Value;
+        auto number = [](std::uint64_t n) { return Value::makeNumber(static_cast<double>(n)); };
         const showmesh::json::CanonicalResult body = showmesh::json::canonicalize(Value::makeObject({
             {"mode", Value::makeString(FallbackModeName(snapshot.state.mode))},
-            {"message", Value::makeString(message)},
+            {"message", Value::makeString(notice())},
             {"coordinatorReachable", Value::makeBool(snapshot.coordinatorReachable)},
             {"coordinatorLost", Value::makeBool(snapshot.coordinatorLost)},
             {"enteredFallbackAtMillis", Value::makeNumber(static_cast<double>(snapshot.state.enteredAtMillis))},
@@ -676,11 +926,10 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
             {"activationsAuthorized", number(snapshot.activationsAuthorized)},
             {"activationsNotDelivered", number(snapshot.activationsNotDelivered)},
             {"coordinatorPostsSkipped", number(snapshot.coordinatorPostsSkipped)},
-            {"recent", Value::makeArray(std::move(recent))},
+            {"recentActivations", recordsJson(snapshot.recentActivations)},
+            {"recentProgramHandOffs", recordsJson(snapshot.recentProgramHandOffs)},
         }));
-        if (!body.ok) return;
-        std::lock_guard<std::mutex> lock(statusFileMutex_);
-        if (body.text == writtenStatus_) return;
+        if (!body.ok || body.text == writtenStatus_) return;
         // updatedAtMillis rides outside the compared text so an unchanged status is not rewritten.
         const std::string rendered =
             body.text.substr(0, body.text.size() - 1) + ",\"updatedAtMillis\":" + std::to_string(now) + "}";
@@ -709,15 +958,24 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
     std::uint64_t activationsAuthorized_ = 0;
     std::uint64_t activationsNotDelivered_ = 0;
     std::uint64_t coordinatorPostsSkipped_ = 0;
-    std::deque<FallbackRecord> recent_;
+    std::deque<FallbackRecord> recentActivations_;
+    std::deque<FallbackRecord> recentProgramHandOffs_;
 
     // Background thread only.
     bool probedOnce_ = false;
     TimeMillis nextProbeAtMillis_ = 0;
     bool fetchedOnce_ = false;
+    // True when the last fetch found a published program, new or unchanged.
+    bool programPublished_ = false;
+    bool programSummaryLoaded_ = false;
     TimeMillis nextFetchAtMillis_ = 0;
     // How far ahead the last fetch scheduled the next one. A longer wait means the clock stepped back.
     TimeMillis latestFetchDelayMillis_ = 0;
+    TimeMillis nextRegistrationAtMillis_ = 0;
+    TimeMillis registrationBackoffMillis_ = 0;
+    std::string lastRegistrationAnswer_;
+    std::string lastFetchOutcomeLine_;
+    std::string lastAcknowledged_;
     std::string tokenHash_;
     std::string keyProblem_;
     bool pinnedKeyProblemLogged_ = false;
@@ -726,7 +984,7 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
     std::optional<Boundary> lastBoundary_;
     bool occurrenceFinished_ = false;
 
-    std::mutex noticeMutex_;
+    mutable std::mutex noticeMutex_;
     std::string raisedNotice_;
     std::mutex statusFileMutex_;
     std::string writtenStatus_;

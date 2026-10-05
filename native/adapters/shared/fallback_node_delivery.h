@@ -145,6 +145,23 @@ inline NodeAnswer HandProgramToNode(HttpTransport* transport, const std::string&
     return ParseNodeAnswer(transport->put(request));
 }
 
+// The outcome word and reason to record for one answer. A node's own word and
+// reason are kept as given; where it gave none, the sentence is this player's.
+inline void DescribeNodeAnswer(const NodeAnswer& answer, std::string* outcome, std::string* reason) {
+    if (!answer.outcome.empty()) {
+        *outcome = answer.outcome;
+        *reason = answer.reason;
+    } else if (answer.responded) {
+        *outcome = kOutcomeUnrecognizedAnswer;
+        *reason = "The address answered with status " + std::to_string(answer.statusCode) +
+                  ", but not as a ShowMesh node. Check the node's address on the coordinator.";
+    } else {
+        *outcome = kOutcomeNoResponse;
+        *reason = "The node did not answer: " + answer.reason +
+                  ". Check the node and the network between it and this player.";
+    }
+}
+
 enum class NodeAnswerClass { kAuthorized, kReplayed, kTransient, kRateLimited, kProgramMissing, kFinal };
 
 // The section 5.8 table's left column. A caller decides on the outcome word;
@@ -168,6 +185,10 @@ struct NodeDeliveryResult {
     // words when the node gave none. "authorized" is the only success.
     std::string outcome;
     std::string reason;
+    // True when outcome is a word a node sent.
+    bool nodeAnswered() const {
+        return outcome != kOutcomeNoResponse && outcome != kOutcomeUnrecognizedAnswer && outcome != kOutcomeStopped;
+    }
     int attempts = 0;
     bool programResent = false;
     // True when the node said it had already processed this execution id.
@@ -191,15 +212,12 @@ inline NodeDeliveryResult DeliverActivation(HttpTransport* transport, const std:
 
     bool rateLimitedRetryUsed = false;
     auto finish = [&](const NodeAnswer& answer) {
-        result.outcome = !answer.outcome.empty() ? answer.outcome
-                         : answer.responded      ? kOutcomeUnrecognizedAnswer
-                                                 : kOutcomeNoResponse;
-        result.reason = answer.reason;
+        DescribeNodeAnswer(answer, &result.outcome, &result.reason);
         return result;
     };
     auto stopped = [&] {
         result.outcome = kOutcomeStopped;
-        result.reason = "the plugin stopped before the node answered";
+        result.reason = "The plugin stopped before the node answered.";
         return result;
     };
 

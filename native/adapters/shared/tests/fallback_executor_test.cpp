@@ -7,8 +7,10 @@
 
 #include <chrono>
 #include <deque>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -230,11 +232,17 @@ class FakeNetwork : public showmesh::HttpTransport {
     std::string registrationRefusalBody = "{\"title\":\"Forbidden\",\"detail\":\"the coordinator says why\"}";
     std::string programEnvelope = "{\"published\":false}";
     std::set<std::string> nodesDown;
+    // Runs after a request is recorded and before it is answered, outside the lock.
+    std::function<void(const std::string& method, const std::string& url)> beforeAnswer;
 
  private:
     HttpResponse handle(const std::string& method, const HttpRequest& request) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            sent_.push_back(Sent{method, request.url, request.body, request.bearerToken, request.timeoutMillis});
+        }
+        if (beforeAnswer) beforeAnswer(method, request.url);
         std::lock_guard<std::mutex> lock(mutex_);
-        sent_.push_back(Sent{method, request.url, request.body, request.bearerToken, request.timeoutMillis});
         const std::string coordinator = kCoordinatorUrl;
         if (request.url.compare(0, coordinator.size(), coordinator) == 0) {
             if (!coordinatorUp) return noResponse();
@@ -315,6 +323,9 @@ class Bench {
     std::string credentialDir() const { return root_ + "/credential"; }
     std::string installPath() const { return root_ + "/state/fallback-program.json"; }
     std::string keyPath() const { return credentialDir() + "/" + kExecutorKeyFilename; }
+    std::string statusMessage() const {
+        return member(parseJson(readFile(stateDir() + "/" + kFallbackStatusFilename)), "message");
+    }
 
     void writeFile(const std::string& path, const std::string& contents) {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -336,7 +347,7 @@ class Bench {
         options.stateDir = stateDir();
         options.credentialDir = credentialDir();
         options.installPath = installPath();
-        options.pinnedKey = fixturePinnedKey();
+        options.pinnedKey = pinnedKey;
         options.randomBytes = fixtureRandom;
         options.notifier = &notifier;
         options.log = [this](bool, const std::string& line) { logs.push_back(line); };
@@ -384,13 +395,10 @@ class Bench {
     }
 
     std::vector<FallbackRecord> activationRecords() {
-        std::vector<FallbackRecord> records;
-        for (const FallbackRecord& r : executor->status().recent) {
-            if (r.kind == "activation") records.push_back(r);
-        }
-        return records;
+        return executor->status().recentActivations;
     }
 
+    PinnedKeyLoadResult pinnedKey = fixturePinnedKey();
     FakeNetwork network;
     RecordingNotifier notifier;
     FixedDefinitions definitions;
@@ -529,7 +537,7 @@ TEST(PairingAgainRegistersTheSameKeyUnderTheNewToken) {
     CHECK_EQ(registrations[1].body, registrations[0].body);
 }
 
-TEST(AnyRefusedRegistrationLeavesTheKeyUnregisteredShowsTheCoordinatorsReasonAndIsTriedAgainAtTheNextFetch) {
+TEST(AnyRefusedRegistrationLeavesTheKeyUnregisteredAndShowsTheCoordinatorsReason) {
     for (int status : {403, 409, 500}) {
         Bench bench;
         bench.network.registrationStatus = status;
@@ -541,17 +549,91 @@ TEST(AnyRefusedRegistrationLeavesTheKeyUnregisteredShowsTheCoordinatorsReasonAnd
         const showmesh::json::Value file = parseJson(readFile(bench.stateDir() + "/" + kFallbackStatusFilename));
         CHECK(member(file, "executorKeyRegistrationProblem").find("the coordinator says why") != std::string::npos);
 
+        // Not before the next program fetch.
         bench.advanceAndTick(kHypothesisProbeIntervalMillis);
         CHECK_EQ(bench.network.count("PUT", "/executor-key"), static_cast<std::size_t>(1));
 
         bench.network.registrationStatus = 200;
-        bench.advanceAndTick(kRefetchRetryMillis);
+        bench.advanceAndTick(kHypothesisProgramRefetchIntervalMillis);
         CHECK_EQ(bench.network.count("PUT", "/executor-key"), static_cast<std::size_t>(2));
         CHECK(bench.executor->status().executorKeyRegistered);
         CHECK(bench.executor->status().executorKeyRegistrationProblem.empty());
         // No refusal is ever answered by asking for a new pairing.
         CHECK_EQ(bench.network.count("POST", "/pairing/"), static_cast<std::size_t>(0));
     }
+}
+
+namespace {
+
+// Ticks every probe interval for the given time and returns how many registrations were sent in it.
+std::size_t registrationsDuring(Bench* bench, TimeMillis millis) {
+    const std::size_t before = bench->network.count("PUT", "/executor-key");
+    for (TimeMillis waited = 0; waited < millis; waited += kHypothesisProbeIntervalMillis) {
+        bench->advanceAndTick(kHypothesisProbeIntervalMillis);
+    }
+    return bench->network.count("PUT", "/executor-key") - before;
+}
+
+}  // namespace
+
+TEST(A409RegistrationIsAskedAgainAtEveryProgramFetch) {
+    Bench bench;
+    bench.network.registrationStatus = 409;
+    bench.tick();
+    // Ten refetch intervals, ten more attempts: this answer clears by waiting.
+    CHECK_EQ(registrationsDuring(&bench, 10 * kHypothesisProgramRefetchIntervalMillis), static_cast<std::size_t>(10));
+}
+
+TEST(A403RegistrationBacksOffDoublingToTenMinutesAndStartsOverWhenTheAnswerChanges) {
+    Bench bench;
+    bench.network.registrationStatus = 403;
+    bench.tick();
+    // Retries land 1, 2, 4, 8 and then 10 minutes apart: at minutes 1, 3, 7, 15, 25, 35.
+    CHECK_EQ(registrationsDuring(&bench, 35 * 60 * 1000), static_cast<std::size_t>(6));
+    CHECK_EQ(registrationsDuring(&bench, 9 * 60 * 1000), static_cast<std::size_t>(0));
+    CHECK_EQ(registrationsDuring(&bench, 60 * 1000), static_cast<std::size_t>(1));
+
+    // A different answer starts the backoff over: one interval, then two.
+    bench.network.registrationStatus = 500;
+    CHECK_EQ(registrationsDuring(&bench, 10 * 60 * 1000), static_cast<std::size_t>(1));
+    CHECK_EQ(registrationsDuring(&bench, 60 * 1000), static_cast<std::size_t>(1));
+    CHECK_EQ(registrationsDuring(&bench, 60 * 1000), static_cast<std::size_t>(0));
+    CHECK_EQ(registrationsDuring(&bench, 60 * 1000), static_cast<std::size_t>(1));
+}
+
+TEST(AProgramWithoutThisPlayersKeyIsNotRewrittenAcknowledgedOrHandedOutAgainAndTheKeyIsRegisteredAgainWithBackoff) {
+    Bench bench;
+    ProgramSpec noKey = twoEntryProgram(bench);
+    noKey.executorPublicKey.clear();
+    noKey.expiresAt = "2026-10-05T23:00:00Z";
+    bench.network.programEnvelope = getEnvelope(signedProgram(noKey));
+    // The coordinator says the key is stored, and keeps publishing a program without it.
+    bench.network.registrationChanged = false;
+    bench.tick();
+    CHECK(bench.executor->status().executorKeyRegistered);
+    CHECK(!bench.executor->status().programEnrollsThisExecutor);
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(1));
+    const auto installedAt = std::filesystem::last_write_time(bench.installPath());
+    const std::string statusBefore = readFile(bench.stateDir() + "/" + kFallbackStatusFilename);
+
+    // Thirty-five minutes: the key is registered again at minutes 1, 3, 7, 15, 25 and 35, not every fetch.
+    CHECK_EQ(registrationsDuring(&bench, 35 * 60 * 1000), static_cast<std::size_t>(6));
+    CHECK_EQ(bench.network.count("GET", std::string("/api/v1/fallback-programs/") + kFppUuid),
+             static_cast<std::size_t>(36));
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(1));
+    CHECK(std::filesystem::last_write_time(bench.installPath()) == installedAt);
+    CHECK_EQ(readFile(bench.stateDir() + "/" + kFallbackStatusFilename), statusBefore);
+
+    // The coordinator publishes the key: installed and handed out once, and no more registrations.
+    ProgramSpec withKey = twoEntryProgram(bench);
+    withKey.expiresAt = "2026-10-05T23:00:00Z";
+    bench.network.programEnvelope = getEnvelope(signedProgram(withKey));
+    CHECK_EQ(registrationsDuring(&bench, 20 * 60 * 1000), static_cast<std::size_t>(0));
+    CHECK(bench.executor->status().programEnrollsThisExecutor);
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(2));
+    CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(2));
 }
 
 TEST(AKeyFileWithAnyOtherModeIsNeitherUsedNorReplaced) {
@@ -660,26 +742,77 @@ TEST(AFetchedProgramIsInstalledAcknowledgedAndHandedToEveryDistinctNodeAddressOn
     CHECK(bench.executor->status().programEnrollsThisExecutor);
 }
 
-TEST(TheProgramIsRefetchedAfterTheNamedFractionOfItsOwnValidityAndHandedOutAgain) {
+TEST(TheProgramIsRefetchedOnTheConfiguredIntervalAndAnUnchangedOneDoesNothingFurther) {
     Bench bench;
     bench.network.programEnvelope = getEnvelope(fixture("program.json"));
     bench.tick();
     const std::string programRoute = std::string("/api/v1/fallback-programs/") + kFppUuid;
     auto fetches = [&] { return bench.network.count("GET", programRoute); };
     CHECK_EQ(fetches(), static_cast<std::size_t>(1));
+    const auto installedAt = std::filesystem::last_write_time(bench.installPath());
 
-    // Fifteen minutes of validity, one third of it: five minutes.
-    const TimeMillis delay = 15 * 60 * 1000 * kRefetchValidityNumerator / kRefetchValidityDenominator;
-    CHECK_EQ(delay, kFiveMinutesMillis);
-    for (TimeMillis waited = kHypothesisProbeIntervalMillis; waited < delay; waited += kHypothesisProbeIntervalMillis) {
+    for (TimeMillis waited = kHypothesisProbeIntervalMillis; waited < kHypothesisProgramRefetchIntervalMillis;
+         waited += kHypothesisProbeIntervalMillis) {
         bench.advanceAndTick(kHypothesisProbeIntervalMillis);
     }
     CHECK_EQ(fetches(), static_cast<std::size_t>(1));
-
     bench.advanceAndTick(kHypothesisProbeIntervalMillis);
     CHECK_EQ(fetches(), static_cast<std::size_t>(2));
-    CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(4));
+
+    // The same revision and expiry: no file rewrite, no acknowledge, no hand-out, no record.
+    CHECK(std::filesystem::last_write_time(bench.installPath()) == installedAt);
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(2));
+    CHECK_EQ(bench.executor->status().recentProgramHandOffs.size(), static_cast<std::size_t>(2));
+}
+
+TEST(AChangedProgramIsInstalledAcknowledgedAndHandedOutAtTheNextRefetch) {
+    Bench bench;
+    bench.network.programEnvelope = getEnvelope(signedProgram(twoEntryProgram(bench)));
+    bench.tick();
+    ProgramSpec refreshed = twoEntryProgram(bench);
+    refreshed.expiresAt = "2026-10-05T12:20:00Z";
+    const std::string refreshedDocument = signedProgram(refreshed);
+    bench.network.programEnvelope = getEnvelope(refreshedDocument);
+
+    for (TimeMillis waited = 0; waited < kHypothesisProgramRefetchIntervalMillis;
+         waited += kHypothesisProbeIntervalMillis) {
+        bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    }
+    CHECK_EQ(readFile(bench.installPath()), refreshedDocument);
+    CHECK_EQ(bench.executor->status().programExpiresAt, std::string("2026-10-05T12:20:00Z"));
     CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(2));
+    CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(2));
+}
+
+TEST(APublishedProgramThatStaysRefusedIsAcknowledgedOnceNotAtEveryFetch) {
+    Bench bench;
+    ProgramSpec expired = twoEntryProgram(bench);
+    expired.expiresAt = "2026-10-05T12:01:00Z";
+    bench.network.programEnvelope = getEnvelope(signedProgram(expired));
+    bench.tick();
+    for (int i = 0; i < 60; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+
+    CHECK(bench.network.count("GET", std::string("/api/v1/fallback-programs/") + kFppUuid) >= 5);
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(1));
+    CHECK(!std::filesystem::exists(bench.installPath()));
+}
+
+TEST(TheRefetchIsNeverLaterThanTheNamedFractionOfTheProgramsValidity) {
+    Bench bench;
+    ProgramSpec shortLived = twoEntryProgram(bench);
+    // Ninety seconds of validity, one third of it: thirty seconds, sooner than the interval.
+    shortLived.compiledAt = "2026-10-05T12:04:30Z";
+    shortLived.expiresAt = "2026-10-05T12:06:00Z";
+    bench.network.programEnvelope = getEnvelope(signedProgram(shortLived));
+    bench.tick();
+    const std::string programRoute = std::string("/api/v1/fallback-programs/") + kFppUuid;
+    CHECK_EQ(90 * 1000 * kRefetchValidityNumerator / kRefetchValidityDenominator, 30000);
+
+    for (int i = 0; i < 5; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(bench.network.count("GET", programRoute), static_cast<std::size_t>(1));
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(bench.network.count("GET", programRoute), static_cast<std::size_t>(2));
 }
 
 TEST(NothingIsFetchedRegisteredOrHandedOutWhileTheCoordinatorDoesNotAnswer) {
@@ -761,7 +894,9 @@ TEST(AnOutageAtAPlaylistTransitionActivatesTheMappedCueExactlyOnceOnTheIntendedN
     const showmesh::json::Value file = parseJson(readFile(bench.stateDir() + "/" + kFallbackStatusFilename));
     CHECK_EQ(member(file, "mode"), std::string("fallback"));
     CHECK_EQ(member(file, "message"), std::string(kFallbackActiveMessage));
-    CHECK_EQ(member(child(file, "recent").items().back(), "outcome"), std::string("authorized"));
+    const showmesh::json::Value& lastRecord = child(file, "recentActivations").items().back();
+    CHECK_EQ(member(lastRecord, "outcome"), std::string("authorized"));
+    CHECK_EQ(member(lastRecord, "answeredBy"), std::string("node"));
 }
 
 TEST(ASingleFailedOrSlowProbeDoesNotEnterFallbackAtTheNextEntry) {
@@ -834,7 +969,7 @@ TEST(AnEntryTheProgramDoesNotMapSendsNothingAndRecordsWhy) {
     CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(0));
     const std::vector<FallbackRecord> records = bench.activationRecords();
     CHECK_EQ(records.size(), static_cast<std::size_t>(1));
-    CHECK_EQ(records[0].outcome, std::string("kUnknownEntry"));
+    CHECK_EQ(records[0].outcome, std::string(kOutcomeUnknownEntry));
     CHECK(!records[0].reason.empty());
     CHECK_EQ(records[0].entryKey, bench.entryKey(2));
     CHECK_EQ(bench.executor->status().activationsNotDelivered, static_cast<std::uint64_t>(1));
@@ -857,7 +992,7 @@ TEST(AMissingProgramSendsNothingAndRecordsWhy) {
     bench.callback("playing", 0);
 
     CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(0));
-    CHECK_EQ(bench.lastActivationRecord().outcome, std::string("kNoProgramInstalled"));
+    CHECK_EQ(bench.lastActivationRecord().outcome, std::string(kOutcomeNoProgram));
 }
 
 TEST(AnExpiredProgramSendsNothingAndRecordsWhy) {
@@ -868,7 +1003,7 @@ TEST(AnExpiredProgramSendsNothingAndRecordsWhy) {
     bench.callback("playing", 0);
 
     CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(0));
-    CHECK_EQ(bench.lastActivationRecord().outcome, std::string("kProgramExpired"));
+    CHECK_EQ(bench.lastActivationRecord().outcome, std::string(kOutcomeProgramExpired));
 }
 
 TEST(AProgramThatDoesNotCarryThisPlayersKeySendsNothingAndRecordsWhy) {
@@ -879,7 +1014,7 @@ TEST(AProgramThatDoesNotCarryThisPlayersKeySendsNothingAndRecordsWhy) {
     bench.loseCoordinator();
     bench.callback("playing", 0);
     CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(0));
-    CHECK_EQ(bench.lastActivationRecord().outcome, std::string(kOutcomeExecutorKeyNotInProgram));
+    CHECK_EQ(bench.lastActivationRecord().outcome, std::string(kOutcomePlayerKeyNotInProgram));
 
     ProgramSpec otherKey = twoEntryProgram(bench);
     otherKey.executorPublicKey = member(parseJson(fixture("keys.json")), "otherExecutorPublicKey");
@@ -887,7 +1022,7 @@ TEST(AProgramThatDoesNotCarryThisPlayersKeySendsNothingAndRecordsWhy) {
     bench.callback("query_next", 0);
     bench.callback("playing", 1);
     CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(0));
-    CHECK_EQ(bench.lastActivationRecord().outcome, std::string(kOutcomeExecutorKeyNotInProgram));
+    CHECK_EQ(bench.lastActivationRecord().outcome, std::string(kOutcomePlayerKeyNotInProgram));
 }
 
 TEST(AnUnpairedPlayerWithNoKeySendsNothingAndRecordsWhy) {
@@ -897,7 +1032,7 @@ TEST(AnUnpairedPlayerWithNoKeySendsNothingAndRecordsWhy) {
     bench.callback("playing", 0);
 
     CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(0));
-    CHECK_EQ(bench.lastActivationRecord().outcome, std::string(kOutcomeNoExecutorKey));
+    CHECK_EQ(bench.lastActivationRecord().outcome, std::string(kOutcomeNoPlayerKey));
 }
 
 TEST(ATargetWithNoAddressGetsNothingAndIsRecordedWhileItsSiblingIsActivated) {
@@ -968,15 +1103,193 @@ TEST(OnceEnteredFallbackLastsUntilThePlaylistStopsEvenIfTheCoordinatorAnswersAga
     CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(2));
 }
 
-TEST(AnOperatorNoticeNamesTheFactThenTheActionWithNoInternalsVocabulary) {
-    for (const std::string& message : {std::string(kCoordinatorLostMessage), std::string(kFallbackActiveMessage)}) {
-        CHECK(message.rfind("The coordinator", 0) == 0);
-        CHECK(message.find("Check the coordinator.") != std::string::npos);
-        for (const char* word : {"fallback", "interlock", "revision", "epoch", "evidence", "boundary", "armed", "ADR",
-                                 "executor", "program"}) {
-            CHECK(message.find(word) == std::string::npos);
+// --- the notice says what is true -------------------------------------------
+
+namespace {
+
+bool isOperatorCopy(const std::string& message) {
+    bool ok = message.rfind("The coordinator", 0) == 0 && message.back() == '.';
+    for (const char* word : {"fallback", "interlock", "revision", "epoch", "evidence", "boundary", "armed", "ADR",
+                             "executor", "program", "(", "kProgram", "kNo"}) {
+        ok = ok && message.find(word) == std::string::npos;
+    }
+    // One or two sentences.
+    std::size_t sentences = 0;
+    for (std::size_t i = 0; i < message.size(); ++i) {
+        if (message[i] == '.' && (i + 1 == message.size() || message[i + 1] == ' ')) ++sentences;
+    }
+    return ok && sentences >= 1 && sentences <= 2;
+}
+
+}  // namespace
+
+TEST(EveryNoticeIsOperatorCopy) {
+    CHECK(FallbackNotice(FallbackMode::kNormal, false, "", BoundaryResult::kNone).empty());
+    for (FallbackMode mode : {FallbackMode::kNormal, FallbackMode::kFallback}) {
+        for (BoundaryResult result : {BoundaryResult::kNone, BoundaryResult::kStarted, BoundaryResult::kNothingToStart,
+                                      BoundaryResult::kStartedOnSomeNodes, BoundaryResult::kNotStarted}) {
+            CHECK(isOperatorCopy(FallbackNotice(mode, true, "", result)));
+            for (const PlayerOutcomeCopy& copy : kPlayerOutcomeCopy) {
+                CHECK(isOperatorCopy(FallbackNotice(mode, true, copy.word, result)));
+            }
         }
     }
+}
+
+TEST(EveryReasonThisPlayerRecordsIsAWholeSentenceWithAnAction) {
+    for (const PlayerOutcomeCopy& copy : kPlayerOutcomeCopy) {
+        const std::string reason = copy.reason;
+        CHECK(reason[0] >= 'A' && reason[0] <= 'Z');
+        CHECK(reason.back() == '.');
+        CHECK(reason.find(". ") != std::string::npos);
+        // The word has the shape of a node's word.
+        for (char c : std::string(copy.word)) CHECK((c >= 'a' && c <= 'z') || c == '-');
+    }
+}
+
+TEST(HealthyFallbackSaysThisPlayerIsStartingThePlannedCues) {
+    Bench bench;
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    bench.loseCoordinator();
+    CHECK_EQ(bench.executor->notice(), std::string(kCoordinatorLostMessage));
+    bench.callback("playing", 0);
+    CHECK_EQ(bench.executor->notice(), std::string(kFallbackActiveMessage));
+    CHECK_EQ(bench.statusMessage(), std::string(kFallbackActiveMessage));
+
+    // An entry the plan maps to no cue is ordinary and does not change the notice.
+    bench.callback("query_next", 0);
+    bench.callback("playing", 2);
+    CHECK_EQ(bench.executor->notice(), std::string(kFallbackActiveMessage));
+}
+
+TEST(AnOutageThatOutlastsThePlanStopsSayingCuesAreBeingStarted) {
+    Bench bench;
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    bench.loseCoordinator();
+    bench.callback("playing", 0);
+    CHECK_EQ(bench.executor->notice(), std::string(kFallbackActiveMessage));
+
+    // The plan runs out in the middle of entry 0. The next probe already says so.
+    gClock = kCompiledAtMillis + 15 * 60 * 1000;
+    bench.tick();
+    const std::string expired = std::string(kNotStartingPrefix) +
+                                "its plan for running the show without the coordinator has run out" +
+                                kRestoreCoordinatorAction;
+    CHECK_EQ(bench.executor->notice(), expired);
+    CHECK_EQ(bench.statusMessage(), expired);
+    CHECK_EQ(bench.notifier.cleared.back(), std::string(kFallbackActiveMessage));
+    CHECK_EQ(bench.notifier.raised.back(), expired);
+
+    bench.callback("query_next", 0);
+    bench.callback("playing", 1);
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.executor->notice(), expired);
+    const FallbackRecord record = bench.lastActivationRecord();
+    CHECK_EQ(record.outcome, std::string(kOutcomeProgramExpired));
+    CHECK(!record.nodeAnswered);
+    CHECK_EQ(record.reason, std::string("This player's plan for running the show without the coordinator has run "
+                                        "out. Restore the coordinator to start the planned cues again."));
+}
+
+TEST(APlanWithoutThisPlayersKeyNeverSaysCuesWillBeOrAreBeingStarted) {
+    Bench bench;
+    ProgramSpec noKey = twoEntryProgram(bench);
+    noKey.executorPublicKey.clear();
+    bench.writeFile(bench.installPath(), signedProgram(noKey));
+    bench.loseCoordinator();
+    const std::string clause = "its plan does not carry this player's key";
+    CHECK_EQ(bench.executor->notice(), std::string(kCannotStartPrefix) + clause + kRestoreCoordinatorAction);
+
+    bench.callback("playing", 0);
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(0));
+    CHECK_EQ(bench.executor->notice(), std::string(kNotStartingPrefix) + clause + kRestoreCoordinatorAction);
+    CHECK_EQ(bench.statusMessage(), bench.executor->notice());
+    for (const std::string& raised : bench.notifier.raised) {
+        CHECK(raised.find("will start") == std::string::npos);
+        CHECK(raised.find("is starting") == std::string::npos);
+    }
+}
+
+TEST(OnConfirmedLossAPlayerThatHoldsNothingToSendSaysItCannotStartThePlannedCues) {
+    {
+        Bench noPinnedKey;
+        noPinnedKey.pinnedKey = PinnedKeyLoadResult();
+        noPinnedKey.makeExecutor();
+        noPinnedKey.writeFile(noPinnedKey.installPath(), signedProgram(twoEntryProgram(noPinnedKey)));
+        noPinnedKey.loseCoordinator();
+        CHECK_EQ(noPinnedKey.executor->notice(), std::string(kCannotStartPrefix) +
+                                                     "it has no coordinator key to check a plan with" +
+                                                     kRestoreCoordinatorAction);
+    }
+    {
+        Bench noProgram;
+        noProgram.loseCoordinator();
+        CHECK_EQ(noProgram.executor->notice(), std::string(kCannotStartPrefix) +
+                                                   "it holds no plan for running the show without the coordinator" +
+                                                   kRestoreCoordinatorAction);
+        CHECK_EQ(noProgram.statusMessage(), noProgram.executor->notice());
+    }
+    {
+        Bench noPlayerKey(/*paired=*/false);
+        noPlayerKey.writeFile(noPlayerKey.installPath(), signedProgram(twoEntryProgram(noPlayerKey)));
+        noPlayerKey.loseCoordinator();
+        CHECK_EQ(noPlayerKey.executor->notice(), std::string(kCannotStartPrefix) +
+                                                     "it has no key of its own for the nodes" +
+                                                     kRestoreCoordinatorAction);
+        for (const std::string& raised : noPlayerKey.notifier.raised) {
+            CHECK(raised.find("will start") == std::string::npos);
+        }
+    }
+}
+
+TEST(ABoundaryNoNodeAcceptedSaysSoAndTheNextOneThatStartsRestoresTheNotice) {
+    Bench bench;
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    bench.network.scriptActivation(kNodeA, nodeAnswer(403, "cue-not-authorized"));
+    bench.loseCoordinator();
+    bench.callback("playing", 0);
+    CHECK_EQ(bench.executor->notice(), std::string(kNotStartingPrefix) + "no node started the last planned cue" +
+                                           kRestoreCoordinatorAction);
+
+    bench.callback("query_next", 0);
+    bench.callback("playing", 1);
+    CHECK_EQ(bench.executor->notice(), std::string(kFallbackActiveMessage));
+}
+
+TEST(ACueStartedOnOnlySomeNodesSaysSo) {
+    Bench bench;
+    ProgramSpec spec;
+    spec.entries = {{bench.entryKey(0), "cue-a", 3, {{"node-a", kNodeA}, {"node-b", kNodeB}}}};
+    bench.writeFile(bench.installPath(), signedProgram(spec));
+    bench.network.nodesDown.insert(kNodeB);
+    bench.loseCoordinator();
+    bench.callback("playing", 0);
+    CHECK_EQ(bench.executor->notice(), std::string(kStartedOnSomeNodesMessage));
+    CHECK_EQ(bench.statusMessage(), std::string(kStartedOnSomeNodesMessage));
+}
+
+TEST(ActivationRecordsAreNotPushedOutByProgramHandOffs) {
+    Bench bench;
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    bench.loseCoordinator();
+    bench.callback("playing", 0);
+    bench.callback("playing", 0, std::nullopt, "");
+
+    // The coordinator returns and publishes a changed program every minute for two hours.
+    bench.network.coordinatorUp = true;
+    for (int minute = 0; minute < 120; ++minute) {
+        ProgramSpec changed = twoEntryProgram(bench);
+        changed.revision = "rev-" + std::to_string(minute);
+        changed.expiresAt = "2026-10-05T23:00:00Z";
+        bench.network.programEnvelope = getEnvelope(signedProgram(changed));
+        for (int i = 0; i < 12; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    }
+    const FallbackStatusSnapshot status = bench.executor->status();
+    CHECK_EQ(status.recentProgramHandOffs.size(), kRecentProgramHandOffRecords);
+    CHECK_EQ(status.recentActivations.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(status.recentActivations[0].outcome, std::string("authorized"));
+    const showmesh::json::Value file = parseJson(readFile(bench.stateDir() + "/" + kFallbackStatusFilename));
+    CHECK_EQ(child(file, "recentActivations").items().size(), static_cast<std::size_t>(1));
 }
 
 // --- the section 5.8 table, case by case ------------------------------------
@@ -1018,7 +1331,9 @@ TEST(Table_NoResponseIsRetriedWithTheSameBodyAtMostThreeAttemptsAtLeast250MsApar
 
     CHECK_EQ(run.result.attempts, 3);
     CHECK_EQ(run.result.outcome, std::string(kOutcomeNoResponse));
-    CHECK_EQ(run.result.reason, std::string("connection refused"));
+    CHECK_EQ(run.result.reason, std::string("The node did not answer: connection refused. Check the node and the "
+                                            "network between it and this player."));
+    CHECK(!run.result.nodeAnswered());
     CHECK(!run.result.activated());
     const std::vector<Sent> posts = run.posts();
     CHECK_EQ(posts.size(), static_cast<std::size_t>(3));
@@ -1126,7 +1441,7 @@ TEST(Table_AnythingElseIsFinalAfterOneAttemptAndNothingIsSentInItsPlace) {
          {"malformed-request", "too-large", "wrong-target", "program-expired", "executor-not-enrolled",
           "signature-invalid", "unknown-entry", "cue-not-authorized", "stale-generation", "stale-catalog",
           "cross-show", "unknown-generation", "unknown-cue", "stale-cue", "asset-missing", "weather-delay-active",
-          "apply-failed", "a-word-this-build-has-never-seen"}) {
+          "apply-failed", "cue-check-failed", "a-word-this-build-has-never-seen"}) {
         TableRun run;
         run.network.scriptActivation(kNodeA, nodeAnswer(409, word));
         run.deliver();
@@ -1178,6 +1493,57 @@ TEST(TheRuntimeStartsAndStopsTheExecutorsOwnThreadAndStopDoesNotWaitOutAProbeInt
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
     CHECK(elapsed < 1000);
     CHECK_EQ(bench.sink.published.size(), static_cast<std::size_t>(3));
+}
+
+TEST(StopIsHonoredBetweenEveryStepWhenTheCoordinatorAnswersTheProbeAndThenStalls) {
+    Bench bench;
+    bench.network.programEnvelope = getEnvelope(fixture("program.json"));
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool stalled = false;
+    bool released = false;
+    bench.network.beforeAnswer = [&](const std::string& method, const std::string& url) {
+        if (method != "PUT" || url.find("/executor-key") == std::string::npos) return;
+        std::unique_lock<std::mutex> lock(mutex);
+        stalled = true;
+        changed.notify_all();
+        changed.wait_for(lock, std::chrono::seconds(5), [&] { return released; });
+    };
+
+    bench.executor->start();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        CHECK(changed.wait_for(lock, std::chrono::seconds(5), [&] { return stalled; }));
+    }
+    // Stop is asked for while the registration is stalled. When it returns,
+    // the tick ends there: no fetch, no acknowledge, no hand-out.
+    bench.executor->requestStop();
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+    }
+    changed.notify_all();
+    bench.executor->stop();
+
+    CHECK_EQ(bench.network.count("GET", "/healthz"), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.network.count("PUT", "/executor-key"), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.network.count("GET", "/api/v1/fallback-programs/"), static_cast<std::size_t>(0));
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(0));
+    CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(0));
+}
+
+TEST(StopDuringTheProgramFetchSkipsTheAcknowledgeAndTheHandOuts) {
+    Bench bench;
+    bench.network.programEnvelope = getEnvelope(fixture("program.json"));
+    bench.network.beforeAnswer = [&](const std::string& method, const std::string& url) {
+        const bool programFetch = method == "GET" && url.find("/api/v1/fallback-programs/") != std::string::npos;
+        if (programFetch) bench.executor->requestStop();
+    };
+    bench.tick();
+
+    CHECK_EQ(bench.network.count("GET", "/api/v1/fallback-programs/"), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(0));
+    CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(0));
 }
 
 TEST(BothShippingAdaptersConstructTheDeliveryAndHandItsRecorderToTheRuntime) {

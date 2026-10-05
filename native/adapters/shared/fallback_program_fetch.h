@@ -88,6 +88,9 @@ enum class FallbackFetchOutcomeKind {
     // The only success outcome: verified, matches this host, not
     // expired, and durably installed.
     kInstalled,
+    // Verified, current, and byte for byte the document already installed.
+    // Nothing was written and there is nothing new to acknowledge.
+    kUnchanged,
 };
 
 // The enum value's own spelling, the identical "grep the name, find the
@@ -113,6 +116,8 @@ inline const char* FallbackFetchOutcomeKindName(FallbackFetchOutcomeKind kind) {
             return "kExpired";
         case FallbackFetchOutcomeKind::kInstalled:
             return "kInstalled";
+        case FallbackFetchOutcomeKind::kUnchanged:
+            return "kUnchanged";
     }
     return "kUnknown";
 }
@@ -167,6 +172,7 @@ inline bool ShouldAcknowledgeFallbackFetchOutcome(const FallbackFetchOutcome& ou
         case FallbackFetchOutcomeKind::kUnexpectedStatus:
         case FallbackFetchOutcomeKind::kNotPublished:
         case FallbackFetchOutcomeKind::kMalformedEnvelope:
+        case FallbackFetchOutcomeKind::kUnchanged:
             return false;
     }
     return false;
@@ -487,7 +493,8 @@ inline FallbackFetchOutcome FetchAndInstallFallbackProgram(HttpTransport* transp
                                                             const std::string& baseUrl,
                                                             const std::string& expectedFppInstanceUuid,
                                                             const std::vector<uint8_t>& coordinatorPublicKey,
-                                                            const std::string& installPath, Clock clock) {
+                                                            const std::string& installPath, Clock clock,
+                                                            const std::string* installedDocument = nullptr) {
     FallbackFetchOutcome outcome;
 
     std::string token;
@@ -617,6 +624,15 @@ inline FallbackFetchOutcome FetchAndInstallFallbackProgram(HttpTransport* transp
         outcome.kind = FallbackFetchOutcomeKind::kExpired;
         outcome.detail = expiryParsed ? "fallback: program's expiresAt has already passed"
                                        : "fallback: program's expiresAt could not be parsed";
+        outcome.packageId = verified.program->packageId();
+        outcome.revision = verified.program->revision();
+        return outcome;
+    }
+
+    // installedDocument, when given, is the exact bytes already installed.
+    if (installedDocument != nullptr && *installedDocument == reconstructedDocument) {
+        outcome.kind = FallbackFetchOutcomeKind::kUnchanged;
+        outcome.detail = "fallback: the published program is the one already installed";
         outcome.packageId = verified.program->packageId();
         outcome.revision = verified.program->revision();
         return outcome;
