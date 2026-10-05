@@ -1,0 +1,8 @@
+{
+  "description": "RFC 8032 section 7.1 test vectors. The coordinator's seed is test 3 and is not needed by a consumer.",
+  "coordinatorPublicKey": "/FHNjmIYoaONpH7QAjDwWAgW7RO6MwOsXeuRFUiQgCU=",
+  "executorSeedHex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "executorPublicKey": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+  "otherExecutorSeedHex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+  "otherExecutorPublicKey": "PUAXw+hDiVqStwqnTRt+vJyYLM8uxJaMwM1V8Sr0Zgw="
+}

@@ -5,8 +5,8 @@
 // the LOCAL half only: given a deterministic entry key
 // (showmesh::deriveEntryKey) and the program on disk, it produces
 // exactly one of a match, or a refusal with a stated reason. It never
-// sends anything anywhere (decision 3's node ingress does not exist yet
-// in any repository this one can build against) and it never
+// sends anything anywhere (fallback_node_delivery.h does that, from a
+// match this file produced) and it never
 // substitutes a different Cue, a nearest match, or a default: a refusal
 // is always the answer when the program does not say, unambiguously,
 // exactly one thing for this key.
@@ -36,9 +36,8 @@
 // caller cannot express "a match with nothing to send it to" in code
 // that compiles, the identical structural guarantee
 // VerifiedFallbackProgram's private constructor gives slice one
-// (fallback_program_verifier.h): the only person who could otherwise
-// construct a hand-built ActivationMatch is the delivery layer this
-// file's own header comment says does not exist yet.
+// (fallback_program_verifier.h): the delivery layer cannot build a match
+// of its own and can only send what this resolver returned.
 
 #include <algorithm>
 #include <chrono>
@@ -174,15 +173,17 @@ struct ActivationTarget {
     std::string nodeId;
     std::optional<showmesh::json::Value> render;
     std::optional<showmesh::json::Value> audio;
+    // The node's inbound listener and its catalog revision, as the program
+    // states them. Absent when the program does not.
+    std::optional<std::string> address;
+    std::optional<std::string> catalogRevision;
 };
 
 // Everything a MATCH carries, restricted to fields copied verbatim from
-// the verified program plus the input entryKey echoed back. See the
-// header comment in adapters/shared/fallback_program_fetch.h and this
-// file's own top-level comment for what ADR-048 decision 3's delivery
-// path additionally needs that this type cannot supply (execution id,
-// the per-host executor credential): this type is not that payload, it
-// is the local half feeding one.
+// the verified program plus the input entryKey echoed back. The
+// execution id and the executor signature are added by
+// fallback_node_delivery.h: this type is not that payload, it is the
+// local half feeding one.
 //
 // NO PUBLIC CONSTRUCTOR IS THE POINT, NOT AN IMPLEMENTATION DETAIL. See
 // this file's top comment. Widening this class (a public constructor, a
@@ -201,6 +202,11 @@ class ActivationMatch {
     std::int64_t cueRevision() const { return cueRevision_; }
     const std::optional<std::int64_t>& generation() const { return generation_; }
     const std::vector<ActivationTarget>& targets() const { return targets_; }
+    // The program copy this match was read from: its expiry as written, the
+    // executor key it enrolls (empty when none), and its exact signed bytes.
+    const std::string& programExpiresAt() const { return programExpiresAt_; }
+    const std::string& executorPublicKey() const { return executorPublicKey_; }
+    const std::string& signedDocument() const { return signedDocument_; }
 
  private:
     friend ActivationResolution ResolveActivationFromDocument(const std::string&, const std::string&,
@@ -209,7 +215,8 @@ class ActivationMatch {
 
     ActivationMatch(std::string packageId, std::string revision, std::string fppInstanceUuid, std::string entryKey,
                      std::string cueId, std::int64_t cueRevision, std::optional<std::int64_t> generation,
-                     std::vector<ActivationTarget> targets)
+                     std::vector<ActivationTarget> targets, std::string programExpiresAt,
+                     std::string executorPublicKey, std::string signedDocument)
         : packageId_(std::move(packageId)),
           revision_(std::move(revision)),
           fppInstanceUuid_(std::move(fppInstanceUuid)),
@@ -217,7 +224,10 @@ class ActivationMatch {
           cueId_(std::move(cueId)),
           cueRevision_(cueRevision),
           generation_(std::move(generation)),
-          targets_(std::move(targets)) {}
+          targets_(std::move(targets)),
+          programExpiresAt_(std::move(programExpiresAt)),
+          executorPublicKey_(std::move(executorPublicKey)),
+          signedDocument_(std::move(signedDocument)) {}
 
     std::string packageId_;
     std::string revision_;
@@ -227,6 +237,9 @@ class ActivationMatch {
     std::int64_t cueRevision_ = 0;
     std::optional<std::int64_t> generation_;
     std::vector<ActivationTarget> targets_;
+    std::string programExpiresAt_;
+    std::string executorPublicKey_;
+    std::string signedDocument_;
 };
 
 struct ActivationResolution {
@@ -375,6 +388,10 @@ inline ActivationResolution ResolveActivationFromDocument(const std::string& ent
         return result;
     }
 
+    const showmesh::json::Value* catalogRevisionsValue = detail::findEntryMember(*programValue, "catalogRevisions");
+    const bool haveCatalogRevisions =
+        catalogRevisionsValue != nullptr && catalogRevisionsValue->type() == showmesh::json::Type::kObject;
+
     std::vector<ActivationTarget> targets;
     for (const showmesh::json::Value& targetValue : targetsValue->items()) {
         if (targetValue.type() != showmesh::json::Type::kObject) continue;
@@ -390,6 +407,16 @@ inline ActivationResolution ResolveActivationFromDocument(const std::string& ent
         const showmesh::json::Value* audioValue = detail::findEntryMember(targetValue, "audio");
         if (audioValue != nullptr && audioValue->type() != showmesh::json::Type::kNull) {
             target.audio = *audioValue;
+        }
+        const showmesh::json::Value* addressValue = detail::findEntryMember(targetValue, "address");
+        if (addressValue != nullptr && addressValue->type() == showmesh::json::Type::kString &&
+            !addressValue->string().empty()) {
+            target.address = addressValue->string();
+        }
+        const showmesh::json::Value* catalogRevisionValue =
+            haveCatalogRevisions ? detail::findEntryMember(*catalogRevisionsValue, target.nodeId.c_str()) : nullptr;
+        if (catalogRevisionValue != nullptr && catalogRevisionValue->type() == showmesh::json::Type::kString) {
+            target.catalogRevision = catalogRevisionValue->string();
         }
         targets.push_back(std::move(target));
     }
@@ -420,11 +447,18 @@ inline ActivationResolution ResolveActivationFromDocument(const std::string& ent
         generation = static_cast<std::int64_t>(generationValue->number());
     }
 
+    const showmesh::json::Value* executorPublicKeyValue = detail::findEntryMember(*programValue, "executorPublicKey");
+
     result.kind = ActivationResolveKind::kMatch;
     result.match = ActivationMatch(verified.program->packageId(), verified.program->revision(),
                                     verified.program->fppInstanceUuid(), entryKey, cueIdValue->string(),
                                     static_cast<std::int64_t>(cueRevisionValue->number()), generation,
-                                    std::move(targets));
+                                    std::move(targets), verified.program->expiresAt(),
+                                    executorPublicKeyValue != nullptr &&
+                                            executorPublicKeyValue->type() == showmesh::json::Type::kString
+                                        ? executorPublicKeyValue->string()
+                                        : std::string(),
+                                    verified.program->rawDocument());
     return result;
 }
 

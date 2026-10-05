@@ -80,6 +80,7 @@ class ThreadNotingTransport : public HttpTransport {
     // callback-to-post handoff; shares post()'s behavior so the
     // interface's second verb has a stated behavior rather than none.
     HttpResponse get(const HttpRequest& request) override { return post(request); }
+    HttpResponse put(const HttpRequest& request) override { return post(request); }
 
     std::vector<std::string> bodies() const {
         std::lock_guard<std::mutex> guard(mutex_);

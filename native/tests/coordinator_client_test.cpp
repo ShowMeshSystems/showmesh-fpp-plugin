@@ -64,6 +64,7 @@ class FakeTransport : public HttpTransport {
     // CoordinatorClient's post paths; shares post()'s script so the
     // interface's second verb has a stated behavior rather than none.
     HttpResponse get(const HttpRequest& request) override { return post(request); }
+    HttpResponse put(const HttpRequest& request) override { return post(request); }
 
     static HttpResponse ok(int statusCode = 200) {
         HttpResponse r;

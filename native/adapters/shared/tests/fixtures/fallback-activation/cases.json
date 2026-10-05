@@ -1,0 +1,305 @@
+{
+  "description": "Fallback activation cases for contract section 5. Each case states what the node holds and its clock, one request body, and the answer.",
+  "nodeId": "node-a",
+  "nodeCatalog": {
+    "show": "halloween",
+    "generation": 7,
+    "catalogRevision": "cat-rev-1",
+    "cues": [
+      {
+        "cueId": "cue-a",
+        "cueRevision": 3
+      },
+      {
+        "cueId": "cue-b",
+        "cueRevision": 5
+      }
+    ]
+  },
+  "validRequest": {
+    "canonical": "{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-000000000001\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1}",
+    "signature": "uG/c7d8e4hIGjBSOqStgSO/5nO6GHrMPkaMtfrdAgiP14dr2V+phicY4MePjOyrN49lkkyM/sVy9/V3YkaVvAA=="
+  },
+  "activations": [
+    {
+      "name": "valid",
+      "description": "A request for a listed entry, Cue and target, signed by the enrolled executor.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-000000000001\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"uG/c7d8e4hIGjBSOqStgSO/5nO6GHrMPkaMtfrdAgiP14dr2V+phicY4MePjOyrN49lkkyM/sVy9/V3YkaVvAA==\"}",
+      "expectedStatus": 200,
+      "expectedOutcome": "authorized"
+    },
+    {
+      "name": "replayed-execution",
+      "description": "The valid request sent a second time.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-000000000001\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"uG/c7d8e4hIGjBSOqStgSO/5nO6GHrMPkaMtfrdAgiP14dr2V+phicY4MePjOyrN49lkkyM/sVy9/V3YkaVvAA==\"}",
+      "repeatBody": true,
+      "expectedStatus": 409,
+      "expectedOutcome": "replayed-execution"
+    },
+    {
+      "name": "invalid-signature",
+      "description": "A well formed request signed by a different key.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-000000000002\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"MYAjPFVI6CiOoyqysODYTFlekEwwEmyNtf65gH/fxvhjCPMpHMGRBaflk9mWa0sg1fDqld5mZAvcEr8xzhIWDA==\"}",
+      "expectedStatus": 403,
+      "expectedOutcome": "signature-invalid"
+    },
+    {
+      "name": "tampered-after-signing",
+      "description": "A signed request whose Cue was changed afterwards.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-b\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-000000000003\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"xA79lgEMOb//WMWoBKirL5Is31lqjDyqd8b1zo/2BHuKSDDqMduvFVS+2JNJEUT03JElsA1uZqU8bq/CxoPjDA==\"}",
+      "expectedStatus": 403,
+      "expectedOutcome": "signature-invalid"
+    },
+    {
+      "name": "arbitrary-member",
+      "description": "A correctly signed request that carries a member this route does not accept.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"action\":\"blackout\",\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-000000000004\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"9sBD3pf0P4WkOsXasoNZc78XKH5zlTnHCHo2hz7UQrCwzraw6hjyOJVd+FTCyM5GAH/7HGU25iiH95eoapTmAQ==\"}",
+      "expectedStatus": 400,
+      "expectedOutcome": "malformed-request"
+    },
+    {
+      "name": "wrong-fpp-host-with-program",
+      "description": "This executor names another FPP player whose program the node also holds.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-000000000005\",\"fppInstanceUuid\":\"33333333-3333-4333-8333-333333333333\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"+E1p9xEZI4r/u1jXGoDzPgHf9ycSsszxvkF6kDHHLezbwEzmX+G70/j95/qSwH7I8fAeldh6owotNQRiRt99Dw==\"}",
+      "expectedStatus": 403,
+      "expectedOutcome": "signature-invalid"
+    },
+    {
+      "name": "wrong-fpp-host-no-program",
+      "description": "This executor names an FPP player the node holds no program for.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-000000000006\",\"fppInstanceUuid\":\"44444444-4444-4444-8444-444444444444\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"piKQ/I9NLr1HqQnSsFCCI7n2qS+4E70kvrqS1EYqo3uwWJzpqGEF7tG2fe5aV+PQkEDEvXJPS7zWAaI7EPwwDg==\"}",
+      "expectedStatus": 409,
+      "expectedOutcome": "program-not-installed"
+    },
+    {
+      "name": "wrong-target",
+      "description": "A request addressed to another node.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-000000000007\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-b\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"q8QX33Ooepug1pUg+eZv7sofBxjnV2J1QqhbLDxWw/aNOvQ+GyenLuFnIQCnO1wArwjmyHTT4jX2tsnNfnknCA==\"}",
+      "expectedStatus": 403,
+      "expectedOutcome": "wrong-target"
+    },
+    {
+      "name": "entry-not-for-this-node",
+      "description": "A listed entry whose targets do not include this node.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-b\",\"cueRevision\":5,\"entryKey\":\"entry-1\",\"executionId\":\"00000000-0000-4000-8000-000000000008\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"0+fS0tgkxlWCX3F3hXIXu7IrqebENrOCPQik1v2z1aeBRhzf7a12Tkczs78pofynI50sU7BSD1yLqbZq4QQ9Bw==\"}",
+      "expectedStatus": 403,
+      "expectedOutcome": "wrong-target"
+    },
+    {
+      "name": "stale-generation",
+      "description": "A request for an earlier activation of the show.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-000000000009\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":6,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"hcfFtsFvf78QfjG2j9Xu6+GgkYgMLYziOEqby7yihWuf17Z8C3IBd95KgJkI2a6xFGq+9vnwRWLST6j09YJeBA==\"}",
+      "expectedStatus": 409,
+      "expectedOutcome": "stale-generation"
+    },
+    {
+      "name": "stale-catalog",
+      "description": "A request for a different Cue catalog than the program names for this node.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-0\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-00000000000a\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"QDUCrQNxtb6wFwW7lInFPZlXg/0r4ElIq77QTpuI0F+pcBlox+57CfP00nYRSSztkbr3Lp9G2FLHrZQWSYeZCA==\"}",
+      "expectedStatus": 409,
+      "expectedOutcome": "stale-catalog"
+    },
+    {
+      "name": "unknown-entry",
+      "description": "A request for an entry the program does not list.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-9\",\"executionId\":\"00000000-0000-4000-8000-00000000000b\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"TDOPXptpv6RXkwekFrpWlAEKCk9r5/1llV989hcNXvmPDi0c0SJpzjFn6M75ei+BkgLcaNA7HdLc2PwW+OwZBg==\"}",
+      "expectedStatus": 409,
+      "expectedOutcome": "unknown-entry"
+    },
+    {
+      "name": "arbitrary-cue",
+      "description": "A listed entry with a Cue the program does not map it to.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-b\",\"cueRevision\":5,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-00000000000c\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"OOuTUZmhypmRTrzP6KizNvDO2l8rF7reiGv1f9WyYUpocvcyQ0fCiT+BIroj77arwVIHr/xQsP4QUUpGAo3aCw==\"}",
+      "expectedStatus": 403,
+      "expectedOutcome": "cue-not-authorized"
+    },
+    {
+      "name": "wrong-cue-revision",
+      "description": "A listed entry and Cue at a different Cue revision.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":2,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-00000000000d\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"l8NDwUyiqxBX/6DXh2r7unL2cAALeEz/33mHzQ7mBm4z7PulGj22kGtTC5Zu0CIXd4M1knWyB2mJHpkDMRi+CQ==\"}",
+      "expectedStatus": 403,
+      "expectedOutcome": "cue-not-authorized"
+    },
+    {
+      "name": "program-not-current",
+      "description": "A request made under a copy of the program the node does not hold.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-00000000000e\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-older\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"i2bIVt+1GQp7qL1Wpe6H+HRjHdRh5d9Dx2/bWk2P2UQvu7qdn/pBJBS1gLVgLrS9fU2s4Lxgnb1wxfWGMtBiAQ==\"}",
+      "expectedStatus": 409,
+      "expectedOutcome": "program-not-current"
+    },
+    {
+      "name": "expired-program",
+      "description": "The valid request shape after the held program has expired.",
+      "installed": [
+        "program.json",
+        "program-other-host.json"
+      ],
+      "now": "2026-10-05T12:15:01Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-00000000000f\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-current\",\"packageRevision\":\"rev-current\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"j5MJQkP5adArT16GBRN0EA9ghman7MuTEn0WrOb5nPn2F+A3n9eDQDxbyj8qPET/fBtCQjJx/DD8SM8jwheIAw==\"}",
+      "expectedStatus": 409,
+      "expectedOutcome": "program-expired"
+    },
+    {
+      "name": "executor-not-enrolled",
+      "description": "The held program carries no executor key.",
+      "installed": [
+        "program-no-executor-key.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "body": "{\"request\":{\"catalogRevision\":\"cat-rev-1\",\"cueId\":\"cue-a\",\"cueRevision\":3,\"entryKey\":\"entry-0\",\"executionId\":\"00000000-0000-4000-8000-000000000010\",\"fppInstanceUuid\":\"22222222-2222-4222-8222-222222222222\",\"generation\":7,\"nodeId\":\"node-a\",\"packageId\":\"pkg-no-key\",\"packageRevision\":\"rev-no-key\",\"programExpiresAt\":\"2026-10-05T12:15:00Z\",\"schemaVersion\":1},\"signature\":\"kgtZp+zZMVg641YVTGAMLEN12FA1gf8+6QvJ2172se8xVKL2lGxim04kYugjuBt+ElCp7m4nOishqtSuwQOIDQ==\"}",
+      "expectedStatus": 403,
+      "expectedOutcome": "executor-not-enrolled"
+    }
+  ],
+  "programs": [
+    {
+      "name": "valid",
+      "description": "A program signed by the coordinator for this FPP player that names this node.",
+      "installed": null,
+      "now": "2026-10-05T12:05:00Z",
+      "pathFppInstanceUuid": "22222222-2222-4222-8222-222222222222",
+      "document": "program.json",
+      "expectedStatus": 200,
+      "expectedOutcome": "installed"
+    },
+    {
+      "name": "wrong-signer",
+      "description": "The same program signed by a key that is not the coordinator's.",
+      "installed": null,
+      "now": "2026-10-05T12:05:00Z",
+      "pathFppInstanceUuid": "22222222-2222-4222-8222-222222222222",
+      "document": "program-wrong-signer.json",
+      "expectedStatus": 403,
+      "expectedOutcome": "program-signature-invalid"
+    },
+    {
+      "name": "wrong-fpp-host",
+      "description": "A valid program delivered under another FPP player's path.",
+      "installed": null,
+      "now": "2026-10-05T12:05:00Z",
+      "pathFppInstanceUuid": "33333333-3333-4333-8333-333333333333",
+      "document": "program.json",
+      "expectedStatus": 403,
+      "expectedOutcome": "wrong-fpp-host"
+    },
+    {
+      "name": "not-targeted",
+      "description": "A valid program that does not name this node.",
+      "installed": null,
+      "now": "2026-10-05T12:05:00Z",
+      "pathFppInstanceUuid": "22222222-2222-4222-8222-222222222222",
+      "document": "program-not-targeted.json",
+      "expectedStatus": 403,
+      "expectedOutcome": "wrong-target"
+    },
+    {
+      "name": "expired",
+      "description": "A valid program delivered after its expiry.",
+      "installed": null,
+      "now": "2026-10-05T12:15:01Z",
+      "pathFppInstanceUuid": "22222222-2222-4222-8222-222222222222",
+      "document": "program.json",
+      "expectedStatus": 409,
+      "expectedOutcome": "program-expired"
+    },
+    {
+      "name": "superseded",
+      "description": "An older copy delivered after a newer one is held.",
+      "installed": [
+        "program.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "pathFppInstanceUuid": "22222222-2222-4222-8222-222222222222",
+      "document": "program-older.json",
+      "expectedStatus": 409,
+      "expectedOutcome": "program-superseded"
+    },
+    {
+      "name": "same-copy-again",
+      "description": "The held copy delivered again.",
+      "installed": [
+        "program.json"
+      ],
+      "now": "2026-10-05T12:05:00Z",
+      "pathFppInstanceUuid": "22222222-2222-4222-8222-222222222222",
+      "document": "program.json",
+      "expectedStatus": 200,
+      "expectedOutcome": "installed"
+    }
+  ]
+}

@@ -130,18 +130,11 @@ define require_symbols
 endef
 
 # Unit tests for the adapter-shared headers that need nothing but jsoncpp
-# and libcrypto (section_names.h, callback_fields.h,
-# fallback_program_verifier.h, fallback_program_installer.h,
-# fallback_program_fetch.h), plus the host-neutral entry-key derivation
-# they feed. Deliberately does not need FPP_SRC: the shared headers under
-# test never pull in an FPP header, so this runs on a plain dev machine,
-# unlike fpp9/fpp10 above. coordinator_config.cpp is here for
-# joinUrlPath/CredentialSource, the identical credential and URL
-# resolution the observation path already uses (fallback_program_fetch.h
-# adds no second resolution path).
-TEST_CORE_SOURCES := $(CORE_DIR)/src/json.cpp $(CORE_DIR)/src/sha256.cpp $(CORE_DIR)/src/playlist_identity.cpp \
-                      $(CORE_DIR)/src/atomic_write.cpp $(CORE_DIR)/src/coordinator_config.cpp
-TEST_SOURCES       := shared/tests/adapter_shared_test.cpp $(CORE_DIR)/tests/main.cpp $(TEST_CORE_SOURCES)
+# and libcrypto, linked against the whole host-neutral core so the fallback
+# executor is driven through ShowMeshRuntime itself. Deliberately does not
+# need FPP_SRC or libcurl: the headers under test pull in neither.
+TEST_SOURCES       := shared/tests/adapter_shared_test.cpp shared/tests/fallback_executor_test.cpp \
+                      $(CORE_DIR)/tests/main.cpp $(CORE_SOURCES)
 TEST_OBJDIR        := $(BUILD)/test-obj
 TEST_OBJECTS       := $(addprefix $(TEST_OBJDIR)/,$(notdir $(TEST_SOURCES:.cpp=.o)))
 TEST_BINARY        := $(BUILD)/adapter_shared_tests
@@ -173,9 +166,20 @@ $(TEST_OBJDIR)/%.o: %.cpp
 
 $(TEST_BINARY): $(TEST_OBJECTS)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $^ $(JSONCPP_LIBS) $(OPENSSL_LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $^ $(JSONCPP_LIBS) $(OPENSSL_LIBS) -pthread -o $@
 
 -include $(TEST_OBJECTS:.o=.d)
+
+# Bench tool, not shipped: sends one node its program and one signed activation
+# with the plugin's own delivery code. See shared/tests/tools/.
+DRIVER_BINARY := $(BUILD)/fallback_delivery_driver
+
+.PHONY: fallback-delivery-driver
+fallback-delivery-driver: $(DRIVER_BINARY)
+
+$(DRIVER_BINARY): shared/tests/tools/fallback_delivery_driver.cpp $(CORE_SOURCES)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(CORE_DIR)/include -Ishared $(OPENSSL_INCLUDE) $^ $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $@
 
 .PHONY: clean
 clean:
