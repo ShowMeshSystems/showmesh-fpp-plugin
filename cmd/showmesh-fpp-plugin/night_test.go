@@ -154,10 +154,73 @@ func TestCmdNightUnconfirmedBodyIsNotAccepted(t *testing.T) {
 }
 
 func TestCmdNightRejectsCommandsOutsideTheSchedule(t *testing.T) {
-	for _, args := range [][]string{{"night"}, {"night", "end-session"}, {"night", "resume-show"}, {"night", "start-night", "extra"}} {
+	for _, args := range [][]string{{"night"}, {"night", "end-session"}, {"night", "resume-show"}, {"night", "start-night", "extra"}, {"night", "start-night", "extra", "--stop-playlists"}} {
 		var stdout, stderr bytes.Buffer
 		if code := run(args, &stdout, &stderr, time.Now); code != exitUsage {
 			t.Fatalf("%v: exit %d", args, code)
 		}
+	}
+}
+
+func nightRequestBodyFor(t *testing.T, args ...string) (body string, code int, stderr string) {
+	t.Helper()
+	srv := nightCoordinator(t, func(w http.ResponseWriter, r *http.Request) {
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(r.Body)
+		body = buf.String()
+		writeNightAccepted(w, r.PathValue("command"), "applied", "preparing")
+	})
+	stateDir := setupPlugin(t, srv, "tok")
+	var stdout, errOut bytes.Buffer
+	code = run(append([]string{"night", "--config-dir", stateDir}, args...), &stdout, &errOut, time.Now)
+	return body, code, errOut.String()
+}
+
+func TestCmdNightPrepareSiteBodyIsUnchangedWithoutStopPlaylists(t *testing.T) {
+	body, code, stderr := nightRequestBodyFor(t, "prepare-site")
+	if code != exitOK || body != "{}" {
+		t.Fatalf("exit %d body %q stderr %q, want exit 0 and the body {}", code, body, stderr)
+	}
+}
+
+func TestCmdNightPrepareSiteStopPlaylistsCarriesTheFlag(t *testing.T) {
+	for _, args := range [][]string{{"--stop-playlists", "prepare-site"}, {"prepare-site", "--stop-playlists"}} {
+		body, code, stderr := nightRequestBodyFor(t, args...)
+		if code != exitOK || body != `{"stopFppPlayback":true}` {
+			t.Fatalf("%v: exit %d body %q stderr %q", args, code, body, stderr)
+		}
+	}
+}
+
+func TestCmdNightStopPlaylistsIsRefusedOnEveryOtherCommand(t *testing.T) {
+	for _, command := range nightCommands {
+		if command == "prepare-site" {
+			continue
+		}
+		for _, args := range [][]string{{"--stop-playlists", command}, {command, "--stop-playlists"}} {
+			body, code, stderr := nightRequestBodyFor(t, args...)
+			if code != exitUsage || body != "" || !strings.Contains(stderr, "applies only to prepare-site") {
+				t.Fatalf("%v: exit %d body %q stderr %q, want a usage refusal and no request", args, code, body, stderr)
+			}
+		}
+	}
+}
+
+func TestCmdNightReportsTheStopResultFromTheCoordinator(t *testing.T) {
+	srv := nightCoordinator(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(nightCommandResponse{
+			Command: nightCommandResult{Command: "prepare-site", Outcome: "applied", Reason: "Stopped what FPP was playing on player-01."},
+			Session: nightSessionState{State: "preparing"},
+		})
+	})
+	stateDir := setupPlugin(t, srv, "tok")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"night", "--config-dir", stateDir, "prepare-site", "--stop-playlists"}, &stdout, &stderr, time.Now); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if rec := readNightStatus(t, stateDir); !strings.Contains(rec.Message, "Stopped what FPP was playing on player-01.") {
+		t.Fatalf("message %q does not carry the stop result", rec.Message)
 	}
 }

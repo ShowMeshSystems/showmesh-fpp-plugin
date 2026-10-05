@@ -89,7 +89,8 @@ Commands:
                   run-readiness, start-preshow, start-night,
                   request-final-show, fade-out-night,
                   power-down-presentation) and record the outcome
-                  locally in night-status.json
+                  locally in night-status.json; prepare-site takes
+                  --stop-playlists to also stop what FPP is playing
   status          print the local record of the most recent run attempt
   version         show this binary's version
   help            show this help
