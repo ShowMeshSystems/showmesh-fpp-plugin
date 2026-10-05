@@ -82,14 +82,23 @@ func writeNightStatus(configDir string, rec nightStatusRecord) error {
 	return writeJSONFile(nightStatusPath(configDir), rec)
 }
 
-// submitNightCommand POSTs an empty request body to
+// nightRequestBody is the empty object, or {"stopFppPlayback":true} when
+// stopPlaylists is set. Only prepare-site is ever sent the latter.
+func nightRequestBody(stopPlaylists bool) []byte {
+	if stopPlaylists {
+		return []byte(`{"stopFppPlayback":true}`)
+	}
+	return []byte("{}")
+}
+
+// submitNightCommand POSTs a request body (see nightRequestBody) to
 // <coordinatorURL>/api/v1/night/commands/<command> and classifies the outcome.
 // A 2xx is trusted only when the body names the command that was sent.
-func submitNightCommand(ctx context.Context, httpClient *http.Client, coordinatorURL *url.URL, token, command string) nightSubmitResult {
+func submitNightCommand(ctx context.Context, httpClient *http.Client, coordinatorURL *url.URL, token, command string, stopPlaylists bool) nightSubmitResult {
 	u := *coordinatorURL
 	u.Path = strings.TrimRight(u.Path, "/") + "/api/v1/night/commands/" + command
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(nightRequestBody(stopPlaylists)))
 	if err != nil {
 		return nightSubmitResult{Class: classUnreachable, TransportErr: fmt.Errorf("building request: %w", err)}
 	}
@@ -138,8 +147,10 @@ func cmdNight(args []string, stdout, stderr io.Writer, clock func() time.Time) i
 	fs.SetOutput(stderr)
 	var configDirFlag string
 	var timeout time.Duration
+	var stopPlaylists bool
 	fs.StringVar(&configDirFlag, "config-dir", "", "override this plugin's state directory; never the credential")
 	fs.DurationVar(&timeout, "timeout", defaultRunTimeout, "request timeout for the night command")
+	fs.BoolVar(&stopPlaylists, "stop-playlists", false, "prepare-site only: also stop whatever FPP is playing; from inside a playlist this stops that playlist too")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "usage: showmesh-fpp-plugin night <command> [flags]")
 		_, _ = fmt.Fprintf(stderr, "\nSend one night lifecycle command to the coordinator and record the outcome locally.\nCommands: %s\n", strings.Join(nightCommands, ", "))
@@ -149,11 +160,22 @@ func cmdNight(args []string, stdout, stderr io.Writer, clock func() time.Time) i
 		return flagParseExit(err)
 	}
 	positional := fs.Args()
+	if len(positional) > 1 {
+		// Flags may also follow the command: night prepare-site --stop-playlists.
+		if err := fs.Parse(positional[1:]); err != nil {
+			return flagParseExit(err)
+		}
+		positional = append(positional[:1], fs.Args()...)
+	}
 	if len(positional) != 1 || !isNightCommand(positional[0]) {
 		fs.Usage()
 		return exitUsage
 	}
 	command := positional[0]
+	if stopPlaylists && command != "prepare-site" {
+		_, _ = fmt.Fprintf(stderr, "showmesh-fpp-plugin night: --stop-playlists applies only to prepare-site, not %s.\n", command)
+		return exitUsage
+	}
 	configDir := resolveConfigDir(configDirFlag)
 	now := clock()
 
@@ -171,7 +193,7 @@ func cmdNight(args []string, stdout, stderr io.Writer, clock func() time.Time) i
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	result := submitNightCommand(ctx, newNonRedirectingHTTPClient(timeout), coordinatorURL, token, command)
+	result := submitNightCommand(ctx, newNonRedirectingHTTPClient(timeout), coordinatorURL, token, command, stopPlaylists)
 	return reportNightResult(stdout, stderr, configDir, command, now, result)
 }
 
@@ -191,10 +213,16 @@ func reportNightResult(stdout, stderr io.Writer, configDir, command string, now 
 	case classOK:
 		rec.Outcome = result.Response.Command.Outcome
 		rec.SessionState = result.Response.Session.State
-		if rec.Outcome == "idempotent_no_op" {
+		reason := result.Response.Command.Reason
+		if rec.Outcome == "idempotent_no_op" && reason != "" {
+			rec.Message = fmt.Sprintf("The coordinator already had %s in effect. The night is %s.", command, rec.SessionState)
+		} else if rec.Outcome == "idempotent_no_op" {
 			rec.Message = fmt.Sprintf("The coordinator already had %s in effect, so nothing changed. The night is %s.", command, rec.SessionState)
 		} else {
 			rec.Message = fmt.Sprintf("The coordinator accepted %s. The night is now %s.", command, rec.SessionState)
+		}
+		if reason != "" {
+			rec.Message += " " + reason
 		}
 	case classRefused:
 		exitCode = exitRefused
