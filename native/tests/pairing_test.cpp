@@ -109,6 +109,7 @@ class FakeTransport : public HttpTransport {
         return r;
     }
     HttpResponse get(const HttpRequest& request) override { return post(request); }
+    HttpResponse put(const HttpRequest& request) override { return post(request); }
 
     static HttpResponse notFound() {
         HttpResponse r;
@@ -431,6 +432,7 @@ TEST(RequestStopReturnsPromptlyEvenWithAClaimAboutToRun) {
             return FakeTransport::notFound();
         }
         HttpResponse get(const HttpRequest& request) override { return post(request); }
+        HttpResponse put(const HttpRequest& request) override { return post(request); }
     };
 
     TempDir state("showmesh-pairing-state");

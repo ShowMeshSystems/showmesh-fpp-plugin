@@ -52,6 +52,7 @@ class HttpTransport {
     // through, so every implementation, real or a test fake, must say
     // what it actually does.
     virtual HttpResponse get(const HttpRequest& request) = 0;
+    virtual HttpResponse put(const HttpRequest& request) = 0;
 };
 
 }  // namespace showmesh

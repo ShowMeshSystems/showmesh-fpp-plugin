@@ -28,11 +28,15 @@ class CurlHttpTransport : public HttpTransport {
         curl_global_init(CURL_GLOBAL_DEFAULT);
     }
 
-    HttpResponse post(const HttpRequest& request) override { return perform(request, /*isPost=*/true); }
+    HttpResponse post(const HttpRequest& request) override { return perform(request, Method::kPost); }
 
-    HttpResponse get(const HttpRequest& request) override { return perform(request, /*isPost=*/false); }
+    HttpResponse get(const HttpRequest& request) override { return perform(request, Method::kGet); }
+
+    HttpResponse put(const HttpRequest& request) override { return perform(request, Method::kPut); }
 
  private:
+    enum class Method { kGet, kPost, kPut };
+
     // Bounds an in-flight response body by the request's own cap, sized
     // for the response this specific call expects rather than one
     // constant shared by every call site.
@@ -41,7 +45,7 @@ class CurlHttpTransport : public HttpTransport {
         std::size_t maxBytes = 8192;
     };
 
-    HttpResponse perform(const HttpRequest& request, bool isPost) {
+    HttpResponse perform(const HttpRequest& request, Method method) {
         HttpResponse response;
 
         CURL* handle = curl_easy_init();
@@ -66,8 +70,9 @@ class CurlHttpTransport : public HttpTransport {
         BoundedBody bounded;
         bounded.maxBytes = request.maxResponseBytes > 0 ? static_cast<std::size_t>(request.maxResponseBytes) : 0;
         curl_easy_setopt(handle, CURLOPT_URL, request.url.c_str());
-        if (isPost) {
+        if (method != Method::kGet) {
             curl_easy_setopt(handle, CURLOPT_POST, 1L);
+            if (method == Method::kPut) curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, "PUT");
             curl_easy_setopt(handle, CURLOPT_POSTFIELDS, request.body.c_str());
             curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, static_cast<long>(request.body.size()));
         } else {

@@ -351,6 +351,74 @@ transition-gain write: a closed gate must survive a restart even when `fppd`
 is not currently outputting frames and would otherwise never reach the
 per-frame dirty mark `modifyChannelData` relies on.
 
+## Fallback executor
+
+When the coordinator is lost during a show, the plugin delivers the Cue
+activations the coordinator authorized in advance, and nothing else. This is
+ADR-048 and Track J step J4; the wire is section 5 of the coordinator
+repository's `docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md`. The code is
+`native/adapters/shared/fallback_*.h`, assembled by `FallbackExecutor` and wired
+into both adapters by `FallbackActivationDelivery`.
+
+**While the coordinator answers**, the executor's own thread:
+
+- creates an Ed25519 executor key once the plugin holds a pairing token, stores
+  the private key as `/etc/showmesh-fpp-plugin/fallback-executor-key` at mode
+  0600, and registers the public key on every start and after every pairing;
+- refetches the signed program after one third of its own validity
+  (`expiresAt` minus `compiledAt`), verifies, installs and acknowledges it; and
+- hands the installed program to every distinct node address it names.
+
+**Deciding the coordinator is lost.** The same thread probes
+`GET {coordinatorUrl}/healthz`. Only a 2xx counts as reached. Loss is confirmed
+after a run of failed probes that also spans a minimum time, never on one
+failed or slow request. The defaults are hypotheses, not measurements, and each
+is an FPP setting:
+
+| Setting | Default |
+|---|---|
+| `ShowMeshCoordinatorProbeIntervalMillis` | 5000 |
+| `ShowMeshCoordinatorProbeTimeoutMillis` | 3000 |
+| `ShowMeshCoordinatorLossFailedProbes` | 3 |
+| `ShowMeshCoordinatorLossMinimumMillis` | 15000 |
+
+**In fallback.** The plugin enters fallback at the first playlist entry that
+starts after loss is confirmed, never in the middle of an entry, and stays in
+it until that playlist stops or the plugin restarts. At each entry it resolves
+the entry key in the installed program and, only when the program carries this
+host's executor key, sends one signed activation per target node to the address
+the program gives. A retry reuses the execution id and the identical body. An
+unknown entry, an expired or missing program, a target with no address, and a
+node's refusal each end with no activation and a recorded reason. Nothing is
+ever sent in place of a refused activation.
+
+While loss is confirmed or fallback is active the worker skips its observation
+and definition posts, so an activation never waits behind their retry budget.
+Sequence numbers are still issued, so the coordinator sees a gap afterwards,
+which it accepts. Nothing is refetched, registered or handed out during that
+time.
+
+**What an operator can read.** `<state-dir>/fallback-status.json` holds the
+mode, whether the coordinator is reachable, the installed program, the count of
+skipped posts, and the 50 most recent deliveries and refusals with the node's
+outcome word and reason. The same lines go to FPP's log, and FPP's warning list
+carries one notice while the coordinator is lost.
+
+Routes this depends on, beyond the two the sending half uses:
+
+| Route | Where | Purpose |
+|---|---|---|
+| `GET /healthz` | coordinator, unauthenticated, outside `/api/v1` | the loss probe |
+| `GET /api/v1/fallback-programs/{fppInstanceId}` and `.../acknowledge` | coordinator | the signed program |
+| `PUT /api/v1/fallback-programs/{fppInstanceId}/executor-key` | coordinator | executor key registration |
+| `PUT /showmesh/v1/fallback/programs/{fppInstanceUuid}` | node | handing a node its program |
+| `POST /showmesh/v1/fallback/activations` | node | one signed activation |
+
+Not built here: the cutoff, the rest or hold rules, and the hand-back at the
+next scheduled-show boundary. `FallbackExecutionState` is the object they
+extend. `/healthz` says only that the coordinator process answers, so a
+coordinator that is up but cut off from its broker is not detected as lost.
+
 ## The FPP adapters
 
 `native/adapters/` is the only code in this repository that includes an FPP

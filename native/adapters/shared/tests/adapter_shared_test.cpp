@@ -403,6 +403,7 @@ class ScriptedTransport : public showmesh::HttpTransport {
         postCalls.push_back(request);
         return postResponse;
     }
+    showmesh::HttpResponse put(const showmesh::HttpRequest& request) override { return post(request); }
 
     showmesh::HttpResponse getResponse;
     showmesh::HttpResponse postResponse;

@@ -87,7 +87,7 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
           pairingDelivery_(delivery_.configWatcher(), nowMillis),
           safeCeilingPercent_(showmesh::adapter::resolveSafeCeilingPercent()),
           runtime_(&definitions_, delivery_.client(), nowMillis, &sequenceStore_, delivery_.client(),
-                  &brightnessStore_, safeCeilingPercent_, &fallbackDelivery_, pairingDelivery_.worker(),
+                  &brightnessStore_, safeCeilingPercent_, fallbackDelivery_.recorder(), pairingDelivery_.worker(),
                   delivery_.configWatcher()) {
         logBrightnessRestartTrust(runtime_.brightnessRestartTrust(), safeCeilingPercent_);
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);

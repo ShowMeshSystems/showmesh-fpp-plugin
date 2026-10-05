@@ -117,59 +117,20 @@ class RecordingSink : public ObservationSink {
 
 class RecordingFallbackActivationRecorder : public showmesh::FallbackActivationRecorder {
  public:
-    void recordEntryKeyResolution(const std::string& entryKey, TimeMillis observedAtMillis) override {
-        calls.push_back({entryKey, observedAtMillis});
+    bool observeEntryEvent(const showmesh::FallbackEntryEvent& event) override {
+        events.push_back(event);
+        return lost;
     }
+    bool coordinatorLost() override { return lost; }
+    void start() override { ++starts; }
+    void requestStop() override { ++stopRequests; }
+    void stop() override { ++stops; }
 
-    struct Call {
-        std::string entryKey;
-        TimeMillis observedAtMillis;
-    };
-    std::vector<Call> calls;
-};
-
-// performStartupFetch() blocks until either release() (the test choosing
-// to let it finish normally) or requestStop() (ShowMeshRuntime::stop()
-// interrupting it) wakes it, whichever comes first. wait_for's own cap
-// (kMaxBlockMillis) exists only so a run that DISABLES the requestStop()
-// wiring, to prove this test can fail, finishes in bounded time instead
-// of hanging the suite forever; kMaxBlockMillis is chosen well above the
-// bound the acceptance test asserts, so a run without the interrupt
-// still fails that assertion before this safety cap would matter.
-class BlockingFallbackActivationRecorder : public showmesh::FallbackActivationRecorder {
- public:
-    static constexpr int kMaxBlockMillis = 3000;
-
-    void recordEntryKeyResolution(const std::string&, TimeMillis) override {}
-
-    void performStartupFetch() override {
-        started.store(true);
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait_for(lock, std::chrono::milliseconds(kMaxBlockMillis),
-                     [this] { return released_ || stopRequested_; });
-        finished.store(true);
-    }
-
-    void requestStop() override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stopRequested_ = true;
-        cv_.notify_all();
-    }
-
-    void release() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        released_ = true;
-        cv_.notify_all();
-    }
-
-    std::atomic<bool> started{false};
-    std::atomic<bool> finished{false};
-
- private:
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    bool released_ = false;
-    bool stopRequested_ = false;
+    std::vector<showmesh::FallbackEntryEvent> events;
+    bool lost = false;
+    int starts = 0;
+    int stopRequests = 0;
+    int stops = 0;
 };
 
 // A transport that answers 200 and records what actually reached the
@@ -191,6 +152,7 @@ class RecordingTransport : public HttpTransport {
     // observation posts; shares post()'s canned response so the
     // interface's second verb has a stated behavior rather than none.
     HttpResponse get(const HttpRequest& request) override { return post(request); }
+    HttpResponse put(const HttpRequest& request) override { return post(request); }
 
     std::vector<HttpRequest> requests;
 };
@@ -212,6 +174,7 @@ class UnreachableTransport : public HttpTransport {
     // behavior rather than none, and stays consistent with this fake's
     // one job.
     HttpResponse get(const HttpRequest& request) override { return post(request); }
+    HttpResponse put(const HttpRequest& request) override { return post(request); }
 
     std::vector<HttpRequest> requests;
 };
@@ -442,18 +405,19 @@ TEST(AFallbackRecorderIsCalledOnceWithTheAlreadyComputedEntryKey) {
     ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
                             showmesh::kDefaultSafeCeilingPercent, &recorder);
 
-    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "song.mp3");
+    runtime.observeCallback("Main Show", "start", "mainPlaylist", 0, "a.fseq", "song.mp3", 4);
     CHECK(runtime.drainOnce());
 
     CHECK_EQ(sink.published.size(), static_cast<std::size_t>(1));
-    CHECK_EQ(recorder.calls.size(), static_cast<std::size_t>(1));
-    // The exact same key the sink's own observation carries: never a
-    // second, independently derived value.
-    CHECK_EQ(recorder.calls[0].entryKey, sink.published[0].entryKey);
-    CHECK_EQ(recorder.calls[0].observedAtMillis, sink.published[0].observedAtMillis);
+    CHECK_EQ(recorder.events.size(), static_cast<std::size_t>(1));
+    CHECK(recorder.events[0].identityResolved);
+    CHECK(recorder.events[0].action == showmesh::PlaylistAction::kStart);
+    CHECK_EQ(recorder.events[0].entryKey, sink.published[0].entryKey);
+    CHECK_EQ(recorder.events[0].observedAtMillis, sink.published[0].observedAtMillis);
+    CHECK_EQ(recorder.events[0].playlistLoop.value_or(-1), 4);
 }
 
-TEST(AFallbackRecorderIsNotCalledWhenIdentityDidNotResolve) {
+TEST(AFallbackRecorderHearsAnEntryWhoseIdentityDidNotResolveAsUnresolved) {
     FakeDefinitions definitions;
     definitions.definition = "";
     RecordingSink sink;
@@ -465,7 +429,65 @@ TEST(AFallbackRecorderIsNotCalledWhenIdentityDidNotResolve) {
     CHECK(runtime.drainOnce());
 
     CHECK_EQ(sink.unavailable.size(), static_cast<std::size_t>(1));
-    CHECK_EQ(recorder.calls.size(), static_cast<std::size_t>(0));
+    CHECK_EQ(recorder.events.size(), static_cast<std::size_t>(1));
+    CHECK(!recorder.events[0].identityResolved);
+    CHECK(recorder.events[0].entryKey.empty());
+    CHECK(recorder.events[0].action == showmesh::PlaylistAction::kPlaying);
+}
+
+TEST(AFallbackRecorderHearsTheEndOfARunAsStop) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    RecordingFallbackActivationRecorder recorder;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
+                            showmesh::kDefaultSafeCeilingPercent, &recorder);
+
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 0, "a.fseq", "song.mp3");
+    CHECK(runtime.drainOnce());
+    runtime.observeCallback("", "playing", "", 0, "", "");
+    CHECK(runtime.drainOnce());
+
+    CHECK_EQ(recorder.events.size(), static_cast<std::size_t>(2));
+    CHECK(recorder.events[1].action == showmesh::PlaylistAction::kStop);
+}
+
+TEST(CoordinatorPostsAreSkippedAndCountedWhileTheRecorderHoldsTheCoordinatorAsLost) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    RecordingFallbackActivationRecorder recorder;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
+                            showmesh::kDefaultSafeCeilingPercent, &recorder);
+
+    recorder.lost = true;
+    runtime.observeCallback("Main Show", "query_next", "mainPlaylist", 0, "a.fseq", "song.mp3");
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 1, "b.fseq", "song.mp3");
+    CHECK(runtime.drainOnce());
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(recorder.events.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(0));
+    CHECK_EQ(runtime.postsSkippedWhileCoordinatorLostCount(), static_cast<std::uint64_t>(2));
+
+    recorder.lost = false;
+    runtime.observeCallback("Main Show", "playing", "mainPlaylist", 2, "c.fseq", "song.mp3");
+    CHECK(runtime.drainOnce());
+    CHECK_EQ(sink.published.size(), static_cast<std::size_t>(1));
+    // A gap, never a regression: the skipped callbacks still minted their numbers.
+    CHECK_EQ(sink.published[0].sequence, static_cast<std::uint64_t>(3));
+    CHECK_EQ(runtime.postsSkippedWhileCoordinatorLostCount(), static_cast<std::uint64_t>(2));
+}
+
+TEST(StartAndStopBracketTheFallbackRecordersBackgroundThread) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    RecordingFallbackActivationRecorder recorder;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
+                            showmesh::kDefaultSafeCeilingPercent, &recorder);
+
+    runtime.start();
+    CHECK_EQ(recorder.starts, 1);
+    runtime.stop();
+    CHECK_EQ(recorder.stopRequests, 1);
+    CHECK_EQ(recorder.stops, 1);
 }
 
 TEST(AnAbsentFallbackRecorderIsNotACrash) {
@@ -1707,67 +1729,6 @@ TEST(StopReturnsPromptlyEvenWhileAPublishIsRetryingAgainstAnUnreachableCoordinat
     // The worker really did attempt delivery and really was retrying,
     // rather than the bound being trivially satisfied by nothing running.
     CHECK(!transport.requests.empty());
-}
-
-// The relocation this test exists to guard: the one-time signed fallback
-// program fetch moved off the plugin's construction path onto the
-// worker thread's first pass (FallbackActivationRecorder::
-// performStartupFetch(), called from workerLoop() before its first
-// drainOnce()), specifically so a fetch stuck against an unreachable
-// coordinator cannot turn into a construction-time hang. Moving it here
-// alone would trade that for a NEW hazard, a SHUTDOWN hang, since
-// stop() joins this same worker thread: this test is what proves that
-// trade was not made, by measuring stop() against a fetch deliberately
-// held blocked, not merely by checking that requestStop() was called.
-//
-// THE BOUND: 500ms, asserted below, chosen to be discriminating against
-// two different numbers rather than vacuous against either alone.
-//   - FPP 10's own shutdown deadline (fpp10/plugin.cpp) gives up waiting
-//     60000ms after requesting a stop. Asserting only against that would
-//     pass even if stop() waited out the fetch instead of interrupting
-//     it, since a single blocked HTTP call is already far short of 60s
-//     on its own.
-//   - The real path's own worst case: FetchAndInstallFallbackProgram
-//     (fallback_program_fetch.h) builds its HttpRequest without setting
-//     timeoutMillis, so it carries HttpRequest's default, 10000ms
-//     (http_transport.h), which is what CurlHttpTransport passes to
-//     libcurl as CURLOPT_TIMEOUT_MS (curl_http_transport.h). 500ms is
-//     1/20 of that, so passing means requestStop() actually interrupted
-//     the block; merely outlasting a 10-second timeout would not clear
-//     it.
-// BlockingFallbackActivationRecorder's own internal cap (3000ms) is
-// unrelated to this bound: it exists only so the "prove this test can
-// fail" run (PR body) exits instead of hanging forever with the
-// interrupt wiring removed, and it is itself well above the 500ms
-// asserted here, so removing the wiring still fails this assertion
-// before that cap is ever reached.
-TEST(StopReturnsPromptlyWhileTheStartupFallbackFetchIsBlocked) {
-    FakeDefinitions definitions;
-    RecordingSink sink;
-    BlockingFallbackActivationRecorder recorder;
-    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, nullptr,
-                            showmesh::kDefaultSafeCeilingPercent, &recorder);
-
-    runtime.start();
-
-    // Poll rather than sleep a fixed guess: stop() below must interrupt
-    // a fetch actually in progress, not merely beat the worker thread to
-    // its first line.
-    for (int i = 0; i < 500 && !recorder.started.load(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    CHECK(recorder.started.load());
-
-    const auto begin = std::chrono::steady_clock::now();
-    runtime.stop();
-    const auto elapsed = std::chrono::steady_clock::now() - begin;
-    const auto elapsedMillis = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-
-    CHECK(elapsedMillis < 500);
-    // stop() returning fast because the fetch never actually started
-    // would prove nothing; this is the same non-vacuous check the
-    // retrying-publish test above makes for its own transport.
-    CHECK(recorder.started.load());
 }
 
 TEST(ThePassCounterCrossesTheCallbackBoundaryAndKeepsAbsenceDistinctFromZero) {

@@ -290,12 +290,14 @@ bool ShowMeshRuntime::drainOnce() {
         if (sequenceStore_ != nullptr && !sequenceStore_->store(observation.sequence)) ++sequencePersistFailures_;
         lastPlaying_.reset();
         playlistEnded_ = true;
-        if (sink_ != nullptr && sink_->publish(observation)) {
+        const bool postsSuspended = notifyFallbackRecorder(PlaylistAction::kStop, evidence, std::string());
+        if (!postsSuspended && sink_ != nullptr && sink_->publish(observation)) {
             ++published_;
             unacknowledgedCoalesced_ = 0;
         }
         return true;
     }
+    const PlaylistAction fallbackAction = runEnded ? PlaylistAction::kStop : evidence.action;
 
     observation.schemaVersion = kObservationSchemaVersion;
     observation.sequenceFilename = evidence.sequenceFilename;
@@ -340,10 +342,11 @@ bool ShowMeshRuntime::drainOnce() {
         observation.unavailable = IdentityUnavailable::kTruncatedIdentityField;
         observation.identity.instanceUuid = instanceUuid;
         ++unavailable_;
+        const bool postsSuspended = notifyFallbackRecorder(fallbackAction, evidence, std::string());
         // An unavailable observation is still an observation the
         // coordinator can acknowledge: only clear the gap on acceptance,
         // never on a refusal, which must still ride forward.
-        if (sink_ != nullptr && sink_->publishUnavailable(observation)) {
+        if (!postsSuspended && sink_ != nullptr && sink_->publishUnavailable(observation)) {
             unacknowledgedCoalesced_ = 0;
         }
         return true;
@@ -362,7 +365,8 @@ bool ShowMeshRuntime::drainOnce() {
         observation.identity.section = evidence.section;
         observation.identity.position = evidence.position;
         ++unavailable_;
-        if (sink_ != nullptr && sink_->publishUnavailable(observation)) {
+        const bool postsSuspended = notifyFallbackRecorder(fallbackAction, evidence, std::string());
+        if (!postsSuspended && sink_ != nullptr && sink_->publishUnavailable(observation)) {
             unacknowledgedCoalesced_ = 0;
         }
         return true;
@@ -370,22 +374,16 @@ bool ShowMeshRuntime::drainOnce() {
 
     observation.identity = resolution.identity;
     observation.entryKey = resolution.entryKey;
-    // Right where entryKey is known, and nowhere else: this is the one
-    // key the fallback resolver looks up, already computed by
-    // resolveEntryIdentity() above, never re-derived a second way. Never
-    // gated on definitionPublisher_ or sink_'s outcome below: recording
-    // what the installed fallback program says about this entry does not
-    // depend on whether the coordinator accepted the observation.
-    if (fallbackRecorder_ != nullptr) {
-        fallbackRecorder_->recordEntryKeyResolution(resolution.entryKey, evidence.observedAtMillis);
-    }
+    // Before the coordinator posts below, so an activation during an outage
+    // never waits behind their retry budget.
+    const bool postsSuspended = notifyFallbackRecorder(fallbackAction, evidence, resolution.entryKey);
     // Before the observation citing it, not after: an observation whose
     // definition has not arrived is still accepted, but Track H holds the
     // binding as having no definition until it does. The return value is
     // deliberately not gated on: a definition the coordinator could not
     // take is not a reason to withhold the observation, and the next
     // sweep retries the definition anyway.
-    if (definitionPublisher_ != nullptr) {
+    if (definitionPublisher_ != nullptr && !postsSuspended) {
         definitionPublisher_->publishDefinition(resolution.identity.instanceUuid, resolution.identity.playlistName,
                                                 resolution.identity.playlistHash, resolution.canonicalDefinition,
                                                 evidence.observedAtMillis);
@@ -394,12 +392,26 @@ bool ShowMeshRuntime::drainOnce() {
     if (observation.action == PlaylistAction::kPlaying || observation.action == PlaylistAction::kStart) {
         lastPlaying_ = observation;
     }
-    const bool accepted = sink_ != nullptr && sink_->publish(observation);
+    const bool accepted = !postsSuspended && sink_ != nullptr && sink_->publish(observation);
     if (accepted) {
         ++published_;
         unacknowledgedCoalesced_ = 0;
     }
     return true;
+}
+
+bool ShowMeshRuntime::notifyFallbackRecorder(PlaylistAction action, const CallbackEvidence& evidence,
+                                             const std::string& entryKey) {
+    if (fallbackRecorder_ == nullptr) return false;
+    FallbackEntryEvent event;
+    event.action = action;
+    event.identityResolved = !entryKey.empty();
+    event.entryKey = entryKey;
+    event.playlistLoop = evidence.playlistLoop;
+    event.observedAtMillis = evidence.observedAtMillis;
+    const bool postsSuspended = fallbackRecorder_->observeEntryEvent(event);
+    if (postsSuspended) ++postsSkippedWhileCoordinatorLost_;
+    return postsSuspended;
 }
 
 // sequence_ is otherwise only touched from the worker thread (inside
@@ -473,6 +485,7 @@ bool ShowMeshRuntime::flushBrightnessIfDirty() {
 
 bool ShowMeshRuntime::sweepDefinitions() {
     if (definitions_ == nullptr || definitionPublisher_ == nullptr) return false;
+    if (fallbackRecorder_ != nullptr && fallbackRecorder_->coordinatorLost()) return false;
     const std::string instanceUuid = definitions_->instanceUuid();
     // Without an instance UUID a definition cannot be filed against an
     // instance, and FPP reports one only once the host identity is
@@ -533,13 +546,6 @@ bool ShowMeshRuntime::maybeSweepDefinitions() {
 
 void ShowMeshRuntime::workerLoop() {
     workerActive_.store(true);
-    // Exactly once, before this thread's first pass over drainOnce():
-    // see FallbackActivationRecorder::performStartupFetch()'s own doc
-    // comment for why this runs here rather than in that recorder's
-    // constructor. workerLoop() itself only ever runs once per start(),
-    // so no separate "already attempted" flag is needed to keep this to
-    // one call.
-    if (fallbackRecorder_ != nullptr) fallbackRecorder_->performStartupFetch();
     while (running_.load()) {
         while (drainOnce()) {
             if (!running_.load()) {
@@ -572,6 +578,7 @@ void ShowMeshRuntime::start() {
     // Its own thread, independent of worker_: see pairing.h's class
     // comment for why the claim POST must never run on worker_.
     if (pairingWorker_ != nullptr) pairingWorker_->start();
+    if (fallbackRecorder_ != nullptr) fallbackRecorder_->start();
 }
 
 void ShowMeshRuntime::stop() {
@@ -579,8 +586,6 @@ void ShowMeshRuntime::stop() {
     // A worker stuck inside publish() or publishDefinition(), retrying
     // against an unreachable coordinator, must be interrupted before the
     // join below waits on it, not after: the join itself has no timeout.
-    // A worker stuck inside performStartupFetch() is the identical
-    // hazard, one time only, at start rather than per observation.
     if (sink_ != nullptr) sink_->requestStop();
     if (definitionPublisher_ != nullptr) definitionPublisher_->requestStop();
     if (fallbackRecorder_ != nullptr) fallbackRecorder_->requestStop();
@@ -599,6 +604,7 @@ void ShowMeshRuntime::stop() {
     // orders one join before the other for correctness, but doing it here
     // keeps every "stop everything" call in this one function.
     if (pairingWorker_ != nullptr) pairingWorker_->stop();
+    if (fallbackRecorder_ != nullptr) fallbackRecorder_->stop();
 }
 
 }  // namespace showmesh

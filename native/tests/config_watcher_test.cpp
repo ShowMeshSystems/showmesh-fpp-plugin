@@ -55,6 +55,7 @@ class NoopTransport : public HttpTransport {
  public:
     HttpResponse post(const HttpRequest&) override { return HttpResponse{}; }
     HttpResponse get(const HttpRequest&) override { return HttpResponse{}; }
+    HttpResponse put(const HttpRequest&) override { return HttpResponse{}; }
 };
 
 // Records every request it is asked to send and answers success, so a
@@ -72,6 +73,7 @@ class RecordingTransport : public HttpTransport {
         return r;
     }
     HttpResponse get(const HttpRequest& request) override { return post(request); }
+    HttpResponse put(const HttpRequest& request) override { return post(request); }
 };
 
 class NoCredentials : public CredentialSource {

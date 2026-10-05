@@ -112,6 +112,7 @@ class FakeTransport : public HttpTransport {
     // paths; shares post()'s canned response so the interface's second
     // verb has a stated behavior rather than none.
     HttpResponse get(const HttpRequest& request) override { return post(request); }
+    HttpResponse put(const HttpRequest& request) override { return post(request); }
 
     std::vector<HttpRequest> requests;
     int statusCode = 200;

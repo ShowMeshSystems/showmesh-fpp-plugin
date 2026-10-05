@@ -205,59 +205,34 @@ class DefinitionPublisher {
     virtual DefinitionHoldings definitionHoldings() const = 0;
 };
 
-// FallbackActivationRecorder is where the plugin records what the
-// installed ADR-048 fallback program (Track J) says about the entry key
-// the worker has just resolved. It never sends anything to a node: the
-// node-activation route and the per-host executor credential ADR-048
-// decision 3 requires do not exist yet, so recording is the whole job.
-//
-// Deliberately as narrow as ObservationSink and DefinitionPublisher:
-// entryKey and observedAtMillis are the only two things the worker
-// already has at the one call site that needs this, and both are
-// standard types, so this header pulls in nothing the host-neutral core
-// does not already carry. The adapter-side implementation
-// (fallback_activation_delivery.h) does the actual resolve-and-record
-// work using the fallback headers (jsoncpp, OpenSSL) this core module
-// never links.
-//
-// Closer in shape to DefinitionPublisher than to ObservationSink or
-// PlaylistMismatchNotifier: there is no accept/retry contract to honor
-// (ObservationSink's bool return exists for gap tracking that does not
-// apply here), and every resolved entry is recorded, not only a
-// transition into or out of some state (PlaylistMismatchNotifier's
-// raise/clear pair). One method, called once per resolved entry.
+// One drained callback as the ADR-048 fallback path sees it. action is
+// kStop when FPP reported the run over, whatever the callback's own word.
+struct FallbackEntryEvent {
+    PlaylistAction action = PlaylistAction::kUnknown;
+    bool identityResolved = false;
+    std::string entryKey;
+    std::optional<int> playlistLoop;
+    TimeMillis observedAtMillis = 0;
+};
+
+// FallbackActivationRecorder is where the worker hands every drained
+// callback to the ADR-048 fallback path (Track J). The adapter-side
+// implementation resolves, records and, during confirmed coordinator loss,
+// delivers; this core module links none of what that needs.
 class FallbackActivationRecorder {
  public:
     virtual ~FallbackActivationRecorder() = default;
-    // Called once per entry whose identity resolved, right where the
-    // worker already has entryKey: never re-derived, never a second
-    // lookup. observedAtMillis is the observation's own timestamp, not a
-    // fresh read of the clock, so a recorded outcome and the observation
-    // it belongs to always agree on when the entry actually played.
-    virtual void recordEntryKeyResolution(const std::string& entryKey, TimeMillis observedAtMillis) = 0;
-
-    // Called exactly once, on the worker thread, before its first pass
-    // over drainOnce(): the one-time signed-program fetch belongs here,
-    // never in this recorder's own constructor. A fetch running during
-    // construction runs on whichever thread constructs the plugin (FPP's
-    // load path on both majors), which is exactly the boot-time
-    // coordinator dependency ADR-025 decision 3 exists to avoid; the
-    // worker thread already exists, already has a join-based stop path,
-    // and already carries the interrupt plumbing this needs, so nothing
-    // about relocating the fetch here should reach for a second thread.
-    // Defaulted to a no-op so every existing caller and test compiles
-    // unchanged.
-    virtual void performStartupFetch() {}
-
-    // Interrupts an in-flight performStartupFetch() so
-    // ShowMeshRuntime::stop()'s join does not have to wait for it. Called
-    // before that join, alongside ObservationSink::requestStop() and
-    // DefinitionPublisher::requestStop(), for the identical reason: a
-    // fetch blocked against an unreachable coordinator must not be able
-    // to hold shutdown past FPP 10's deadline. Defaulted to a no-op:
-    // performStartupFetch() itself defaults to doing nothing, so there
-    // is nothing to interrupt unless both are overridden together.
+    // Called on the worker thread, once per drained callback, before that
+    // callback's coordinator posts. Returns true when the worker must skip
+    // those posts: their retry budget would delay the next activation.
+    virtual bool observeEntryEvent(const FallbackEntryEvent& event) = 0;
+    // The same answer for work no callback drives, such as a definition sweep.
+    virtual bool coordinatorLost() { return false; }
+    // start() and stop() bracket the recorder's own background thread, the
+    // way PairingWorker's do. requestStop() interrupts it before the join.
+    virtual void start() {}
     virtual void requestStop() {}
+    virtual void stop() {}
 };
 
 // Clock is injected so the whole runtime is testable without waiting.
@@ -319,8 +294,8 @@ class ShowMeshRuntime {
     // pass the "ShowMeshSafeCeilingPercent" setting's value instead.
     // fallbackRecorder is likewise optional and defaults to nullptr so
     // every existing caller and test compiles unchanged. When non-null,
-    // drainOnce() calls recordEntryKeyResolution() once per entry whose
-    // identity resolves, right after entryKey itself is known.
+    // drainOnce() hands it every drained callback, and start() and stop()
+    // start and stop its background thread.
     // pairingWorker and configWatcher are likewise optional and default to
     // nullptr so every existing caller and test compiles unchanged. When
     // set: workerLoop() ticks configWatcher once per pass (a local file
@@ -482,6 +457,8 @@ class ShowMeshRuntime {
     const CallbackHandoff& handoff() const { return handoff_; }
     std::uint64_t publishedCount() const { return published_.load(); }
     std::uint64_t unavailableCount() const { return unavailable_.load(); }
+    // Callbacks whose coordinator posts were skipped because the fallback recorder held the coordinator as lost.
+    std::uint64_t postsSkippedWhileCoordinatorLostCount() const { return postsSkippedWhileCoordinatorLost_.load(); }
     // Count of drainOnce() calls whose freshly minted sequence number
     // could not be persisted (sequenceStore->store() returned false). The
     // observation still publishes; only the durability guarantee is
@@ -510,6 +487,8 @@ class ShowMeshRuntime {
 
  private:
     void workerLoop();
+    // True when the recorder asked for this callback's coordinator posts to be skipped.
+    bool notifyFallbackRecorder(PlaylistAction action, const CallbackEvidence& evidence, const std::string& entryKey);
 
     PlaylistDefinitionSource* definitions_;
     ObservationSink* sink_;
@@ -610,6 +589,7 @@ class ShowMeshRuntime {
     std::atomic<std::uint64_t> published_{0};
     std::atomic<std::uint64_t> unavailable_{0};
     std::atomic<std::uint64_t> sequencePersistFailures_{0};
+    std::atomic<std::uint64_t> postsSkippedWhileCoordinatorLost_{0};
     // Written once from the constructor, before start() runs the worker
     // thread; read-only afterward, so no lock is needed.
     bool sequenceFilesWereAllInvalidAtStartup_ = false;
