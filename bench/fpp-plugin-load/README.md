@@ -319,8 +319,8 @@ a graceful fppd stop from `fallback`. By reading the source, a graceful stop
 ends the main loop and unloads plugins without stopping the playlist first, so
 no `stop` callback reaches the plugin and the file stays: FPP 9.5.3 returns from
 `MainLoop()` at `fppd.cpp` 804 and calls `PluginManager::Cleanup()` at 824, and
-FPP 10.0 does the same at 1120 and 1170, after calling each plugin's
-`shutdown()`. FPP 10.0 also queues its `stop` callback for the main loop
+FPP 10.0 does the same at 1120 and 1170, where the cleanup calls each plugin's
+`shutdown()` before destroying it. FPP 10.0 also queues its `stop` callback for the main loop
 (`Playlist.cpp` 1577), which has ended by then. Neither was run from
 `fallback`. `A9` is described where it is defined in the script.
 
