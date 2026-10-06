@@ -422,7 +422,10 @@ then holds whether or not it changed, and hands it to the nodes. If the
 coordinator is still lost then, it does the same after the first probe that
 succeeds. A fetch that gets no answer, and an acknowledgement that gets no
 success answer, stay owed and are tried again at every probe: the coordinator
-holds the player until the acknowledgement lands. An expired copy is never
+holds the player until the acknowledgement lands. That covers a timeout, no
+answer, a 408, a 429 and a 5xx. Any other 4xx is a refusal that waiting cannot
+clear, so the plugin stops asking, records it once, and asks again only after
+the next pairing or the next newly installed copy. An expired copy is never
 acknowledged as verified. The plugin never posts an observation for an entry
 that began while it was the executor.
 
@@ -436,21 +439,28 @@ has not passed is therefore undecided, and until FPP decides it the plugin
 behaves as the saved state: it posts no observation, reports the saved state,
 and fetches, acknowledges and hands back nothing.
 
-- The first callback that names the saved playlist resumes the state. The
-  first entry callback for the recorded entry key is the entry already handled
-  and gets no Cue, whatever its pass counter says, because FPP's counter starts
-  over with fppd.
+- The first callback that names the saved playlist resumes the state. If the
+  callback that resumes is for the recorded entry key, that entry gets no Cue
+  whatever its pass counter says, because FPP's counter starts over with fppd.
+  If it is for another entry, that entry is a boundary like any other, and the
+  recorded entry gets a Cue the next time FPP reaches it.
 - A callback that names another playlist, a `stop`, or FPP naming no playlist
-  for 30 seconds after the plugin started, hands back. The 30 seconds are a
-  hypothesis (`kHypothesisRestartSettleMillis`): in the container bench FPP's
-  first callback came 19 ms after the plugin loaded on FPP 9.5.3 and 21 ms on
-  FPP 10.0. A real player has not been measured.
+  for 30 seconds after the plugin started, hands back. The callback and the
+  30 second timer are decided under one lock, so whichever comes first decides
+  and the other does nothing. The 30 seconds are measured on a monotonic
+  clock, so setting the player's clock neither ends them early nor skips them.
+  They are a hypothesis (`kHypothesisRestartSettleMillis`): in the container
+  bench run recorded in `bench/fpp-plugin-load/README.md`, FPP's first
+  callback came 23 ms after the plugin loaded on FPP 9.5.3 and 33 ms on FPP
+  10.0. A real player has not been measured.
 - An entry a restart interrupted is not tried again: a Cue started well inside
   an entry is worse than a missed one. It is recorded as
   `interrupted-by-restart`.
 - A saved state whose cutoff has passed, and a file written by another version
   of the plugin, are never resumed: the plugin starts in `normal` with the
-  hand-back steps owed. The playlist name cannot tell the run fallback was
+  hand-back steps owed. A file of another version is kept beside the token as
+  `fallback-state.json.unknown-version` and is otherwise unused; it can be
+  deleted. The playlist name cannot tell the run fallback was
   entered in from a later run of the same playlist, so the cutoff is what
   bounds a resume.
 
@@ -473,6 +483,18 @@ recent deliveries and refusals, and separately the 20 most recent program
 hand-offs. Each record carries an outcome word, who answered (`node` or
 `player`), and a reason: the node's own, or a whole sentence from this player.
 The same lines go to FPP's log.
+
+Words and fields of this player's own that the file can carry:
+
+| Where | Value | Meaning |
+|---|---|---|
+| record outcome | `interrupted-by-restart` | The plugin restarted while this entry's Cue was being started, and it was not tried again. |
+| record outcome | `cutoff-passed` | The program ran out before the node answered, so no further request was sent to it. |
+| record outcome | `resting` | The entry began after the cutoff, so nothing was started for it. |
+| `waitingForFppAfterRestart` | `true` | The plugin started with a saved state and FPP has not yet named a playlist or stayed idle for 30 seconds. |
+| `acknowledgementOwed` | `true` | The coordinator has not recorded which copy this player holds. |
+| `acknowledgementProblem` | a sentence | Whether that acknowledgement is waiting or was refused, and what to do. Empty when nothing is owed. |
+| `stateReportProblem` | a sentence | Why the last state report did not land, and what to do. Empty when it did. |
 
 FPP's warning list carries one notice while the coordinator is lost or the
 plugin is not in `normal`, and the status file's `message` is the same text. It

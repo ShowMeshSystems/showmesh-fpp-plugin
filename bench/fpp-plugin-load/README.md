@@ -305,10 +305,24 @@ persistence and the FPP 10 shutdown-predicate changes in place:
 
 **Both runs exit 0, with all eight assertions passing on both majors.**
 
-`A10` and `A11` were added later and observed on 2026-10-06 on an x86_64 host
-running the `amd64` image natively: FPP's first callback came 19 ms (FPP 9.5.3)
-and 21 ms (FPP 10.0) after the plugin loaded, and the idle hand-back came
-30.0 s after it. `A9` is described where it is defined in the script.
+`A10` and `A11` were added later. The numbers quoted for them
+anywhere in this repository are from one run, on 2026-10-06 at commit
+`db2674e`, on an x86_64 host running the `amd64` image natively. FPP's first
+callback came 23 ms (FPP 9.5.3) and 33 ms (FPP 10.0) after the plugin loaded,
+and the idle hand-back came 30.029 s (FPP 9.5.3) and 30.021 s (FPP 10.0) after
+it. All eleven assertions passed on both majors in that run.
+
+`A10` writes the saved state file itself, while the running plugin is in
+`normal`, and then restarts fppd. It shows that a plugin starting with that file
+resumes when FPP starts the playlist again. It does not show the file surviving
+a graceful fppd stop from `fallback`. By reading the source, a graceful stop
+ends the main loop and unloads plugins without stopping the playlist first, so
+no `stop` callback reaches the plugin and the file stays: FPP 9.5.3 returns from
+`MainLoop()` at `fppd.cpp` 804 and calls `PluginManager::Cleanup()` at 824, and
+FPP 10.0 does the same at 1120 and 1170, after calling each plugin's
+`shutdown()`. FPP 10.0 also queues its `stop` callback for the main loop
+(`Playlist.cpp` 1577), which has ended by then. Neither was run from
+`fallback`. `A9` is described where it is defined in the script.
 
 ### A6 on FPP 9 caught a real product defect, since fixed
 
