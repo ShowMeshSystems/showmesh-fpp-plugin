@@ -433,6 +433,12 @@ class Bench {
     }
 
     std::vector<Sent> activations() { return network.sent("POST", kNodeActivationPath); }
+    // The activation at index, or an empty one when it was never sent.
+    Sent activation(std::size_t index) {
+        const std::vector<Sent> all = activations();
+        CHECK(index < all.size());
+        return index < all.size() ? all[index] : Sent();
+    }
 
     FallbackRecord lastActivationRecord() {
         const std::vector<FallbackRecord> records = activationRecords();
@@ -540,6 +546,7 @@ TEST(PairingCreatesTheKeyBesideTheTokenWithTheTokensModeAndRegistersIt) {
 
     const std::vector<Sent> registrations = bench.network.sent("PUT", "/executor-key");
     CHECK_EQ(registrations.size(), static_cast<std::size_t>(1));
+    if (registrations.size() < 1) return;
     CHECK_EQ(registrations[0].url,
              std::string(kCoordinatorUrl) + "/api/v1/fallback-programs/" + kFppUuid + "/executor-key");
     CHECK_EQ(registrations[0].bearerToken, std::string("token-one"));
@@ -568,6 +575,7 @@ TEST(ARestartKeepsTheSameKeyAndRegistersItAgain) {
     CHECK_EQ(readFile(bench.keyPath()), keyOnDisk);
     const std::vector<Sent> registrations = bench.network.sent("PUT", "/executor-key");
     CHECK_EQ(registrations.size(), static_cast<std::size_t>(2));
+    if (registrations.size() < 2) return;
     CHECK_EQ(registrations[0].body, registrations[1].body);
 }
 
@@ -582,6 +590,7 @@ TEST(PairingAgainRegistersTheSameKeyUnderTheNewToken) {
     CHECK_EQ(readFile(bench.keyPath()), keyOnDisk);
     const std::vector<Sent> registrations = bench.network.sent("PUT", "/executor-key");
     CHECK_EQ(registrations.size(), static_cast<std::size_t>(2));
+    if (registrations.size() < 2) return;
     CHECK_EQ(registrations[1].bearerToken, std::string("token-two"));
     CHECK_EQ(registrations[1].body, registrations[0].body);
 }
@@ -755,6 +764,7 @@ TEST(TheProbeReadsHealthzWithItsOwnTimeoutAndOnlyA2xxCountsAsReached) {
     bench.tick();
     const std::vector<Sent> probes = bench.network.sent("GET", "/healthz");
     CHECK_EQ(probes.size(), static_cast<std::size_t>(1));
+    if (probes.size() < 1) return;
     CHECK_EQ(probes[0].url, std::string(kCoordinatorUrl) + "/healthz");
     CHECK_EQ(probes[0].timeoutMillis, kHypothesisProbeTimeoutMillis);
     CHECK(probes[0].bearerToken.empty());
@@ -787,6 +797,7 @@ TEST(AFetchedProgramIsInstalledAcknowledgedAndHandedToEveryDistinctNodeAddressOn
     // node-b appears under two entries and still gets one copy.
     const std::vector<Sent> handed = bench.network.sent("PUT", kNodeProgramPathPrefix);
     CHECK_EQ(handed.size(), static_cast<std::size_t>(2));
+    if (handed.size() < 2) return;
     CHECK_EQ(handed[0].url, std::string("http://") + kNodeA + kNodeProgramPathPrefix + kFppUuid);
     CHECK_EQ(handed[1].url, std::string("http://") + kNodeB + kNodeProgramPathPrefix + kFppUuid);
     CHECK_EQ(handed[0].body, fixture("program.json"));
@@ -926,6 +937,7 @@ TEST(AnOutageAtAPlaylistTransitionActivatesTheMappedCueExactlyOnceOnTheIntendedN
 
     const std::vector<Sent> activations = bench.activations();
     CHECK_EQ(activations.size(), static_cast<std::size_t>(1));
+    if (activations.size() < 1) return;
     CHECK_EQ(activations[0].url, std::string("http://") + kNodeA + kNodeActivationPath);
     CHECK_EQ(activations[0].timeoutMillis, kNodeRequestTimeoutMillis);
     CHECK(activations[0].bearerToken.empty());
@@ -953,6 +965,7 @@ TEST(AnOutageAtAPlaylistTransitionActivatesTheMappedCueExactlyOnceOnTheIntendedN
     CHECK_EQ(status.activationsAuthorized, static_cast<std::uint64_t>(1));
     const std::vector<FallbackRecord> records = bench.activationRecords();
     CHECK_EQ(records.size(), static_cast<std::size_t>(1));
+    if (records.size() < 1) return;
     CHECK_EQ(records[0].outcome, std::string("authorized"));
     CHECK_EQ(records[0].reason, std::string("node says authorized"));
     CHECK_EQ(records[0].executionId, requestMember(activations[0], "executionId"));
@@ -1004,6 +1017,7 @@ TEST(AnEntryThatTargetsTwoNodesSendsEachItsOwnExecutionId) {
 
     const std::vector<Sent> activations = bench.activations();
     CHECK_EQ(activations.size(), static_cast<std::size_t>(2));
+    if (activations.size() < 2) return;
     CHECK_NE(requestMember(activations[0], "executionId"), requestMember(activations[1], "executionId"));
     std::map<std::string, std::string> catalogRevisionByNode;
     for (const Sent& activation : activations) {
@@ -1030,6 +1044,7 @@ TEST(ALoopBackIntoTheSameEntryIsANewOccurrenceWithANewExecutionId) {
     bench.callback("playing", 0, 1);  // the playlist looped
     const std::vector<Sent> activations = bench.activations();
     CHECK_EQ(activations.size(), static_cast<std::size_t>(2));
+    if (activations.size() < 2) return;
     CHECK_NE(requestMember(activations[0], "executionId"), requestMember(activations[1], "executionId"));
     CHECK_EQ(requestMember(activations[0], "entryKey"), requestMember(activations[1], "entryKey"));
 }
@@ -1044,6 +1059,7 @@ TEST(AnEntryTheProgramDoesNotMapSendsNothingAndRecordsWhy) {
     CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(0));
     const std::vector<FallbackRecord> records = bench.activationRecords();
     CHECK_EQ(records.size(), static_cast<std::size_t>(1));
+    if (records.size() < 1) return;
     CHECK_EQ(records[0].outcome, std::string(kOutcomeUnknownEntry));
     CHECK(!records[0].reason.empty());
     CHECK_EQ(records[0].entryKey, bench.entryKey(2));
@@ -1120,9 +1136,11 @@ TEST(ATargetWithNoAddressGetsNothingAndIsRecordedWhileItsSiblingIsActivated) {
 
     const std::vector<Sent> activations = bench.activations();
     CHECK_EQ(activations.size(), static_cast<std::size_t>(1));
+    if (activations.size() < 1) return;
     CHECK_EQ(activations[0].url, std::string("http://") + kNodeB + kNodeActivationPath);
     const std::vector<FallbackRecord> records = bench.activationRecords();
     CHECK_EQ(records.size(), static_cast<std::size_t>(2));
+    if (records.size() < 2) return;
     CHECK_EQ(records[0].nodeId, std::string("node-a"));
     CHECK_EQ(records[0].outcome, std::string(kOutcomeNoAddress));
     CHECK_EQ(records[1].outcome, std::string("authorized"));
@@ -1402,6 +1420,7 @@ TEST(TheStateIsReportedAtOnceOnStartThenEveryTenSecondsAndNeverWhileTheProbeFail
     bench.tick();
     std::vector<showmesh::json::Value> reports = stateReports(&bench);
     CHECK_EQ(reports.size(), static_cast<std::size_t>(1));
+    if (reports.size() < 1) return;
     if (reports.empty()) return;
     CHECK_EQ(numberMember(reports[0], "schemaVersion"), 1.0);
     CHECK_EQ(numberMember(reports[0], "sequence"), 1.0);
@@ -1727,6 +1746,7 @@ TEST(AnOutageThatOutlastsAPlaylistEntersFallbackAgainUnderTheNextOne) {
     CHECK(bench.executor->status().state.mode == FallbackMode::kFallback);
     const std::vector<Sent> activations = bench.activations();
     CHECK_EQ(activations.size(), static_cast<std::size_t>(2));
+    if (activations.size() < 2) return;
     CHECK_NE(requestMember(activations[0], "executionId"), requestMember(activations[1], "executionId"));
     CHECK(std::filesystem::exists(bench.statePath()));
     CHECK_EQ(bench.sink.published.size(), static_cast<std::size_t>(0));
@@ -1764,6 +1784,7 @@ TEST(ASecondOutageAfterAHandBackRunsTheWholeCycleAgainWithNoEntryStartedTwice) {
     bench.callback("playing", 1);
     const std::vector<Sent> activations = bench.activations();
     CHECK_EQ(activations.size(), static_cast<std::size_t>(2));
+    if (activations.size() < 2) return;
     CHECK_NE(requestMember(activations[0], "executionId"), requestMember(activations[1], "executionId"));
     CHECK_EQ(requestMember(activations[1], "entryKey"), bench.entryKey(1));
     // Each entry had exactly one owner: one observation or one activation, never both.
@@ -1813,7 +1834,7 @@ TEST(TheStateIsOnDiskBesideTheTokenBeforeTheFirstActivationLeaves) {
         CHECK(false);
         return;
     }
-    const std::string executionId = requestMember(bench.activations()[0], "executionId");
+    const std::string executionId = requestMember(bench.activation(0), "executionId");
     FallbackExecutionState atSend;
     CHECK(ParseFallbackState(onDiskAtSend, &atSend));
     CHECK_EQ(modeAtSend, 0600);
@@ -1839,7 +1860,7 @@ TEST(APluginRestartInFallbackResumesItUnderTheSamePlaylistAndDoesNotSendTheEntry
     enterFallback(&bench);
     const FallbackExecutionState before = bench.executor->status().state;
     const std::string firstBoot = bench.executor->bootId();
-    const std::string firstId = requestMember(bench.activations()[0], "executionId");
+    const std::string firstId = requestMember(bench.activation(0), "executionId");
 
     // The plugin restarts while FPP keeps playing the same playlist.
     gClock += 30000;
@@ -1862,6 +1883,7 @@ TEST(APluginRestartInFallbackResumesItUnderTheSamePlaylistAndDoesNotSendTheEntry
     bench.callback("playing", 1);
     const std::vector<Sent> activations = bench.activations();
     CHECK_EQ(activations.size(), static_cast<std::size_t>(2));
+    if (activations.size() < 2) return;
     CHECK_NE(requestMember(activations[1], "executionId"), firstId);
 
     // Its report carries the state it left, under a new boot id.
@@ -1887,7 +1909,7 @@ TEST(ARestartThatInterruptedAnEntryRetriesItWithTheSameExecutionIdsSoTheNodeRuns
         }
     };
     bench.callback("playing", 0);
-    const Sent first = bench.activations()[0];
+    const Sent first = bench.activation(0);
 
     // The plugin died after the node ran the cue and before it could record that: the file says unfinished.
     bench.network.beforeAnswer = nullptr;
@@ -1899,6 +1921,7 @@ TEST(ARestartThatInterruptedAnEntryRetriesItWithTheSameExecutionIdsSoTheNodeRuns
 
     const std::vector<Sent> activations = bench.activations();
     CHECK_EQ(activations.size(), static_cast<std::size_t>(2));
+    if (activations.size() < 2) return;
     CHECK_EQ(activations[1].body, first.body);
     CHECK_EQ(bench.lastActivationRecord().outcome, std::string("authorized"));
     FallbackExecutionState after;
@@ -2069,6 +2092,7 @@ TEST(Table_NoResponseIsRetriedWithTheSameBodyAtMostThreeAttemptsAtLeast250MsApar
     CHECK(!run.result.activated());
     const std::vector<Sent> posts = run.posts();
     CHECK_EQ(posts.size(), static_cast<std::size_t>(3));
+    if (posts.size() < 3) return;
     CHECK_EQ(posts[1].body, posts[0].body);
     CHECK_EQ(posts[2].body, posts[0].body);
     CHECK_EQ(run.pauses.size(), static_cast<std::size_t>(2));
