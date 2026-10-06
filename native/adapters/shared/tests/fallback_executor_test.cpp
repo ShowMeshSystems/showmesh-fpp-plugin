@@ -1355,6 +1355,23 @@ std::vector<std::string> orderSince(Bench* bench, std::size_t from) {
     return std::vector<std::string>(all.begin() + static_cast<std::ptrdiff_t>(std::min(from, all.size())), all.end());
 }
 
+// A missing element reads as empty, so a regression fails a check instead of crashing the suite.
+std::string at(const std::vector<std::string>& lines, std::size_t index) {
+    return index < lines.size() ? lines[index] : std::string();
+}
+
+showmesh::json::Value lastReport(Bench* bench) {
+    const std::vector<showmesh::json::Value> reports = stateReports(bench);
+    CHECK(!reports.empty());
+    return reports.empty() ? showmesh::json::Value() : reports.back();
+}
+
+Sent lastSent(Bench* bench, const std::string& method, const std::string& urlPart) {
+    const std::vector<Sent> sent = bench->network.sent(method, urlPart);
+    CHECK(!sent.empty());
+    return sent.empty() ? Sent() : sent.back();
+}
+
 std::string joined(const std::vector<std::string>& lines) {
     std::string out;
     for (const std::string& line : lines) out += line + "\n";
@@ -1385,6 +1402,7 @@ TEST(TheStateIsReportedAtOnceOnStartThenEveryTenSecondsAndNeverWhileTheProbeFail
     bench.tick();
     std::vector<showmesh::json::Value> reports = stateReports(&bench);
     CHECK_EQ(reports.size(), static_cast<std::size_t>(1));
+    if (reports.empty()) return;
     CHECK_EQ(numberMember(reports[0], "schemaVersion"), 1.0);
     CHECK_EQ(numberMember(reports[0], "sequence"), 1.0);
     CHECK_EQ(member(reports[0], "bootId"), bench.executor->bootId());
@@ -1394,20 +1412,21 @@ TEST(TheStateIsReportedAtOnceOnStartThenEveryTenSecondsAndNeverWhileTheProbeFail
     for (const char* absent : {"playlistName", "packageId", "packageRevision", "cutoffAt"}) {
         CHECK(!hasMember(reports[0], absent));
     }
-    const Sent sent = bench.network.sent("PUT", "/fallback-state")[0];
+    const Sent sent = lastSent(&bench, "PUT", "/fallback-state");
     CHECK_EQ(sent.url, std::string(kCoordinatorUrl) + kStateRoute);
     CHECK_EQ(sent.bearerToken, std::string("token-one"));
     CHECK_EQ(sent.timeoutMillis, kStateReportTimeoutMillis);
     // The report is the first request after the probe, before the key and the program.
     const std::vector<std::string> order = bench.network.order();
-    CHECK_EQ(order[0], std::string("GET /healthz"));
-    CHECK_EQ(order[1], "PUT " + kStateRoute);
+    CHECK_EQ(at(order, 0), std::string("GET /healthz"));
+    CHECK_EQ(at(order, 1), "PUT " + kStateRoute);
 
     bench.advanceAndTick(kHypothesisProbeIntervalMillis);
     CHECK_EQ(stateReports(&bench).size(), static_cast<std::size_t>(1));
     bench.advanceAndTick(kHypothesisProbeIntervalMillis);
     reports = stateReports(&bench);
     CHECK_EQ(reports.size(), static_cast<std::size_t>(2));
+    if (reports.size() < 2) return;
     CHECK_EQ(numberMember(reports[1], "sequence"), 2.0);
 
     bench.network.coordinatorUp = false;
@@ -1419,8 +1438,8 @@ TEST(TheStateIsReportedAtOnceOnStartThenEveryTenSecondsAndNeverWhileTheProbeFail
     const std::size_t mark = bench.network.order().size();
     bench.advanceAndTick(kHypothesisProbeIntervalMillis);
     const std::vector<std::string> after = orderSince(&bench, mark);
-    CHECK_EQ(after[0], std::string("GET /healthz"));
-    CHECK_EQ(after[1], "PUT " + kStateRoute);
+    CHECK_EQ(at(after, 0), std::string("GET /healthz"));
+    CHECK_EQ(at(after, 1), "PUT " + kStateRoute);
     CHECK_EQ(stateReports(&bench).size(), static_cast<std::size_t>(3));
 }
 
@@ -1534,7 +1553,7 @@ TEST(AtTheCutoffThePluginRestsSendsNothingMoreAndSaysSo) {
     bench.advanceAndTick(kHypothesisProbeIntervalMillis);
     CHECK(bench.executor->status().state.mode == FallbackMode::kResting);
     CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(0));
-    const showmesh::json::Value report = stateReports(&bench).back();
+    const showmesh::json::Value report = lastReport(&bench);
     CHECK_EQ(member(report, "state"), std::string("resting"));
     CHECK_EQ(member(report, "playlistName"), std::string(kPlaylistName));
     CHECK_EQ(member(report, "packageId"), std::string("pkg-test"));
@@ -1567,7 +1586,7 @@ TEST(ACoordinatorThatComesBackDoesNotTakeTheShowBackBeforeThePlaylistStops) {
     bench.advanceAndTick(kHypothesisProbeIntervalMillis);
     // The probe and the report, and nothing else: no registration, no fetch, no hand-out.
     CHECK_EQ(joined(orderSince(&bench, mark)), "GET /healthz\nPUT " + kStateRoute + "\n");
-    const showmesh::json::Value report = stateReports(&bench).back();
+    const showmesh::json::Value report = lastReport(&bench);
     CHECK_EQ(member(report, "state"), std::string("fallback"));
     CHECK_EQ(member(report, "playlistName"), std::string(kPlaylistName));
     CHECK_EQ(member(report, "packageId"), std::string("pkg-test"));
@@ -1582,7 +1601,7 @@ TEST(ACoordinatorThatComesBackDoesNotTakeTheShowBackBeforeThePlaylistStops) {
     CHECK_EQ(bench.sink.published.size(), static_cast<std::size_t>(0));
     CHECK(bench.executor->coordinatorLost());
     for (int i = 0; i < 4; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
-    CHECK_EQ(member(stateReports(&bench).back(), "state"), std::string("fallback"));
+    CHECK_EQ(member(lastReport(&bench), "state"), std::string("fallback"));
     CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(0));
 }
 
@@ -1601,7 +1620,7 @@ TEST(WhenThePlaylistStopsThePluginHandsBackReportThenFetchThenAcknowledge) {
     // The report has already gone, from the worker, before anything else.
     CHECK_EQ(joined(orderSince(&bench, mark)), "PUT " + kStateRoute + "\n");
     CHECK(!std::filesystem::exists(bench.statePath()));
-    const showmesh::json::Value report = stateReports(&bench).back();
+    const showmesh::json::Value report = lastReport(&bench);
     CHECK_EQ(member(report, "state"), std::string("normal"));
     CHECK(!hasMember(report, "playlistName"));
     CHECK(!hasMember(report, "cutoffAt"));
@@ -1611,7 +1630,7 @@ TEST(WhenThePlaylistStopsThePluginHandsBackReportThenFetchThenAcknowledge) {
     CHECK_EQ(joined(orderSince(&bench, mark)),
              "PUT " + kStateRoute + "\nGET " + kProgramRoute + "\nPOST " + kAcknowledgeRoute + "\nPUT " +
                  kNodeProgramRoute + "\n");
-    const showmesh::json::Value ack = parseJson(bench.network.sent("POST", "/acknowledge").back().body);
+    const showmesh::json::Value ack = parseJson(lastSent(&bench, "POST", "/acknowledge").body);
     CHECK_EQ(member(ack, "packageId"), std::string("pkg-test"));
     CHECK_EQ(member(ack, "revision"), std::string("rev-test"));
     CHECK_EQ(member(ack, "verificationResult"), std::string("verified"));
@@ -1645,9 +1664,8 @@ TEST(AHandBackFetchThatFindsANewerProgramInstallsAcknowledgesAndHandsItOut) {
     stopPlaylist(&bench);
     bench.tick();
     CHECK_EQ(readFile(bench.installPath()), newerDocument);
-    const std::vector<Sent> acks = bench.network.sent("POST", "/acknowledge");
-    CHECK_EQ(acks.size(), static_cast<std::size_t>(1));
-    CHECK_EQ(member(parseJson(acks[0].body), "revision"), std::string("rev-newer"));
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(1));
+    CHECK_EQ(member(parseJson(lastSent(&bench, "POST", "/acknowledge").body), "revision"), std::string("rev-newer"));
     CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(1));
 }
 
@@ -1690,11 +1708,11 @@ TEST(WithTheCoordinatorStillLostAtTheBoundaryThePluginHandsBackOnTheFirstGoodPro
     const std::size_t mark = bench.network.order().size();
     bench.advanceAndTick(kHypothesisProbeIntervalMillis);
     const std::vector<std::string> after = orderSince(&bench, mark);
-    CHECK_EQ(after[0], std::string("GET /healthz"));
-    CHECK_EQ(after[1], "PUT " + kStateRoute);
-    CHECK_EQ(after[2], "GET " + kProgramRoute);
-    CHECK_EQ(after[3], "POST " + kAcknowledgeRoute);
-    CHECK_EQ(member(stateReports(&bench).back(), "state"), std::string("normal"));
+    CHECK_EQ(at(after, 0), std::string("GET /healthz"));
+    CHECK_EQ(at(after, 1), "PUT " + kStateRoute);
+    CHECK_EQ(at(after, 2), "GET " + kProgramRoute);
+    CHECK_EQ(at(after, 3), "POST " + kAcknowledgeRoute);
+    CHECK_EQ(member(lastReport(&bench), "state"), std::string("normal"));
     CHECK(!bench.executor->coordinatorLost());
 }
 
@@ -1791,6 +1809,10 @@ TEST(TheStateIsOnDiskBesideTheTokenBeforeTheFirstActivationLeaves) {
     };
     bench.callback("playing", 0, 3);
 
+    if (bench.activations().empty()) {
+        CHECK(false);
+        return;
+    }
     const std::string executionId = requestMember(bench.activations()[0], "executionId");
     FallbackExecutionState atSend;
     CHECK(ParseFallbackState(onDiskAtSend, &atSend));
@@ -1802,6 +1824,7 @@ TEST(TheStateIsOnDiskBesideTheTokenBeforeTheFirstActivationLeaves) {
     CHECK_EQ(atSend.occurrence.playlistLoop.value_or(-1), 3);
     CHECK(!atSend.occurrence.delivered);
     CHECK_EQ(atSend.occurrence.executionIds.size(), static_cast<std::size_t>(1));
+    if (atSend.occurrence.executionIds.empty()) return;
     CHECK_EQ(atSend.occurrence.executionIds[0].first, std::string("node-a"));
     CHECK_EQ(atSend.occurrence.executionIds[0].second, executionId);
 
@@ -1844,7 +1867,7 @@ TEST(APluginRestartInFallbackResumesItUnderTheSamePlaylistAndDoesNotSendTheEntry
     // Its report carries the state it left, under a new boot id.
     bench.network.coordinatorUp = true;
     bench.advanceAndTick(kHypothesisProbeIntervalMillis);
-    const showmesh::json::Value report = stateReports(&bench).back();
+    const showmesh::json::Value report = lastReport(&bench);
     CHECK_EQ(member(report, "state"), std::string("fallback"));
     CHECK_EQ(member(report, "playlistName"), std::string(kPlaylistName));
     CHECK_EQ(member(report, "since"), std::string("2026-10-05T12:05:20Z"));
@@ -1943,11 +1966,11 @@ TEST(ARestartAfterThePlaylistEndedHandsBackBecauseTheBoundaryPassedWhileThePlugi
         const std::size_t mark = bench.network.order().size();
         bench.tick();
         const std::vector<std::string> after = orderSince(&bench, mark);
-        CHECK_EQ(after[0], std::string("GET /healthz"));
-        CHECK_EQ(after[1], "PUT " + kStateRoute);
-        CHECK_EQ(after[2], "GET " + kProgramRoute);
-        CHECK_EQ(after[3], "POST " + kAcknowledgeRoute);
-        const showmesh::json::Value report = stateReports(&bench).back();
+        CHECK_EQ(at(after, 0), std::string("GET /healthz"));
+        CHECK_EQ(at(after, 1), "PUT " + kStateRoute);
+        CHECK_EQ(at(after, 2), "GET " + kProgramRoute);
+        CHECK_EQ(at(after, 3), "POST " + kAcknowledgeRoute);
+        const showmesh::json::Value report = lastReport(&bench);
         CHECK_EQ(member(report, "state"), std::string("normal"));
         CHECK_EQ(member(report, "since"), std::string("2026-10-05T12:05:50Z"));
         CHECK(!bench.executor->coordinatorLost());
@@ -1962,7 +1985,7 @@ TEST(AStateFileThatCannotBeReadMeansNormal) {
         restartPlugin(&bench, kPlaylistName);
         CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
         bench.tick();
-        CHECK_EQ(member(stateReports(&bench).back(), "state"), std::string("normal"));
+        CHECK_EQ(member(lastReport(&bench), "state"), std::string("normal"));
     }
 }
 
