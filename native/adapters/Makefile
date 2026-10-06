@@ -181,6 +181,17 @@ $(DRIVER_BINARY): shared/tests/tools/fallback_delivery_driver.cpp $(CORE_SOURCES
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -I$(CORE_DIR)/include -Ishared $(OPENSSL_INCLUDE) $^ $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $@
 
+# Bench tool, not shipped: the plugin's runtime and fallback executor with FPP
+# replaced by lines on standard input, for an end to end run. See shared/tests/tools/.
+PLUGIN_DRIVER_BINARY := $(BUILD)/fallback_plugin_driver
+
+.PHONY: fallback-plugin-driver
+fallback-plugin-driver: $(PLUGIN_DRIVER_BINARY)
+
+$(PLUGIN_DRIVER_BINARY): shared/tests/tools/fallback_plugin_driver.cpp $(CORE_SOURCES)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(CORE_DIR)/include -Ishared $(OPENSSL_INCLUDE) $^ $(CURL_LIBS) $(OPENSSL_LIBS) -pthread -o $@
+
 .PHONY: clean
 clean:
 	rm -rf $(BUILD)

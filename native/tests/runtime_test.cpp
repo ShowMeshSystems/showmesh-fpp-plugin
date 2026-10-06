@@ -415,6 +415,7 @@ TEST(AFallbackRecorderIsCalledOnceWithTheAlreadyComputedEntryKey) {
     CHECK_EQ(recorder.events[0].entryKey, sink.published[0].entryKey);
     CHECK_EQ(recorder.events[0].observedAtMillis, sink.published[0].observedAtMillis);
     CHECK_EQ(recorder.events[0].playlistLoop.value_or(-1), 4);
+    CHECK_EQ(recorder.events[0].playlistName, std::string("Main Show"));
 }
 
 TEST(AFallbackRecorderHearsAnEntryWhoseIdentityDidNotResolveAsUnresolved) {
@@ -449,6 +450,8 @@ TEST(AFallbackRecorderHearsTheEndOfARunAsStop) {
 
     CHECK_EQ(recorder.events.size(), static_cast<std::size_t>(2));
     CHECK(recorder.events[1].action == showmesh::PlaylistAction::kStop);
+    // FPP names no playlist at the end of a run; the recorder still hears which one ended.
+    CHECK_EQ(recorder.events[1].playlistName, std::string("Main Show"));
 }
 
 TEST(CoordinatorPostsAreSkippedAndCountedWhileTheRecorderHoldsTheCoordinatorAsLost) {

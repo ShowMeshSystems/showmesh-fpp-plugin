@@ -1,8 +1,8 @@
 #pragma once
 
-// The plugin's ADR-048 fallback executor (Track J, J4). tick() runs on this
-// class's own thread and observeEntryEvent() on the runtime worker; neither is
-// FPP's callback thread. The README's "Fallback executor" section has the rest.
+// The plugin's ADR-048 fallback executor (Track J, J4 and J5). tick() runs on
+// this class's own thread and observeEntryEvent() on the runtime worker;
+// neither is FPP's callback thread. The README's "Fallback executor" section has the rest.
 
 #include <algorithm>
 #include <atomic>
@@ -24,6 +24,8 @@
 #include "fallback_pinned_key_loader.h"
 #include "fallback_program_fetch.h"
 #include "fallback_program_installer.h"
+#include "fallback_state_report.h"
+#include "fallback_state_store.h"
 #include "showmesh/atomic_write.h"
 #include "showmesh/coordinator_config.h"
 #include "showmesh/http_transport.h"
@@ -35,22 +37,28 @@
 namespace showmesh {
 namespace fallback {
 
-// HYPOTHESIS, not a measurement: how often the program is asked for again.
-constexpr int kHypothesisProgramRefetchIntervalMillis = 60000;
-constexpr const char* kProgramRefetchIntervalSettingName = "ShowMeshFallbackProgramRefetchIntervalMillis";
-// The refetch is never later than this fraction of the installed program's
-// own validity (expiresAt minus compiledAt).
-constexpr int kRefetchValidityNumerator = 1;
-constexpr int kRefetchValidityDenominator = 3;
+// Section 5.12 fixes how often a plugin in normal asks for its program again.
+constexpr int kProgramRefetchIntervalMillis = 60000;
 // A registration that makes no progress is tried again after one refetch
 // interval, then double that each time, up to this cap.
 constexpr TimeMillis kRegistrationBackoffCapMillis = 600000;
 constexpr int kExecutorRegistrationTimeoutMillis = 10000;
 // 409: the coordinator has not read this player's identity yet. It clears by waiting.
 constexpr int kRegistrationNotYetStatus = 409;
+// HYPOTHESIS, not a measurement: how long a plugin that started with a saved
+// fallback or resting state waits for FPP to name a playlist before it takes
+// FPP as idle and hands back. FPP 9.5 and FPP 10.0 both load plugins before
+// their main loop starts any playlist, so the answer cannot be read at load.
+constexpr int kHypothesisRestartSettleMillis = 30000;
 constexpr std::size_t kRecentActivationRecords = 50;
 constexpr std::size_t kRecentProgramHandOffRecords = 20;
 constexpr const char* kFallbackStatusFilename = "fallback-status.json";
+
+// The four rule values section 5.13 fixes. A program with any other is not usable.
+constexpr const char* kRuleFallbackBoundary = "safe-playback-boundary";
+constexpr const char* kRuleRestHold = "hold";
+constexpr const char* kRuleLocalShutdown = "local-shutdown";
+constexpr const char* kRuleRecoveryBoundary = "next-scheduled-show-boundary";
 
 // Outcome words this player records when it decided itself, in the same shape
 // as the words a node sends.
@@ -58,6 +66,7 @@ constexpr const char* kOutcomeNoCoordinatorKey = "no-coordinator-key";
 constexpr const char* kOutcomeNoProgram = "no-program";
 constexpr const char* kOutcomeProgramNotVerified = "program-not-verified";
 constexpr const char* kOutcomeProgramExpired = "program-expired";
+constexpr const char* kOutcomeProgramRulesUnknown = "program-rules-unknown";
 constexpr const char* kOutcomeUnknownEntry = "unknown-entry";
 constexpr const char* kOutcomeAmbiguousEntry = "ambiguous-entry";
 constexpr const char* kOutcomeNoTarget = "no-target";
@@ -67,6 +76,8 @@ constexpr const char* kOutcomeNoAddress = "no-address";
 constexpr const char* kOutcomeIncompleteProgram = "incomplete-program";
 constexpr const char* kOutcomeEntryNotIdentified = "entry-not-identified";
 constexpr const char* kOutcomeSigningFailed = "signing-failed";
+constexpr const char* kOutcomeResting = "resting";
+constexpr const char* kOutcomeInterruptedByRestart = "interrupted-by-restart";
 
 // What an operator reads for one of this player's own outcome words: a whole
 // sentence for the status file, and the clause the notice puts after "because".
@@ -91,6 +102,10 @@ constexpr PlayerOutcomeCopy kPlayerOutcomeCopy[] = {
      "This player's plan for running the show without the coordinator has run out. Restore the coordinator to start "
      "the planned cues again.",
      "its plan for running the show without the coordinator has run out"},
+    {kOutcomeProgramRulesUnknown,
+     "The plan on this player asks for something this plugin version does not know, so it is not used. Update the "
+     "ShowMesh plugin on this player.",
+     "its plan asks for something this plugin version does not know"},
     {kOutcomeUnknownEntry,
      "The plan has no cue for this playlist entry, so nothing was started for it. No action is needed if the entry "
      "has no cue in the show.",
@@ -119,6 +134,18 @@ constexpr PlayerOutcomeCopy kPlayerOutcomeCopy[] = {
      "FPP's playlist entry could not be identified"},
     {kOutcomeSigningFailed, "The request for this node could not be signed. Check FPP's log on this player.",
      "a request could not be signed"},
+    {kOutcomeInterruptedByRestart,
+     "The plugin restarted while this entry's cue was being started, and it was not tried again. No action is "
+     "needed; the next entry starts as planned.",
+     "the plugin restarted during the last entry"},
+    {kOutcomeCutoffPassed,
+     "This player's plan ran out before the node answered, so it stopped trying. Restore the coordinator to start "
+     "the planned cues again.",
+     "its plan ran out before a node answered"},
+    {kOutcomeResting,
+     "This player's plan ran out earlier in this playlist, so nothing was started for this entry. Check the "
+     "coordinator; it takes over when this playlist stops.",
+     "its plan ran out earlier in this playlist"},
 };
 // For a boundary where nodes were asked and none started the cue.
 constexpr PlayerOutcomeCopy kNoNodeStartedCopy = {"", "", "no node started the last planned cue"};
@@ -150,73 +177,101 @@ inline const char* PlayerOutcomeWord(ActivationResolveKind kind) {
     return "";
 }
 
-enum class FallbackMode { kNormal, kFallback };
-
-inline const char* FallbackModeName(FallbackMode mode) { return mode == FallbackMode::kFallback ? "fallback" : "normal"; }
-
-// What the last entry boundary in fallback came to.
-enum class BoundaryResult {
-    kNone,
-    kStarted,
-    // The plan maps this entry to no cue. Ordinary, and not a failure.
-    kNothingToStart,
-    kStartedOnSomeNodes,
-    kNotStarted,
-};
+// "2026-10-05T12:15:00Z" as an operator reads it. Any other shape is shown as written.
+inline std::string CutoffForOperator(const std::string& cutoffAt) {
+    if (cutoffAt.size() != 20 || cutoffAt[10] != 'T' || cutoffAt[19] != 'Z') return cutoffAt;
+    return cutoffAt.substr(11, 5) + " UTC on " + cutoffAt.substr(0, 10);
+}
 
 constexpr const char* kCoordinatorLostMessage =
     "The coordinator has stopped answering, and this player will start the planned cues on the nodes itself from "
     "the next playlist entry. Check the coordinator.";
-constexpr const char* kFallbackActiveMessage =
-    "The coordinator stopped answering, so this player is starting the planned cues on the nodes itself until this "
-    "playlist stops. Check the coordinator.";
-constexpr const char* kStartedOnSomeNodesMessage =
-    "The coordinator stopped answering, and this player started the last planned cue on only some of its nodes. "
-    "Check the nodes and restore the coordinator.";
 constexpr const char* kCannotStartPrefix =
     "The coordinator has stopped answering, and this player cannot start the planned cues itself because ";
-constexpr const char* kNotStartingPrefix =
-    "The coordinator stopped answering, and this player is not starting the planned cues because ";
 constexpr const char* kRestoreCoordinatorAction = ". Restore the coordinator to start them again.";
+// What follows a notice once the coordinator answers again: nothing is asked of the operator.
+constexpr const char* kCoordinatorTakesOverAction = "Nothing to do: the coordinator takes over when this playlist stops.";
 
-// The notice an operator sees, true to what this player can do and last did.
-// problem is one of this player's outcome words, or empty when nothing
-// stands in the way.
-inline std::string FallbackNotice(FallbackMode mode, bool coordinatorLost, const std::string& problem,
-                                  BoundaryResult lastBoundary) {
-    if (mode == FallbackMode::kNormal) {
-        if (!coordinatorLost) return std::string();
-        if (problem.empty()) return kCoordinatorLostMessage;
-        return std::string(kCannotStartPrefix) + PlayerOutcomeCopyFor(problem).noticeClause +
-               kRestoreCoordinatorAction;
-    }
-    if (!problem.empty() || lastBoundary == BoundaryResult::kNotStarted) {
-        return std::string(kNotStartingPrefix) + PlayerOutcomeCopyFor(problem).noticeClause +
-               kRestoreCoordinatorAction;
-    }
-    if (lastBoundary == BoundaryResult::kStartedOnSomeNodes) return kStartedOnSomeNodesMessage;
-    return kFallbackActiveMessage;
+constexpr const char* kAcknowledgementWaitingMessage =
+    "The coordinator has not confirmed which plan this player holds, and the plugin keeps asking. Check the "
+    "coordinator if this does not clear.";
+
+// A 4xx that waiting cannot clear. 408 and 429 are asked again like no answer and a 5xx.
+inline bool AcknowledgementRefused(int statusCode) {
+    return statusCode >= 400 && statusCode <= 499 && statusCode != 408 && statusCode != 429;
 }
 
-// The one record of where this host stands in ADR-048's Normal, Fallback and
-// Resting states. The cutoff, rest or hold rules and the hand-back at the
-// next scheduled-show boundary extend this object; they are not built yet.
-struct FallbackExecutionState {
-    FallbackMode mode = FallbackMode::kNormal;
-    TimeMillis enteredAtMillis = 0;
-    std::string enteredAtEntryKey;
-    BoundaryResult lastBoundary = BoundaryResult::kNone;
-    // This player's outcome word for a boundary that started nothing. Empty when a node refused.
-    std::string lastBoundaryProblem;
+inline std::string AcknowledgementRefusedMessage(int statusCode) {
+    const std::string fact = "The coordinator refused to record which plan this player holds and answered " +
+                             std::to_string(statusCode) + ". ";
+    if (statusCode == 401 || statusCode == 403) return fact + "Pair this player with the coordinator again.";
+    return fact + "Check that the coordinator and this plugin are versions that work together.";
+}
 
-    void enter(TimeMillis now, const std::string& entryKey) {
-        mode = FallbackMode::kFallback;
-        enteredAtMillis = now;
-        enteredAtEntryKey = entryKey;
-    }
-    // The only exits in this step: the playlist it entered under stops, or the plugin restarts.
-    void leaveOnPlaylistStop() { *this = FallbackExecutionState(); }
+inline TimeMillis SteadyClockMillis() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// What the notice is built from.
+struct NoticeFacts {
+    FallbackExecutionState state;
+    bool coordinatorLost = false;
+    bool coordinatorReachable = false;
+    // One of this player's outcome words, or empty when nothing stands in the way.
+    std::string problem;
+    // The plugin started with a saved state and FPP has not yet said what it is playing.
+    bool waitingForFpp = false;
 };
+
+// The notice an operator sees: the state, the playlist it is held under, the
+// cutoff, and what to do. Every form is true whether or not the coordinator
+// is answering again. Empty when there is nothing to say.
+inline std::string FallbackNotice(const NoticeFacts& facts) {
+    const FallbackExecutionState& state = facts.state;
+    const std::string playlist = "playlist " + state.playlistName;
+    const std::string cutoff = CutoffForOperator(state.cutoffAt);
+    const bool back = facts.coordinatorReachable;
+    if (facts.waitingForFpp && state.mode != FallbackMode::kNormal) {
+        return "This player's plugin restarted while it was running " + playlist +
+               " without the coordinator, and it is waiting for FPP to say what it is playing. Nothing to do.";
+    }
+    if (state.mode == FallbackMode::kNormal) {
+        if (!facts.coordinatorLost) return std::string();
+        if (facts.problem.empty()) return kCoordinatorLostMessage;
+        return std::string(kCannotStartPrefix) + PlayerOutcomeCopyFor(facts.problem).noticeClause +
+               kRestoreCoordinatorAction;
+    }
+    if (state.mode == FallbackMode::kResting) {
+        const std::string fact = "This player stopped starting cues for " + playlist + " at " + cutoff +
+                                 ", when its plan for running without the coordinator ran out. ";
+        return fact + (back ? kCoordinatorTakesOverAction
+                            : "Restore the coordinator; cues start again after this playlist stops.");
+    }
+    if (!facts.problem.empty() || state.lastBoundary == BoundaryResult::kNotStarted) {
+        const std::string clause = PlayerOutcomeCopyFor(facts.problem).noticeClause;
+        if (back) {
+            return "The coordinator is answering again, but this player is not starting the planned cues for " +
+                   playlist + " because " + clause + ". " + kCoordinatorTakesOverAction;
+        }
+        return "The coordinator stopped answering, and this player is not starting the planned cues for " + playlist +
+               " because " + clause + kRestoreCoordinatorAction;
+    }
+    if (state.lastBoundary == BoundaryResult::kStartedOnSomeNodes) {
+        if (back) {
+            return "The coordinator is answering again, and this player started the last planned cue for " + playlist +
+                   " on only some of its nodes. Check the nodes; the coordinator takes over when this playlist stops.";
+        }
+        return "The coordinator stopped answering, and this player started the last planned cue for " + playlist +
+               " on only some of its nodes. Check the nodes and restore the coordinator.";
+    }
+    if (back) {
+        return "The coordinator is answering again, and this player keeps starting the planned cues for " + playlist +
+               " until that playlist stops. " + kCoordinatorTakesOverAction;
+    }
+    return "The coordinator stopped answering, so this player is starting the planned cues for " + playlist +
+           " itself until that playlist stops or until " + cutoff + ". Check the coordinator.";
+}
 
 // Where the operator-facing notice goes. The FPP adapters back it with WarningHolder.
 class FallbackStateNotifier {
@@ -242,6 +297,8 @@ struct FallbackRecord {
 
 struct FallbackStatusSnapshot {
     FallbackExecutionState state;
+    // Started with a saved state that FPP has not yet confirmed or ended.
+    bool waitingForFpp = false;
     bool coordinatorReachable = false;
     bool coordinatorLost = false;
     bool executorKeyRegistered = false;
@@ -252,6 +309,13 @@ struct FallbackStatusSnapshot {
     std::string programRevision;
     std::string programExpiresAt;
     bool programEnrollsThisExecutor = false;
+    // Why the last state report did not land. Empty when it did, or none was due.
+    std::string stateReportProblem;
+    // The coordinator has not yet recorded which copy this player holds.
+    bool acknowledgementOwed = false;
+    // Waiting or refused, as an operator reads it. Empty when nothing is owed.
+    std::string acknowledgementProblem;
+    std::uint64_t stateReportsSent = 0;
     std::uint64_t activationsAuthorized = 0;
     std::uint64_t activationsNotDelivered = 0;
     std::uint64_t coordinatorPostsSkipped = 0;
@@ -261,30 +325,51 @@ struct FallbackStatusSnapshot {
 
 struct FallbackExecutorOptions {
     Clock clock = nullptr;
+    // Measures the settle window, so a wall clock step can neither end it nor skip it.
+    Clock monotonicClock = SteadyClockMillis;
     std::string fppInstanceUuid;
     // Holds config.json and receives fallback-status.json.
     std::string stateDir;
-    // Holds the pairing token and the executor key.
+    // Holds the pairing token, the executor key and the fallback state file.
     std::string credentialDir;
     std::string installPath;
     PinnedKeyLoadResult pinnedKey;
     OutageDetectorConfig detector;
-    int programRefetchIntervalMillis = kHypothesisProgramRefetchIntervalMillis;
+    int programRefetchIntervalMillis = kProgramRefetchIntervalMillis;
+    // How long a saved state waits for FPP to name a playlist before FPP is taken as idle.
+    int restartSettleMillis = kHypothesisRestartSettleMillis;
     showmesh::RandomBytesFn randomBytes = showmesh::readRandomBytes;
     // Receives one line per event. isError marks what an operator must act on.
     std::function<void(bool isError, const std::string& line)> log;
     FallbackStateNotifier* notifier = nullptr;
     // Replaces the real wait between delivery attempts. Tests only.
     DeliveryPause pause;
+    // Replaces the write of the state file. Tests only.
+    std::function<bool(const std::string& credentialDir, const FallbackExecutionState& state)> writeState;
 };
 
 class FallbackExecutor : public showmesh::FallbackActivationRecorder {
  public:
+    // Reads the saved state from disk and nothing from the network, so it is
+    // safe on FPP's plugin load path.
     FallbackExecutor(FallbackExecutorOptions options, HttpTransport* transport)
         : options_(std::move(options)),
           transport_(transport),
           credentials_(options_.credentialDir),
-          detector_(options_.detector) {}
+          detector_(options_.detector) {
+        uint8_t random[16] = {0};
+        if (options_.randomBytes != nullptr) options_.randomBytes(random, sizeof(random));
+        bootId_ = formatExecutionId(random);
+        // An existing key is read here, from disk, so an entry FPP starts
+        // before the background thread's first pass can still be signed.
+        // A key is only ever created on that thread.
+        struct ::stat keyFile {};
+        if (::stat(showmesh::joinPath(options_.credentialDir, kExecutorKeyFilename).c_str(), &keyFile) == 0) {
+            key_ = LoadOrCreateExecutorKey(options_.credentialDir, options_.randomBytes);
+            keyProblem_ = key_.detail;
+        }
+        restoreSavedState(options_.clock != nullptr ? options_.clock() : 0);
+    }
 
     ~FallbackExecutor() override { stop(); }
 
@@ -294,7 +379,8 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
             while (!stopRequested_.load()) {
                 tick(options_.clock());
                 std::unique_lock<std::mutex> lock(wakeMutex_);
-                wake_.wait_for(lock, std::chrono::milliseconds(250), [this] { return stopRequested_.load(); });
+                wake_.wait_for(lock, std::chrono::milliseconds(250), [this] { return stopRequested_.load() || woken_; });
+                woken_ = false;
             }
         });
     }
@@ -309,53 +395,118 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         if (thread_.joinable()) thread_.join();
     }
 
+    // True while the worker must not post to the coordinator: outside normal,
+    // while loss is confirmed, and until the report that must come first is sent.
     bool coordinatorLost() override {
         std::lock_guard<std::mutex> lock(mutex_);
-        return state_.mode == FallbackMode::kFallback || detector_.confirmedLost();
+        return postsSuspendedLocked();
     }
 
-    // One step of the background thread: probe when due, then, only while the
-    // coordinator answers and this host is not in fallback, register and refetch.
+    // One step of the background thread. It probes when a probe is due,
+    // checks the cutoff, sends a state report when one is due, and, only in
+    // normal with the coordinator answering, registers and refetches.
     // A stop request is honored between every network call.
     void tick(TimeMillis now) {
-        // The second test keeps a clock stepped backwards from stalling the probe.
-        const TimeMillis interval = options_.detector.probeIntervalMillis;
-        if (probedOnce_ && now < nextProbeAtMillis_ && nextProbeAtMillis_ - now <= interval) return;
-        nextProbeAtMillis_ = now + interval;
-        probedOnce_ = true;
-        refreshCredentialAndKey();
-        loadProgramSummaryOnce();
-        const showmesh::CoordinatorUrlLoad url = showmesh::loadCoordinatorBaseUrl(options_.stateDir);
-        // No coordinator is configured, so there is nothing to lose and nothing to fetch.
-        if (!url.ok) return;
+        bool acted = false;
+        std::string baseUrl;
+        if (probeDue(now)) {
+            acted = true;
+            refreshCredentialAndKey();
+            loadProgramSummaryOnce();
+            const showmesh::CoordinatorUrlLoad url = showmesh::loadCoordinatorBaseUrl(options_.stateDir);
+            // No coordinator is configured, so there is nothing to lose and nothing to fetch.
+            if (url.ok) {
+                baseUrl = url.baseUrl;
+                probe(baseUrl, now);
+            }
+        }
+        if (enterRestingAtCutoff(now)) acted = true;
+        // FPP named no playlist for the whole settle window: it is idle, and
+        // the boundary passed while the plugin was down.
+        if (handBack(now, "FPP named no playlist after the plugin started", /*onlyWhenFppStayedIdle=*/true)) {
+            acted = true;
+        }
 
-        const bool reached = probeCoordinator(url.baseUrl);
-        bool wasLost = false;
-        bool isLost = false;
-        bool inFallback = false;
+        bool reachable = false;
+        bool reportDue = false;
+        bool handBackDue = false;
+        bool normal = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            wasLost = detector_.confirmedLost();
-            detector_.recordProbe(reached, now);
-            isLost = detector_.confirmedLost();
-            inFallback = state_.mode == FallbackMode::kFallback;
+            reachable = lastProbeSucceeded_;
+            // No report without a pairing token: there is nobody to report as.
+            reportDue = !tokenHash_.empty() && (reportDue_ || now >= nextPeriodicReportAtMillis_ ||
+                                                nextPeriodicReportAtMillis_ - now > kStateReportIntervalMillis);
+            handBackDue = handBackFetchDue_;
+            normal = state_.mode == FallbackMode::kNormal;
         }
-        if (isLost && !wasLost) {
-            log(true, "coordinator loss confirmed after " + std::to_string(options_.detector.failedProbesToConfirm) +
-                          " or more failed probes");
-        } else if (wasLost && !isLost) {
-            log(false, "coordinator is answering again");
+        if (reachable && !stopRequested_.load()) {
+            if (baseUrl.empty() && (reportDue || (handBackDue && normal))) {
+                const showmesh::CoordinatorUrlLoad url = showmesh::loadCoordinatorBaseUrl(options_.stateDir);
+                if (url.ok) baseUrl = url.baseUrl;
+            }
+            if (!baseUrl.empty()) {
+                // The report is the first request after a recovery, before a fetch and before an observation.
+                if (reportDue) {
+                    sendStateReport(baseUrl, now);
+                    acted = true;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    reportOwedBeforePosts_ = false;
+                    normal = state_.mode == FallbackMode::kNormal;
+                    handBackDue = handBackFetchDue_;
+                }
+                // The hand-back fetch goes at once the first time, then on the
+                // probe cadence like everything else owed to the coordinator.
+                const bool atOnce = handBackDue && handBackFetchAtOnce_.exchange(false);
+                if (normal && !stopRequested_.load() && (probedThisTick_ || atOnce)) {
+                    if (handBackDue) {
+                        handBackFetch(baseUrl, now);
+                        acted = true;
+                    } else {
+                        retryOwedAcknowledgement(baseUrl);
+                        if (!stopRequested_.load()) keepCurrent(baseUrl, now);
+                    }
+                }
+            }
         }
-        if (reached && !inFallback && !stopRequested_.load()) keepCurrent(url.baseUrl, now);
+        probedThisTick_ = false;
+        if (!acted) return;
         refreshNotice(now);
         publishStatus(now);
     }
 
     bool observeEntryEvent(const showmesh::FallbackEntryEvent& event) override {
+        const TimeMillis now = event.observedAtMillis;
+        enterRestingAtCutoff(now);
+        // The boundary of section 5.13: FPP stopped the playlist fallback was
+        // entered under, or names a different one. For a plugin that started
+        // with a saved state, this first callback is also what decides it.
+        bool endedFallback = false;
+        bool resumed = false;
+        RecordedOccurrence interrupted;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            endedFallback = state_.mode != FallbackMode::kNormal &&
+                            (event.action == showmesh::PlaylistAction::kStop ||
+                             (!event.playlistName.empty() && event.playlistName != state_.playlistName));
+            if (undecided_ && !endedFallback && !event.playlistName.empty()) {
+                undecided_ = false;
+                resumed = true;
+                interrupted = state_.occurrence;
+            }
+        }
+        if (endedFallback) handBack(now, "FPP stopped the playlist or named another");
+        if (forgetBoundary_.exchange(false)) {
+            lastBoundary_.reset();
+            occurrenceFinished_ = false;
+        }
+        if (resumed) resumeSavedState(event, interrupted);
+
         switch (event.action) {
             case showmesh::PlaylistAction::kStop:
                 lastBoundary_.reset();
-                leaveFallbackOnPlaylistStop(event.observedAtMillis);
                 break;
             case showmesh::PlaylistAction::kQueryNext:
                 occurrenceFinished_ = true;
@@ -367,21 +518,24 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
             case showmesh::PlaylistAction::kUnknown:
                 break;
         }
-        const bool lost = coordinatorLost();
-        if (lost) {
+        // The stop that ended fallback belongs to an entry that began in it, so it is never posted.
+        bool suspended = endedFallback && event.action == showmesh::PlaylistAction::kStop;
+        {
             std::lock_guard<std::mutex> lock(mutex_);
-            ++coordinatorPostsSkipped_;
+            suspended = suspended || postsSuspendedLocked();
+            if (suspended) ++coordinatorPostsSkipped_;
         }
-        refreshNotice(event.observedAtMillis);
-        publishStatus(event.observedAtMillis);
-        return lost;
+        refreshNotice(now);
+        publishStatus(now);
+        return suspended;
     }
 
     FallbackStatusSnapshot status() const {
         std::lock_guard<std::mutex> lock(mutex_);
         FallbackStatusSnapshot snapshot;
         snapshot.state = state_;
-        snapshot.coordinatorReachable = detector_.reachable();
+        snapshot.waitingForFpp = undecided_;
+        snapshot.coordinatorReachable = lastProbeSucceeded_;
         snapshot.coordinatorLost = detector_.confirmedLost();
         snapshot.executorKeyRegistered = registered_;
         snapshot.executorKeyRegistrationProblem = registrationProblem_;
@@ -390,6 +544,10 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         snapshot.programRevision = programRevision_;
         snapshot.programExpiresAt = programExpiresAt_;
         snapshot.programEnrollsThisExecutor = programEnrollsThisExecutor_;
+        snapshot.stateReportProblem = stateReportProblem_;
+        snapshot.acknowledgementOwed = !acknowledgementProblem_.empty();
+        snapshot.acknowledgementProblem = acknowledgementProblem_;
+        snapshot.stateReportsSent = stateReportsSent_;
         snapshot.activationsAuthorized = activationsAuthorized_;
         snapshot.activationsNotDelivered = activationsNotDelivered_;
         snapshot.coordinatorPostsSkipped = coordinatorPostsSkipped_;
@@ -404,6 +562,8 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         return raisedNotice_;
     }
 
+    const std::string& bootId() const { return bootId_; }
+
  private:
     struct Boundary {
         bool identityResolved = false;
@@ -411,14 +571,22 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         std::optional<int> playlistLoop;
     };
 
+    struct OwedAcknowledgement {
+        FallbackFetchOutcome outcome;
+        std::string verdict;
+        // Package, revision and result: what a refusal is remembered for.
+        std::string copy;
+        bool refused = false;
+    };
+
     struct InstalledProgram {
         bool present = false;
         std::string signedDocument;
         std::string packageId;
         std::string revision;
-        std::string compiledAt;
         std::string expiresAt;
         std::string executorPublicKey;
+        bool rulesKnown = false;
         std::vector<std::string> addresses;
     };
 
@@ -426,12 +594,212 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         if (options_.log) options_.log(isError, line);
     }
 
-    bool probeCoordinator(const std::string& baseUrl) {
+    bool postsSuspendedLocked() const {
+        return state_.mode != FallbackMode::kNormal || detector_.confirmedLost() || reportOwedBeforePosts_;
+    }
+
+    void wakeBackgroundThread() {
+        {
+            std::lock_guard<std::mutex> lock(wakeMutex_);
+            woken_ = true;
+        }
+        wake_.notify_all();
+    }
+
+    // On start a saved fallback or resting state whose cutoff has not passed
+    // is UNDECIDED: FPP loads plugins before it starts any playlist, so what
+    // FPP is playing cannot be read here. Until FPP's first callback or the
+    // settle window decides it, the plugin behaves as the saved state.
+    void restoreSavedState(TimeMillis now) {
+        state_.sinceMillis = now;
+        startedAtMonotonicMillis_ = options_.monotonicClock();
+        FallbackExecutionState saved;
+        const SavedStateRead read = LoadFallbackState(options_.credentialDir, &saved);
+        if (read == SavedStateRead::kNone) return;
+        if (read == SavedStateRead::kUnknownVersion) {
+            log(true, "the saved fallback state was written by another plugin version and is not resumed");
+            SetAsideFallbackState(options_.credentialDir);
+            handBackFetchDue_ = true;
+            reportOwedBeforePosts_ = true;
+            return;
+        }
+        std::int64_t cutoffSeconds = 0;
+        if (!detail::parseRfc3339ToEpochSeconds(saved.cutoffAt, &cutoffSeconds) || now >= cutoffSeconds * 1000) {
+            log(false, "the saved fallback state is over: its plan ran out while the plugin was down; handing back");
+            SaveFallbackState(options_.credentialDir, state_);
+            handBackFetchDue_ = true;
+            reportOwedBeforePosts_ = true;
+            return;
+        }
+        state_ = saved;
+        undecided_ = true;
+        log(true, std::string("started with a saved ") + FallbackModeName(saved.mode) + " state under playlist " +
+                      saved.playlistName + "; waiting for FPP to say what it is playing");
+    }
+
+    // FPP named the saved playlist: the saved state stands. If this callback
+    // is for the recorded entry key, that entry gets no Cue whatever its pass
+    // counter says: FPP's counter starts over with fppd. An entry the restart
+    // interrupted is not tried again.
+    void resumeSavedState(const showmesh::FallbackEntryEvent& event, const RecordedOccurrence& recorded) {
+        log(true, "resumed the saved state: FPP is playing playlist " + event.playlistName);
+        if (!recorded.present) return;
+        if (!recorded.delivered) {
+            showmesh::FallbackEntryEvent entry = event;
+            entry.entryKey = recorded.entryKey;
+            recordPlayerDecision(entry, std::string(), std::string(), kOutcomeInterruptedByRestart);
+            RecordedOccurrence closed = recorded;
+            closed.delivered = true;
+            persistOccurrence(closed);
+        }
+        if (event.identityResolved == recorded.identityResolved && event.entryKey == recorded.entryKey) {
+            lastBoundary_ = Boundary{event.identityResolved, event.entryKey, event.playlistLoop};
+            occurrenceFinished_ = false;
+        }
+    }
+
+    // One writer at a time, and always the state as it is now, so a save
+    // that lost a race never writes an older state back.
+    void saveCurrentState() {
+        std::lock_guard<std::mutex> saveLock(saveMutex_);
+        FallbackExecutionState state;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            state = state_;
+        }
+        const bool saved = options_.writeState ? options_.writeState(options_.credentialDir, state)
+                                               : SaveFallbackState(options_.credentialDir, state);
+        if (!saved) {
+            log(true, "could not save the fallback state; a plugin restart would not resume it");
+        }
+    }
+
+    // Outside normal, and while the coordinator is held as lost, the probe
+    // runs at least every 10 seconds and is never backed off, whatever the
+    // configured interval. A restarted plugin's detector starts fresh, so the
+    // state decides this and not the detector alone.
+    bool probeDue(TimeMillis now) {
+        TimeMillis interval = options_.detector.probeIntervalMillis;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_.mode != FallbackMode::kNormal || detector_.confirmedLost()) {
+                interval = std::min<TimeMillis>(interval, kLostProbeIntervalCapMillis);
+            }
+        }
+        // The last test keeps a clock stepped backwards from stalling the probe.
+        if (probedOnce_ && now < lastProbeAtMillis_ + interval && now >= lastProbeAtMillis_) return false;
+        lastProbeAtMillis_ = now;
+        probedOnce_ = true;
+        return true;
+    }
+
+    void probe(const std::string& baseUrl, TimeMillis now) {
         HttpRequest request;
         request.url = joinUrlPath(baseUrl, kCoordinatorHealthPath);
         request.timeoutMillis = options_.detector.probeTimeoutMillis;
         const HttpResponse response = transport_->get(request);
-        return response.transportOk && response.statusCode >= 200 && response.statusCode <= 299;
+        const bool reached = response.transportOk && response.statusCode >= 200 && response.statusCode <= 299;
+        probedThisTick_ = true;
+        bool wasLost = false;
+        bool isLost = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            wasLost = detector_.confirmedLost();
+            detector_.recordProbe(reached, now);
+            isLost = detector_.confirmedLost();
+            // A probe that succeeds after one that failed: the report goes first.
+            if (reached && !lastProbeSucceeded_) reportDue_ = true;
+            if (isLost) reportOwedBeforePosts_ = true;
+            lastProbeSucceeded_ = reached;
+        }
+        if (isLost && !wasLost) {
+            log(true, "coordinator loss confirmed after " + std::to_string(options_.detector.failedProbesToConfirm) +
+                          " or more failed probes");
+        } else if (wasLost && !isLost) {
+            log(false, "coordinator is answering again");
+        }
+    }
+
+    // The cutoff is the expiresAt of the copy fallback was entered with.
+    // Returns true when this call moved the plugin to resting.
+    bool enterRestingAtCutoff(TimeMillis now) {
+        FallbackExecutionState state;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_.mode != FallbackMode::kFallback) return false;
+            std::int64_t cutoffSeconds = 0;
+            const bool parsed = detail::parseRfc3339ToEpochSeconds(state_.cutoffAt, &cutoffSeconds);
+            if (parsed && now < cutoffSeconds * 1000) return false;
+            state_.rest(now);
+            reportDue_ = true;
+            state = state_;
+        }
+        saveCurrentState();
+        log(true, "reached the cutoff " + state.cutoffAt + "; resting until playlist " + state.playlistName +
+                      " stops");
+        wakeBackgroundThread();
+        return true;
+    }
+
+    // The hand-back: normal first, then the report while the coordinator
+    // answers, then the fetch on the background thread. Either thread may
+    // call it, and it decides and acts under one hold of the lock: the settle
+    // tick does nothing once a callback has decided, and the reverse.
+    bool handBack(TimeMillis now, const char* why, bool onlyWhenFppStayedIdle = false) {
+        bool reachable = false;
+        std::string playlist;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_.mode == FallbackMode::kNormal) return false;
+            if (onlyWhenFppStayedIdle &&
+                (!undecided_ || options_.monotonicClock() - startedAtMonotonicMillis_ < options_.restartSettleMillis)) {
+                return false;
+            }
+            playlist = state_.playlistName;
+            state_.handBack(now);
+            undecided_ = false;
+            handBackFetchDue_ = true;
+            reachable = lastProbeSucceeded_;
+            reportDue_ = !reachable;
+            reportOwedBeforePosts_ = !reachable;
+            handBackFetchAtOnce_.store(true);
+            forgetBoundary_.store(true);
+        }
+        saveCurrentState();
+        log(false, "handed back playlist " + playlist + " at " + std::to_string(static_cast<long long>(now)) + ": " +
+                       why);
+        if (reachable) {
+            const showmesh::CoordinatorUrlLoad url = showmesh::loadCoordinatorBaseUrl(options_.stateDir);
+            if (url.ok) sendStateReport(url.baseUrl, now);
+        }
+        wakeBackgroundThread();
+        return true;
+    }
+
+    // Sends the state as it is at this moment. Reports are never queued.
+    void sendStateReport(const std::string& baseUrl, TimeMillis now) {
+        std::lock_guard<std::mutex> reportLock(reportMutex_);
+        StateReport report;
+        report.bootId = bootId_;
+        report.sequence = ++reportSequence_;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            report.state = state_;
+            reportDue_ = false;
+            nextPeriodicReportAtMillis_ = now + kStateReportIntervalMillis;
+        }
+        const StateReportAnswer answer =
+            SendStateReport(transport_, &credentials_, baseUrl, options_.fppInstanceUuid, report);
+        const std::string problem = StateReportProblem(answer);
+        std::string previous;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            previous = stateReportProblem_;
+            stateReportProblem_ = problem;
+            if (answer.kind != StateReportAnswerKind::kCredentialUnavailable) ++stateReportsSent_;
+        }
+        if (!problem.empty() && problem != previous) log(true, "state report: " + problem);
+        if (problem.empty() && !previous.empty()) log(false, "state report: accepted again");
     }
 
     // A changed pairing token means a new pairing: the key is registered again under it.
@@ -442,9 +810,13 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
             tokenHash_ = tokenHash;
             credentials_.invalidate();
             resetRegistrationBackoff();
+            // A new pairing is one of the two things a refused acknowledgement waits for.
+            if (owedAcknowledgement_.has_value()) owedAcknowledgement_->refused = false;
             std::lock_guard<std::mutex> lock(mutex_);
             registered_ = false;
             registrationAttemptDue_ = true;
+            // The first report goes out as soon as there is a pairing token.
+            reportDue_ = true;
         }
         if (keyCopy().usable()) return;
         ExecutorKeyResult loaded = LoadOrCreateExecutorKey(options_.credentialDir, options_.randomBytes);
@@ -486,8 +858,8 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
 
     void keepCurrent(const std::string& baseUrl, TimeMillis now) {
         // The last test asks again at once when the clock stepped backwards.
-        bool fetchDue =
-            !fetchedOnce_ || now >= nextFetchAtMillis_ || nextFetchAtMillis_ - now > latestFetchDelayMillis_;
+        bool fetchDue = !fetchedOnce_ || now >= nextFetchAtMillis_ ||
+                        nextFetchAtMillis_ - now > options_.programRefetchIntervalMillis;
         const ExecutorKeyResult key = keyCopy();
         bool attemptDue = false;
         {
@@ -501,12 +873,23 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         }
         if (!fetchDue) return;
 
-        const bool enrolled = fetchAndInstall(baseUrl, now, key);
+        const bool enrolled = fetchAndInstall(baseUrl, now, key, /*atHandBack=*/false);
         if (stopRequested_.load()) return;
         // Registered, yet the published program does not carry the key: the
         // coordinator may have lost it, so the flag in memory is not trusted.
         if (programPublished_ && key.usable() && registeredNow() && !enrolled && now >= nextRegistrationAtMillis_) {
             if (registerKey(baseUrl, key.key, now)) nextFetchAtMillis_ = now;
+        }
+    }
+
+    // Hand-back step 3: fetch at once, acknowledge the copy then held whether
+    // or not it changed, and hand it to the nodes. Owed until the coordinator answers.
+    void handBackFetch(const std::string& baseUrl, TimeMillis now) {
+        const ExecutorKeyResult key = keyCopy();
+        fetchAndInstall(baseUrl, now, key, /*atHandBack=*/true);
+        if (lastFetchReachedCoordinator_) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            handBackFetchDue_ = false;
         }
     }
 
@@ -559,10 +942,11 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
     }
 
     // Returns whether the installed program carries this host's key.
-    bool fetchAndInstall(const std::string& baseUrl, TimeMillis now, const ExecutorKeyResult& key) {
+    bool fetchAndInstall(const std::string& baseUrl, TimeMillis now, const ExecutorKeyResult& key, bool atHandBack) {
         fetchedOnce_ = true;
+        lastFetchReachedCoordinator_ = false;
+        nextFetchAtMillis_ = now + options_.programRefetchIntervalMillis;
         const InstalledProgram before = readInstalledProgram();
-        scheduleNextFetch(now, before);
         if (options_.pinnedKey.status != PinnedKeyLoadStatus::kLoaded) {
             if (!pinnedKeyProblemLogged_) {
                 log(true, std::string("no usable fallback program: ") +
@@ -570,37 +954,57 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
                               ")");
             }
             pinnedKeyProblemLogged_ = true;
+            // Nothing can be fetched or acknowledged without the key, so nothing is owed.
+            lastFetchReachedCoordinator_ = true;
             return false;
         }
 
+        const InstalledProgramIdentity identity{before.packageId, before.revision, before.expiresAt};
         const FallbackFetchOutcome outcome = FetchAndInstallFallbackProgram(
             transport_, &credentials_, baseUrl, options_.fppInstanceUuid, options_.pinnedKey.publicKey,
-            options_.installPath, options_.clock, before.present ? &before.signedDocument : nullptr);
+            options_.installPath, options_.clock, before.present ? &identity : nullptr);
+        lastFetchReachedCoordinator_ = outcome.kind != FallbackFetchOutcomeKind::kTransportUnreachable &&
+                                       outcome.kind != FallbackFetchOutcomeKind::kCredentialUnavailable;
         const std::string outcomeLine =
             std::string("program fetch: ") + FallbackFetchOutcomeKindName(outcome.kind) + ": " + outcome.detail;
         if (outcomeLine != lastFetchOutcomeLine_) log(false, outcomeLine);
         lastFetchOutcomeLine_ = outcomeLine;
         programPublished_ = outcome.kind == FallbackFetchOutcomeKind::kInstalled ||
                             outcome.kind == FallbackFetchOutcomeKind::kUnchanged;
-        // The same program again: nothing is rewritten, acknowledged or handed out.
-        if (outcome.kind == FallbackFetchOutcomeKind::kUnchanged) return rememberProgram(before, key);
+        const bool installed = outcome.kind == FallbackFetchOutcomeKind::kInstalled;
 
-        // One acknowledge per verdict on a program, not one per fetch of a program still refused.
+        // One acknowledge per verdict on a program, not one per fetch of a
+        // program still refused. An unchanged copy is acknowledged only at a hand-back.
         const std::string verdict = outcome.packageId + "/" + outcome.revision + "/" +
                                     FallbackFetchOutcomeVerificationResult(outcome.kind);
-        const bool newVerdict = outcome.kind == FallbackFetchOutcomeKind::kInstalled || verdict != lastAcknowledged_;
-        if (ShouldAcknowledgeFallbackFetchOutcome(outcome) && newVerdict && !stopRequested_.load()) {
-            const AcknowledgeResult ack = AcknowledgeFallbackProgram(transport_, &credentials_, baseUrl,
-                                                                     options_.fppInstanceUuid, outcome, options_.clock);
-            if (ack.ok) lastAcknowledged_ = verdict;
-            if (!ack.ok) log(true, "acknowledge failed: " + ack.error);
+        const bool heldCopyAtHandBack = atHandBack && programPublished_;
+        const bool newVerdict = installed || verdict != lastAcknowledged_;
+        // A newly installed copy is the other.
+        if (installed && owedAcknowledgement_.has_value()) owedAcknowledgement_->refused = false;
+        if ((heldCopyAtHandBack || (ShouldAcknowledgeFallbackFetchOutcome(outcome) && newVerdict)) &&
+            !stopRequested_.load()) {
+            acknowledge(baseUrl, outcome, verdict);
         }
-        if (outcome.kind != FallbackFetchOutcomeKind::kInstalled) return rememberProgram(before, key);
-
-        const InstalledProgram program = readInstalledProgram();
+        const InstalledProgram program = installed ? readInstalledProgram() : before;
+        // At a hand-back the fetch may have found nothing new while a copy is
+        // still held: that copy is acknowledged, unless it has expired. An
+        // expired copy is never called verified.
+        std::int64_t heldExpiresAt = 0;
+        const bool heldCopyCurrent = program.present &&
+                                     detail::parseRfc3339ToEpochSeconds(program.expiresAt, &heldExpiresAt) &&
+                                     now < heldExpiresAt * 1000;
+        if (atHandBack && !programPublished_ && lastFetchReachedCoordinator_ && heldCopyCurrent &&
+            !stopRequested_.load()) {
+            FallbackFetchOutcome held;
+            held.kind = FallbackFetchOutcomeKind::kUnchanged;
+            held.packageId = program.packageId;
+            held.revision = program.revision;
+            acknowledge(baseUrl, held, std::string());
+        }
         const bool enrolled = rememberProgram(program, key);
-        scheduleNextFetch(now, program);
-        resetRegistrationBackoff();
+        if (!installed && !heldCopyAtHandBack) return enrolled;
+
+        if (installed) resetRegistrationBackoff();
         for (const std::string& address : program.addresses) {
             if (stopRequested_.load()) break;
             const NodeAnswer answer =
@@ -616,18 +1020,44 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         return enrolled;
     }
 
-    // The configured interval, or one third of the program's validity when that is sooner.
-    void scheduleNextFetch(TimeMillis now, const InstalledProgram& program) {
-        TimeMillis delay = options_.programRefetchIntervalMillis;
-        std::int64_t compiledAt = 0;
-        std::int64_t expiresAt = 0;
-        if (program.present && detail::parseRfc3339ToEpochSeconds(program.compiledAt, &compiledAt) &&
-            detail::parseRfc3339ToEpochSeconds(program.expiresAt, &expiresAt) && expiresAt > compiledAt) {
-            const TimeMillis validityMillis = static_cast<TimeMillis>(expiresAt - compiledAt) * 1000;
-            delay = std::min(delay, validityMillis * kRefetchValidityNumerator / kRefetchValidityDenominator);
+    // An acknowledgement that got no success answer stays owed: the
+    // coordinator holds a handed-back player until it lands. One the
+    // coordinator refused is not sent again for the same copy until then.
+    void acknowledge(const std::string& baseUrl, const FallbackFetchOutcome& outcome, const std::string& verdict) {
+        const std::string copy = outcome.packageId + "/" + outcome.revision + "/" +
+                                 FallbackFetchOutcomeVerificationResult(outcome.kind);
+        if (owedAcknowledgement_.has_value() && owedAcknowledgement_->refused && owedAcknowledgement_->copy == copy) {
+            return;
         }
-        latestFetchDelayMillis_ = std::max<TimeMillis>(delay, options_.detector.probeIntervalMillis);
-        nextFetchAtMillis_ = now + latestFetchDelayMillis_;
+        const AcknowledgeResult ack = AcknowledgeFallbackProgram(transport_, &credentials_, baseUrl,
+                                                                 options_.fppInstanceUuid, outcome, options_.clock);
+        if (ack.ok) {
+            if (!verdict.empty()) lastAcknowledged_ = verdict;
+            if (owedAcknowledgement_.has_value()) log(false, "acknowledge sent");
+            owedAcknowledgement_.reset();
+            setAcknowledgementProblem(std::string());
+            return;
+        }
+        const bool refused = AcknowledgementRefused(ack.statusCode);
+        if (refused) {
+            log(true, "acknowledge refused, not tried again until the next pairing or the next new copy: " + ack.error);
+        } else if (!owedAcknowledgement_.has_value()) {
+            log(true, "acknowledge failed, tried again at every probe: " + ack.error);
+        }
+        owedAcknowledgement_ = OwedAcknowledgement{outcome, verdict, copy, refused};
+        setAcknowledgementProblem(refused ? AcknowledgementRefusedMessage(ack.statusCode)
+                                          : std::string(kAcknowledgementWaitingMessage));
+    }
+
+    void retryOwedAcknowledgement(const std::string& baseUrl) {
+        if (!owedAcknowledgement_.has_value()) return;
+        const OwedAcknowledgement owed = *owedAcknowledgement_;
+        acknowledge(baseUrl, owed.outcome, owed.verdict);
+    }
+
+    void setAcknowledgementProblem(const std::string& problem) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        acknowledgementProblem_ = problem;
     }
 
     InstalledProgram readInstalledProgram() const {
@@ -645,9 +1075,15 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         program.signedDocument = read.rawDocument;
         program.packageId = text(*body, "packageId");
         program.revision = text(*body, "revision");
-        program.compiledAt = text(*body, "compiledAt");
         program.expiresAt = text(*body, "expiresAt");
         program.executorPublicKey = text(*body, "executorPublicKey");
+        const showmesh::json::Value* rules = detail::findMember(*body, "rules");
+        program.rulesKnown = rules != nullptr && rules->type() == showmesh::json::Type::kObject &&
+                             rules->members().size() == 4 &&
+                             text(*rules, "fallbackBoundary") == kRuleFallbackBoundary &&
+                             text(*rules, "restHold") == kRuleRestHold &&
+                             text(*rules, "localShutdown") == kRuleLocalShutdown &&
+                             text(*rules, "recoveryBoundary") == kRuleRecoveryBoundary;
         const showmesh::json::Value* entries = detail::findMember(*body, "entries");
         if (entries == nullptr || entries->type() != showmesh::json::Type::kArray) return program;
         for (const showmesh::json::Value& entry : entries->items()) {
@@ -666,21 +1102,24 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         return program;
     }
 
-    // This player's outcome word for what stops it starting any cue right
-    // now, or empty when it holds everything a delivery needs.
-    std::string readinessProblem(TimeMillis nowMillis) const {
+    // Section 5.13's usable program: installed, verified, before its expiry,
+    // carrying this player's key, with exactly the four known rule values.
+    // Returns this player's outcome word for what is missing, or empty.
+    std::string usableProgramProblem(TimeMillis nowMillis) const {
         if (options_.pinnedKey.status != PinnedKeyLoadStatus::kLoaded) return kOutcomeNoCoordinatorKey;
         const auto now = std::chrono::system_clock::time_point(std::chrono::milliseconds(nowMillis));
-        const ActivationResolution probe =
+        const ActivationResolution installed =
             ResolveInstalledActivation(std::string(), options_.installPath, options_.pinnedKey.publicKey, now);
-        if (probe.kind == ActivationResolveKind::kNoProgramInstalled ||
-            probe.kind == ActivationResolveKind::kProgramFailedReverification ||
-            probe.kind == ActivationResolveKind::kProgramExpired) {
-            return PlayerOutcomeWord(probe.kind);
+        if (installed.kind == ActivationResolveKind::kNoProgramInstalled ||
+            installed.kind == ActivationResolveKind::kProgramFailedReverification ||
+            installed.kind == ActivationResolveKind::kProgramExpired) {
+            return PlayerOutcomeWord(installed.kind);
         }
         const ExecutorKeyResult key = keyCopy();
         if (!key.usable()) return kOutcomeNoPlayerKey;
-        if (readInstalledProgram().executorPublicKey != key.key.publicKeyBase64) return kOutcomePlayerKeyNotInProgram;
+        const InstalledProgram program = readInstalledProgram();
+        if (program.executorPublicKey != key.key.publicKeyBase64) return kOutcomePlayerKeyNotInProgram;
+        if (!program.rulesKnown) return kOutcomeProgramRulesUnknown;
         return std::string();
     }
 
@@ -698,27 +1137,24 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
     }
 
     void onEntryBoundary(const showmesh::FallbackEntryEvent& event) {
-        bool entered = false;
         FallbackMode mode = FallbackMode::kNormal;
+        bool lost = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (state_.mode == FallbackMode::kNormal && detector_.confirmedLost()) {
-                state_.enter(event.observedAtMillis, event.entryKey);
-                entered = true;
-            }
             mode = state_.mode;
+            lost = detector_.confirmedLost();
         }
-        if (entered) log(true, "entered fallback at entryKey=" + event.entryKey);
         const ExecutorKeyResult key = keyCopy();
 
         ActivationResolution resolution;
-        std::string problem = kOutcomeEntryNotIdentified;
-        std::string detailForLog = "identity not resolved";
-        if (event.identityResolved && options_.pinnedKey.status != PinnedKeyLoadStatus::kLoaded) {
-            problem = kOutcomeNoCoordinatorKey;
-            detailForLog =
-                std::string(PinnedKeyLoadStatusName(options_.pinnedKey.status)) + " " + options_.pinnedKey.error;
-        } else if (event.identityResolved) {
+        std::string problem = usableProgramProblem(event.observedAtMillis);
+        std::string detailForLog = problem;
+        if (mode == FallbackMode::kResting) {
+            problem = kOutcomeResting;
+        } else if (problem.empty() && !event.identityResolved) {
+            problem = kOutcomeEntryNotIdentified;
+            detailForLog = "identity not resolved";
+        } else if (problem.empty()) {
             const auto now = std::chrono::system_clock::time_point(std::chrono::milliseconds(event.observedAtMillis));
             resolution =
                 ResolveInstalledActivation(event.entryKey, options_.installPath, options_.pinnedKey.publicKey, now);
@@ -727,20 +1163,28 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         }
         log(false, detailForLog + " entryKey=" + event.entryKey +
                        " observedAtMillis=" + std::to_string(static_cast<long long>(event.observedAtMillis)));
-        if (mode != FallbackMode::kFallback) return;
+        // In normal with the coordinator answering, or not confirmed lost, the entry is the coordinator's.
+        if (mode == FallbackMode::kNormal && !lost) return;
 
-        if (problem.empty() && !key.usable()) problem = kOutcomeNoPlayerKey;
-        if (problem.empty() && resolution.match->executorPublicKey() != key.key.publicKeyBase64) {
-            problem = kOutcomePlayerKeyNotInProgram;
-        }
         if (!problem.empty()) {
+            // Outside fallback this is why it was not entered. Inside, why this entry got nothing.
             const bool nothingMapped = problem == kOutcomeUnknownEntry;
             recordPlayerDecision(event, std::string(), std::string(), problem);
             setBoundaryResult(nothingMapped ? BoundaryResult::kNothingToStart : BoundaryResult::kNotStarted,
                               nothingMapped ? std::string() : problem);
             return;
         }
-        deliverMatch(event, *resolution.match, key.key);
+        const ActivationMatch& match = *resolution.match;
+        if (mode == FallbackMode::kNormal) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                state_.enter(event.observedAtMillis, event.playlistName, match.packageId(), match.revision(),
+                             match.programExpiresAt());
+                reportDue_ = true;
+            }
+            log(true, "entered fallback under playlist " + event.playlistName + " at entryKey=" + event.entryKey);
+        }
+        deliverMatch(event, match, key.key);
     }
 
     void setBoundaryResult(BoundaryResult result, const std::string& problem) {
@@ -749,29 +1193,35 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         state_.lastBoundaryProblem = problem;
     }
 
-    void deliverMatch(const showmesh::FallbackEntryEvent& event, const ActivationMatch& match,
-                      const ExecutorKey& key) {
+    void deliverMatch(const showmesh::FallbackEntryEvent& event, const ActivationMatch& match, const ExecutorKey& key) {
         struct Delivery {
             FallbackRecord record;
             std::string body;
         };
         std::vector<Delivery> deliveries;
         std::string firstProblem;
+        RecordedOccurrence occurrence;
+        occurrence.present = true;
+        occurrence.identityResolved = event.identityResolved;
+        occurrence.entryKey = event.entryKey;
+        occurrence.playlistLoop = event.playlistLoop;
         for (const ActivationTarget& target : match.targets()) {
             std::string problem;
-            uint8_t random[16];
             std::string signature;
             std::string executionId;
             ActivationRequestBuild build;
             if (!target.address.has_value()) {
                 problem = kOutcomeNoAddress;
             } else {
-                const bool haveId = options_.randomBytes != nullptr && options_.randomBytes(random, sizeof(random));
-                executionId = haveId ? formatExecutionId(random) : std::string();
+                uint8_t random[16];
+                if (executionId.empty() && options_.randomBytes != nullptr &&
+                    options_.randomBytes(random, sizeof(random))) {
+                    executionId = formatExecutionId(random);
+                }
                 build = BuildActivationRequest(match, target, executionId);
                 if (!build.ok) {
                     problem = kOutcomeIncompleteProgram;
-                } else if (!haveId || !signWithExecutorKey(key, build.canonical, &signature)) {
+                } else if (executionId.empty() || !signWithExecutorKey(key, build.canonical, &signature)) {
                     problem = kOutcomeSigningFailed;
                 }
             }
@@ -780,6 +1230,7 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
                 recordPlayerDecision(event, target.nodeId, target.address.value_or(std::string()), problem);
                 continue;
             }
+            occurrence.executionIds.emplace_back(target.nodeId, executionId);
             Delivery delivery;
             delivery.record.atMillis = event.observedAtMillis;
             delivery.record.entryKey = event.entryKey;
@@ -790,11 +1241,22 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
             deliveries.push_back(std::move(delivery));
         }
 
+        // On disk before the first activation leaves, so a restart can tell
+        // what was already sent and with which ids.
+        persistOccurrence(occurrence);
+
+        // The cutoff is checked before every request, so no retry and no
+        // program leaves for a node after it.
+        std::int64_t cutoffSeconds = 0;
+        const TimeMillis cutoffMillis =
+            detail::parseRfc3339ToEpochSeconds(match.programExpiresAt(), &cutoffSeconds) ? cutoffSeconds * 1000 : 0;
+
         // One thread per node, so a node that does not answer never delays another node's activation.
         auto run = [&](Delivery* delivery) {
             const NodeDeliveryResult result = DeliverActivation(
                 transport_, delivery->record.address, delivery->body, match.fppInstanceUuid(), match.signedDocument(),
-                options_.pause ? options_.pause : DeliveryPause([this](int millis) { return waitOrStop(millis); }));
+                options_.pause ? options_.pause : DeliveryPause([this](int millis) { return waitOrStop(millis); }),
+                [this, cutoffMillis] { return options_.clock() < cutoffMillis; });
             delivery->record.outcome = result.outcome;
             delivery->record.reason = result.reason;
             delivery->record.nodeAnswered = result.nodeAnswered();
@@ -806,14 +1268,28 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         for (std::thread& thread : threads) thread.join();
 
         std::size_t started = 0;
+        bool stopped = false;
         for (const Delivery& delivery : deliveries) {
             if (delivery.record.outcome == "authorized") ++started;
+            if (delivery.record.outcome == kOutcomeStopped) stopped = true;
             appendRecord(delivery.record, "activation", &recentActivations_, kRecentActivationRecords);
         }
+        // A delivery cut short by a plugin stop stays unfinished on disk, so the next start retries it.
+        occurrence.delivered = !stopped;
+        persistOccurrence(occurrence);
         setBoundaryResult(started == match.targets().size() ? BoundaryResult::kStarted
-                          : started > 0                     ? BoundaryResult::kStartedOnSomeNodes
-                                                            : BoundaryResult::kNotStarted,
+                          : started > 0    ? BoundaryResult::kStartedOnSomeNodes
+                                           : BoundaryResult::kNotStarted,
                           deliveries.empty() ? firstProblem : std::string());
+    }
+
+    void persistOccurrence(const RecordedOccurrence& occurrence) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_.mode != FallbackMode::kFallback) return;
+            state_.occurrence = occurrence;
+        }
+        saveCurrentState();
     }
 
     bool waitOrStop(int millis) {
@@ -846,35 +1322,27 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         while (list->size() > limit) list->pop_front();
     }
 
-    void leaveFallbackOnPlaylistStop(TimeMillis now) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (state_.mode != FallbackMode::kFallback) return;
-            state_.leaveOnPlaylistStop();
-        }
-        log(false, "left fallback: the playlist stopped at " + std::to_string(static_cast<long long>(now)));
-    }
-
     // Keeps exactly one notice raised: the one that is true now, or none.
     // The state is read while holding the lock that guards the raise, so the
     // last caller to finish is the one with the newest state.
     void refreshNotice(TimeMillis now) {
         std::lock_guard<std::mutex> noticeLock(noticeMutex_);
-        FallbackExecutionState state;
-        bool lost = false;
+        NoticeFacts facts;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            state = state_;
-            lost = detector_.confirmedLost();
+            facts.state = state_;
+            facts.coordinatorLost = detector_.confirmedLost();
+            facts.coordinatorReachable = lastProbeSucceeded_;
+            facts.waitingForFpp = undecided_;
         }
-        std::string problem;
-        if (state.mode == FallbackMode::kFallback || lost) {
-            problem = readinessProblem(now);
-            if (problem.empty() && state.lastBoundary == BoundaryResult::kNotStarted) {
-                problem = state.lastBoundaryProblem;
+        if (facts.state.mode == FallbackMode::kFallback || (facts.state.mode == FallbackMode::kNormal && facts.coordinatorLost)) {
+            facts.problem = usableProgramProblem(now);
+            if (facts.problem.empty() && facts.state.mode == FallbackMode::kFallback &&
+                facts.state.lastBoundary == BoundaryResult::kNotStarted) {
+                facts.problem = facts.state.lastBoundaryProblem;
             }
         }
-        const std::string wanted = FallbackNotice(state.mode, lost, problem, state.lastBoundary);
+        const std::string wanted = FallbackNotice(facts);
         if (wanted == raisedNotice_) return;
         if (options_.notifier != nullptr) {
             if (!raisedNotice_.empty()) options_.notifier->clear(raisedNotice_);
@@ -911,11 +1379,17 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         using showmesh::json::Value;
         auto number = [](std::uint64_t n) { return Value::makeNumber(static_cast<double>(n)); };
         const showmesh::json::CanonicalResult body = showmesh::json::canonicalize(Value::makeObject({
-            {"mode", Value::makeString(FallbackModeName(snapshot.state.mode))},
+            {"state", Value::makeString(FallbackModeName(snapshot.state.mode))},
             {"message", Value::makeString(notice())},
+            {"sinceMillis", Value::makeNumber(static_cast<double>(snapshot.state.sinceMillis))},
+            {"playlistName", Value::makeString(snapshot.state.playlistName)},
+            {"cutoffAt", Value::makeString(snapshot.state.cutoffAt)},
+            {"waitingForFppAfterRestart", Value::makeBool(snapshot.waitingForFpp)},
             {"coordinatorReachable", Value::makeBool(snapshot.coordinatorReachable)},
             {"coordinatorLost", Value::makeBool(snapshot.coordinatorLost)},
-            {"enteredFallbackAtMillis", Value::makeNumber(static_cast<double>(snapshot.state.enteredAtMillis))},
+            {"stateReportProblem", Value::makeString(snapshot.stateReportProblem)},
+            {"acknowledgementOwed", Value::makeBool(snapshot.acknowledgementOwed)},
+            {"acknowledgementProblem", Value::makeString(snapshot.acknowledgementProblem)},
             {"executorKeyRegistered", Value::makeBool(snapshot.executorKeyRegistered)},
             {"executorKeyRegistrationProblem", Value::makeString(snapshot.executorKeyRegistrationProblem)},
             {"executorPublicKey", Value::makeString(snapshot.executorPublicKey)},
@@ -941,13 +1415,28 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
     FallbackExecutorOptions options_;
     HttpTransport* transport_;
     showmesh::FileCredentialSource credentials_;
+    std::string bootId_;
 
     // Guards everything both threads read: the detector, the state object,
-    // the key, the registration flags, the program summary and the records.
+    // the key, the report and registration flags, the program summary and the records.
     mutable std::mutex mutex_;
     CoordinatorOutageDetector detector_;
     FallbackExecutionState state_;
     ExecutorKeyResult key_;
+    bool lastProbeSucceeded_ = false;
+    // A state report is owed now: on start, on a state change, after a recovered probe.
+    bool reportDue_ = true;
+    TimeMillis nextPeriodicReportAtMillis_ = 0;
+    // The report that must be the first request after a recovery has not gone out yet.
+    bool reportOwedBeforePosts_ = false;
+    // Hand-back step 3 is owed: fetch at once and acknowledge the copy then held.
+    bool handBackFetchDue_ = false;
+    // Started with a saved state that FPP has not yet confirmed or ended.
+    bool undecided_ = false;
+    TimeMillis startedAtMonotonicMillis_ = 0;
+    std::string stateReportProblem_;
+    std::string acknowledgementProblem_;
+    std::uint64_t stateReportsSent_ = 0;
     bool registered_ = false;
     std::string registrationProblem_;
     bool registrationAttemptDue_ = true;
@@ -961,26 +1450,36 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
     std::deque<FallbackRecord> recentActivations_;
     std::deque<FallbackRecord> recentProgramHandOffs_;
 
+    // One report at a time, so sequence numbers leave in order.
+    std::mutex reportMutex_;
+    std::int64_t reportSequence_ = 0;
+    // One writer of the state file at a time.
+    std::mutex saveMutex_;
+    // Set by a hand-back on either thread; the worker then forgets the entry it last acted on.
+    std::atomic<bool> forgetBoundary_{false};
+    std::atomic<bool> handBackFetchAtOnce_{false};
+
     // Background thread only.
     bool probedOnce_ = false;
-    TimeMillis nextProbeAtMillis_ = 0;
+    bool probedThisTick_ = false;
+    TimeMillis lastProbeAtMillis_ = 0;
     bool fetchedOnce_ = false;
     // True when the last fetch found a published program, new or unchanged.
     bool programPublished_ = false;
+    bool lastFetchReachedCoordinator_ = false;
     bool programSummaryLoaded_ = false;
     TimeMillis nextFetchAtMillis_ = 0;
-    // How far ahead the last fetch scheduled the next one. A longer wait means the clock stepped back.
-    TimeMillis latestFetchDelayMillis_ = 0;
     TimeMillis nextRegistrationAtMillis_ = 0;
     TimeMillis registrationBackoffMillis_ = 0;
     std::string lastRegistrationAnswer_;
     std::string lastFetchOutcomeLine_;
     std::string lastAcknowledged_;
+    std::optional<OwedAcknowledgement> owedAcknowledgement_;
     std::string tokenHash_;
     std::string keyProblem_;
     bool pinnedKeyProblemLogged_ = false;
 
-    // Runtime worker thread only.
+    // Runtime worker thread only, after construction.
     std::optional<Boundary> lastBoundary_;
     bool occurrenceFinished_ = false;
 
@@ -994,6 +1493,7 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
     std::atomic<bool> stopRequested_{false};
     std::mutex wakeMutex_;
     std::condition_variable wake_;
+    bool woken_ = false;
 };
 
 }  // namespace fallback

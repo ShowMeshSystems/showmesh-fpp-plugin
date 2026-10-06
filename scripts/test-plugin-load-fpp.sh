@@ -260,7 +260,7 @@ RESULTS_STATUS=()
 if [ -n "$ADAPTER_OBJECT" ]; then
     EXPECTED_ASSERTIONS=1
 else
-    EXPECTED_ASSERTIONS=9
+    EXPECTED_ASSERTIONS=11
 fi
 SUMMARY_PRINTED=0
 SUMMARY_FAILED=0
@@ -1249,6 +1249,149 @@ a9() {
 }
 
 # ---------------------------------------------------------------------------
+# A10 / A11: a saved fallback state across a real fppd restart
+#
+# fppd loads plugins before its main loop starts any playlist, so a plugin
+# cannot read what FPP is playing when it is constructed. These two restart
+# fppd in place (the scripts FPP's own restart uses, not a container recreate,
+# so /etc survives) and read what the plugin itself decided from FPP's
+# callbacks: resumed when the scheduler starts the saved playlist again, and
+# handed back when FPP stays idle for the settle window.
+# ---------------------------------------------------------------------------
+
+RESUME_PLAYLIST="ShowMeshResume"
+FALLBACK_STATE_FILE="/etc/showmesh-fpp-plugin/fallback-state.json"
+FALLBACK_STATUS_FILE="/home/fpp/media/plugindata/fpp-showmesh/fallback-status.json"
+# kHypothesisRestartSettleMillis in native/adapters/shared/fallback_executor.h.
+RESTART_SETTLE_SECONDS=30
+
+fpp_status() {
+    curl -fsS --max-time 5 "http://localhost:${BENCH_HTTP_PORT}/api/fppd/status" 2>/dev/null | jq -r "$1" 2>/dev/null || true
+}
+
+plugin_fallback_status() {
+    docker exec "$CONTAINER" cat "$FALLBACK_STATUS_FILE" 2>/dev/null | jq -r "$1" 2>/dev/null || true
+}
+
+write_saved_fallback_state() {
+    local cutoff since
+    cutoff="$(docker exec "$CONTAINER" date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"
+    since="$(docker exec "$CONTAINER" date +%s)000"
+    docker exec "$CONTAINER" sh -c "mkdir -p /etc/showmesh-fpp-plugin && chmod 700 /etc/showmesh-fpp-plugin"
+    echo "{\"version\":1,\"state\":\"fallback\",\"playlistName\":\"${RESUME_PLAYLIST}\",\"sinceMillis\":${since},\"packageId\":\"bench-package\",\"packageRevision\":\"bench-revision\",\"cutoffAt\":\"${cutoff}\"}" |
+        docker exec -i "$CONTAINER" sh -c "umask 077; cat > $FALLBACK_STATE_FILE"
+}
+
+set_schedule() {
+    echo "$1" | docker exec -i "$CONTAINER" sh -c "cat > /home/fpp/media/config/schedule.json"
+    curl -fsS -o /dev/null --max-time 5 -X POST "http://localhost:${BENCH_HTTP_PORT}/api/schedule/reload" || true
+}
+
+restart_fppd_in_place() {
+    docker exec "$CONTAINER" /opt/fpp/scripts/fppd_stop >/dev/null 2>&1 || true
+    sleep 2
+    docker exec "$CONTAINER" /opt/fpp/scripts/fppd_start >/dev/null 2>&1 || true
+    wait_for_http 60
+}
+
+# Milliseconds between the first fppd.log line matching $2 and the first
+# matching $3, in the log text $1. Empty when either is missing.
+log_millis_between() {
+    echo "$1" | awk -v a="$2" -v b="$3" '
+        function ms(t,   p) { split(t, p, /[:.]/); return ((p[1] * 60 + p[2]) * 60 + p[3]) * 1000 + p[4] }
+        index($0, a) && ta == "" { ta = ms($2) }
+        index($0, b) && tb == "" { tb = ms($2) }
+        END { if (ta != "" && tb != "") print tb - ta }'
+}
+
+wait_for() {
+    local tries="$1"
+    shift
+    local i=0
+    while [ "$i" -lt "$tries" ]; do
+        if "$@"; then return 0; fi
+        i=$((i + 1))
+        sleep 1
+    done
+    return 1
+}
+
+fpp_is_playing_resume_playlist() { [ "$(fpp_status .current_playlist.playlist)" = "$RESUME_PLAYLIST" ]; }
+fpp_is_idle() { [ "$(fpp_status .status_name)" = "idle" ]; }
+plugin_state_is() { [ "$(plugin_fallback_status .state)" = "$1" ]; }
+
+a10_a11() {
+    local resumed_name="A10_restart_resumes_saved_fallback_state"
+    local idle_name="A11_idle_restart_hands_back_after_settle_window"
+
+    echo "{\"name\":\"${RESUME_PLAYLIST}\",\"version\":3,\"repeat\":1,\"loopCount\":0,\"empty\":false,\"desc\":\"bench\",\"random\":0,\"leadIn\":[],\"mainPlaylist\":[{\"type\":\"pause\",\"enabled\":1,\"playOnce\":0,\"duration\":20},{\"type\":\"pause\",\"enabled\":1,\"playOnce\":0,\"duration\":20}],\"leadOut\":[],\"playlistInfo\":{\"total_duration\":40,\"total_items\":2}}" |
+        docker exec -i "$CONTAINER" sh -c "cat > /home/fpp/media/playlists/${RESUME_PLAYLIST}.json"
+    set_schedule "[{\"enabled\":1,\"sequence\":0,\"day\":7,\"playlist\":\"${RESUME_PLAYLIST}\",\"startTime\":\"00:00:00\",\"endTime\":\"24:00:00\",\"repeat\":1,\"repeatInterval\":0,\"stopType\":0,\"startDate\":\"2020-01-01\",\"endDate\":\"2099-12-31\",\"startTimeOffset\":0,\"endTimeOffset\":0,\"type\":\"playlist\",\"args\":[]}]"
+    if ! wait_for 30 fpp_is_playing_resume_playlist; then
+        record "$resumed_name" "FAIL" "FPP's scheduler did not start the bench playlist, so there is nothing to resume: status $(fpp_status .status_name)"
+        record "$idle_name" "FAIL" "not evaluated: the bench playlist never played"
+        return
+    fi
+
+    # A10: FPP is playing the playlist the saved state names; fppd restarts.
+    local offset tail_log millis
+    write_saved_fallback_state
+    offset="$(fppd_log_line_count)"
+    if ! restart_fppd_in_place; then
+        record "$resumed_name" "FAIL" "fppd did not come back after an in-place restart"
+        record "$idle_name" "FAIL" "not evaluated: fppd did not come back"
+        return
+    fi
+    wait_for 20 plugin_state_is fallback || true
+    wait_for 20 fpp_is_playing_resume_playlist || true
+    sleep 2
+    tail_log="$(fppd_log_since "$offset")"
+    millis="$(log_millis_between "$tail_log" "started with a saved fallback state" "resumed the saved state")"
+    if ! echo "$tail_log" | grep -qF "resumed the saved state: FPP is playing playlist ${RESUME_PLAYLIST}"; then
+        record "$resumed_name" "FAIL" "no resume line in the fppd.log tail written by this restart; plugin state is '$(plugin_fallback_status .state)', FPP is '$(fpp_status .status_name)' playing '$(fpp_status .current_playlist.playlist)'"
+    elif ! plugin_state_is fallback || [ "$(plugin_fallback_status .playlistName)" != "$RESUME_PLAYLIST" ]; then
+        record "$resumed_name" "FAIL" "the plugin's status says state '$(plugin_fallback_status .state)' under '$(plugin_fallback_status .playlistName)' after the restart, want fallback under ${RESUME_PLAYLIST}"
+    elif ! docker exec "$CONTAINER" test -f "$FALLBACK_STATE_FILE"; then
+        record "$resumed_name" "FAIL" "the saved state file is gone although the plugin resumed"
+    else
+        record "$resumed_name" "PASS" "after an in-place fppd restart the scheduler started ${RESUME_PLAYLIST} again and the plugin's status says fallback under it; FPP's first callback came ${millis:-?} ms after the plugin loaded"
+    fi
+
+    # A11: nothing is scheduled and nothing plays; fppd restarts.
+    set_schedule "[]"
+    curl -fsS -o /dev/null --max-time 5 "http://localhost:${BENCH_HTTP_PORT}/api/playlists/stop" || true
+    if ! wait_for 30 fpp_is_idle; then
+        record "$idle_name" "FAIL" "FPP did not go idle after the schedule was emptied and the playlist stopped: status $(fpp_status .status_name)"
+        return
+    fi
+    write_saved_fallback_state
+    offset="$(fppd_log_line_count)"
+    if ! restart_fppd_in_place; then
+        record "$idle_name" "FAIL" "fppd did not come back after an in-place restart"
+        return
+    fi
+    local early_state
+    wait_for 10 plugin_state_is fallback || true
+    early_state="$(plugin_fallback_status .state)"
+    wait_for $((RESTART_SETTLE_SECONDS + 20)) plugin_state_is normal || true
+    sleep 1
+    tail_log="$(fppd_log_since "$offset")"
+    millis="$(log_millis_between "$tail_log" "started with a saved fallback state" "FPP named no playlist after the plugin started")"
+    if [ "$early_state" != "fallback" ]; then
+        record "$idle_name" "FAIL" "right after the restart the plugin's status said '$early_state', want fallback until the settle window ends"
+    elif ! plugin_state_is normal; then
+        record "$idle_name" "FAIL" "the plugin's status still says '$(plugin_fallback_status .state)' $((RESTART_SETTLE_SECONDS + 20)) s after an idle restart"
+    elif [ -z "$millis" ] || [ "$millis" -lt $((RESTART_SETTLE_SECONDS * 1000)) ]; then
+        record "$idle_name" "FAIL" "the hand-back came ${millis:-?} ms after the plugin loaded, want no sooner than the ${RESTART_SETTLE_SECONDS} s settle window"
+    elif docker exec "$CONTAINER" test -f "$FALLBACK_STATE_FILE"; then
+        record "$idle_name" "FAIL" "the saved state file is still there after the hand-back"
+    else
+        record "$idle_name" "PASS" "with FPP idle the plugin's status said fallback after the restart, then normal ${millis} ms after the plugin loaded, and the saved state file was removed"
+    fi
+    docker exec "$CONTAINER" rm -f "/home/fpp/media/playlists/${RESUME_PLAYLIST}.json" >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
 # Run all assertions, then report
 # ---------------------------------------------------------------------------
 
@@ -1261,6 +1404,7 @@ if [ -z "$ADAPTER_OBJECT" ]; then
     a7
     a8
     a9
+    a10_a11
 fi
 
 print_summary

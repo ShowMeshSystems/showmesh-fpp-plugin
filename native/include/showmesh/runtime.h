@@ -209,6 +209,8 @@ class DefinitionPublisher {
 // kStop when FPP reported the run over, whatever the callback's own word.
 struct FallbackEntryEvent {
     PlaylistAction action = PlaylistAction::kUnknown;
+    // The playlist FPP named. For the end of a run, the playlist that was playing when known.
+    std::string playlistName;
     bool identityResolved = false;
     std::string entryKey;
     std::optional<int> playlistLoop;
@@ -488,7 +490,8 @@ class ShowMeshRuntime {
  private:
     void workerLoop();
     // True when the recorder asked for this callback's coordinator posts to be skipped.
-    bool notifyFallbackRecorder(PlaylistAction action, const CallbackEvidence& evidence, const std::string& entryKey);
+    bool notifyFallbackRecorder(PlaylistAction action, const CallbackEvidence& evidence, const std::string& entryKey,
+                                const std::string& playlistName);
 
     PlaylistDefinitionSource* definitions_;
     ObservationSink* sink_;

@@ -40,6 +40,7 @@ constexpr int kNodeRequestTimeoutMillis = 2000;
 constexpr const char* kOutcomeNoResponse = "no-response";
 constexpr const char* kOutcomeUnrecognizedAnswer = "unrecognized-answer";
 constexpr const char* kOutcomeStopped = "plugin-stopping";
+constexpr const char* kOutcomeCutoffPassed = "cutoff-passed";
 
 // A UUID in its 36 character lowercase form from 16 random bytes (version 4).
 inline std::string formatExecutionId(const uint8_t randomBytes[16]) {
@@ -187,7 +188,8 @@ struct NodeDeliveryResult {
     std::string reason;
     // True when outcome is a word a node sent.
     bool nodeAnswered() const {
-        return outcome != kOutcomeNoResponse && outcome != kOutcomeUnrecognizedAnswer && outcome != kOutcomeStopped;
+        return outcome != kOutcomeNoResponse && outcome != kOutcomeUnrecognizedAnswer && outcome != kOutcomeStopped &&
+               outcome != kOutcomeCutoffPassed;
     }
     int attempts = 0;
     bool programResent = false;
@@ -198,12 +200,16 @@ struct NodeDeliveryResult {
 
 // Waits millis, returning false when the plugin is stopping.
 using DeliveryPause = std::function<bool(int millis)>;
+// Asked before every request to a node. False once the program's cutoff has passed.
+using DeliveryAllowed = std::function<bool()>;
+
 
 // Sends one signed activation and follows the section 5.8 table. Every retry
 // carries the identical body, and so the identical execution id.
 inline NodeDeliveryResult DeliverActivation(HttpTransport* transport, const std::string& address,
                                              const std::string& body, const std::string& fppInstanceUuid,
-                                             const std::string& signedDocument, const DeliveryPause& pause) {
+                                             const std::string& signedDocument, const DeliveryPause& pause,
+                                             const DeliveryAllowed& allowed = DeliveryAllowed()) {
     NodeDeliveryResult result;
     HttpRequest request;
     request.url = "http://" + address + kNodeActivationPath;
@@ -221,7 +227,17 @@ inline NodeDeliveryResult DeliverActivation(HttpTransport* transport, const std:
         return result;
     };
 
+    // Nothing leaves after the cutoff: not a retry already waiting, and not a program.
+    auto cutOff = [&] {
+        if (!allowed || allowed()) return false;
+        result.outcome = kOutcomeCutoffPassed;
+        result.reason = "This player's plan ran out before the node answered, so it stopped trying. Restore the "
+                        "coordinator to start the planned cues again.";
+        return true;
+    };
+
     for (;;) {
+        if (cutOff()) return result;
         ++result.attempts;
         const NodeAnswer answer = ParseNodeAnswer(transport->post(request));
         switch (ClassifyNodeAnswer(answer)) {
@@ -243,6 +259,7 @@ inline NodeDeliveryResult DeliverActivation(HttpTransport* transport, const std:
                 continue;
             case NodeAnswerClass::kProgramMissing:
                 if (result.programResent) return finish(answer);
+                if (cutOff()) return result;
                 result.programResent = true;
                 HandProgramToNode(transport, address, fppInstanceUuid, signedDocument);
                 continue;
