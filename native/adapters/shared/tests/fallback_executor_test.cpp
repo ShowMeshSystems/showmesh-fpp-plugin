@@ -1888,26 +1888,41 @@ TEST(ARestartThatInterruptedAnEntryRetriesItWithTheSameExecutionIdsSoTheNodeRuns
     CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(2));
 }
 
-TEST(APluginRestartWhileRestingStaysRestingAndSendsNothing) {
-    Bench bench;
-    enterFallback(&bench);
-    gClock = kCompiledAtMillis + 15 * 60 * 1000;
-    bench.tick();
-    CHECK(bench.executor->status().state.mode == FallbackMode::kResting);
+TEST(ARestartAfterTheCutoffDoesNotResumeEvenUnderTheSamePlaylistName) {
+    // The name cannot tell this run from a later run of the playlist. The plan's expiry bounds a resume.
+    for (bool restingWhenItStopped : {true, false}) {
+        Bench bench;
+        enterFallback(&bench);
+        if (restingWhenItStopped) {
+            gClock = kCompiledAtMillis + 15 * 60 * 1000;
+            bench.tick();
+            CHECK(bench.executor->status().state.mode == FallbackMode::kResting);
+        }
+        gClock = kCompiledAtMillis + 16 * 60 * 1000;
+        restartPlugin(&bench, kPlaylistName);
+        CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
+        CHECK(!std::filesystem::exists(bench.statePath()));
 
-    gClock += 60000;
-    restartPlugin(&bench, kPlaylistName);
-    CHECK(bench.executor->status().state.mode == FallbackMode::kResting);
-    bench.network.coordinatorUp = true;
-    bench.network.programEnvelope = getEnvelope(fixture("program.json"));
-    bench.tick();
-    bench.callback("playing", 1);
-    bench.callback("query_next", 1);
-    bench.callback("playing", 0);
-    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
-    CHECK_EQ(bench.sink.published.size(), static_cast<std::size_t>(0));
-    CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(0));
-    CHECK_EQ(member(stateReports(&bench).back(), "state"), std::string("resting"));
+        // One second before the cutoff the same restart resumes.
+        Bench early;
+        enterFallback(&early);
+        gClock = kCompiledAtMillis + 15 * 60 * 1000 - 1000;
+        restartPlugin(&early, kPlaylistName);
+        CHECK(early.executor->status().state.mode == FallbackMode::kFallback);
+    }
+}
+
+TEST(TheReportNamesThePlaylistAsFppsOwnStatusSpellsIt) {
+    CHECK_EQ(FppStatusPlaylistName("Main Show"), std::string("Main Show"));
+    CHECK_EQ(FppStatusPlaylistName("Main Show.json"), std::string("Main Show"));
+    CHECK_EQ(FppStatusPlaylistName("/home/fpp/media/playlists/Main Show.json"), std::string("Main Show"));
+    CHECK_EQ(FppStatusPlaylistName("Act 1.5"), std::string("Act 1.5"));
+
+    StateReport report;
+    report.bootId = "boot";
+    report.sequence = 1;
+    report.state.enter(0, "/home/fpp/media/playlists/Main Show.json", "pkg", "rev", "2026-10-05T12:15:00Z");
+    CHECK_EQ(member(parseJson(StateReportBody(report)), "playlistName"), std::string("Main Show"));
 }
 
 TEST(ARestartAfterThePlaylistEndedHandsBackBecauseTheBoundaryPassedWhileThePluginWasDown) {

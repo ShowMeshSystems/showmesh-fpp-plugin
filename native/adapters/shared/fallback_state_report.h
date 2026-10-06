@@ -43,6 +43,17 @@ inline std::string StateReportPath(const std::string& fppInstanceUuid) {
     return "/api/v1/fallback-programs/" + fppInstanceUuid + "/fallback-state";
 }
 
+// The playlist name as FPP's own status spells it (current_playlist.playlist):
+// no directory and no .json suffix. The coordinator compares the two readings.
+inline std::string FppStatusPlaylistName(const std::string& name) {
+    std::string plain = name.substr(name.find_last_of("\\/") + 1);
+    const std::string suffix = ".json";
+    if (plain.size() >= suffix.size() && plain.compare(plain.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        plain = plain.substr(0, plain.find_last_of('.'));
+    }
+    return plain;
+}
+
 inline std::string StateReportBody(const StateReport& report) {
     using showmesh::json::Value;
     std::vector<Value::Member> members = {
@@ -53,7 +64,7 @@ inline std::string StateReportBody(const StateReport& report) {
         {"since", Value::makeString(detail::formatEpochMillisAsRfc3339(report.state.sinceMillis))},
     };
     if (report.state.mode != FallbackMode::kNormal) {
-        members.emplace_back("playlistName", Value::makeString(report.state.playlistName));
+        members.emplace_back("playlistName", Value::makeString(FppStatusPlaylistName(report.state.playlistName)));
         members.emplace_back("packageId", Value::makeString(report.state.packageId));
         members.emplace_back("packageRevision", Value::makeString(report.state.packageRevision));
         members.emplace_back("cutoffAt", Value::makeString(report.state.cutoffAt));

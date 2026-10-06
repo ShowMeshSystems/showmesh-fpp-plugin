@@ -509,15 +509,20 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         wake_.notify_all();
     }
 
-    // On start: a saved fallback or resting state is resumed only when FPP is
-    // playing the playlist it names. Otherwise the boundary passed while the
-    // plugin was down, and the hand-back steps are owed.
+    // On start: a saved state is resumed only when FPP is playing the playlist
+    // it names and the program copy it was entered with has not expired. The
+    // name alone cannot tell the same run from a later run of that playlist;
+    // the expiry bounds it. Otherwise the hand-back steps are owed.
     void restoreSavedState(TimeMillis now) {
         state_.sinceMillis = now;
         FallbackExecutionState saved;
         if (!LoadFallbackState(options_.credentialDir, &saved)) return;
-        if (saved.playlistName != options_.playingPlaylistAtStart) {
-            log(false, "the playlist this player was running stopped while the plugin was down; handing back");
+        std::int64_t cutoffSeconds = 0;
+        const bool unexpired =
+            detail::parseRfc3339ToEpochSeconds(saved.cutoffAt, &cutoffSeconds) && now < cutoffSeconds * 1000;
+        if (saved.playlistName != options_.playingPlaylistAtStart || !unexpired) {
+            log(false, "the saved fallback state is over: its playlist stopped or its plan ran out while the "
+                       "plugin was down; handing back");
             SaveFallbackState(options_.credentialDir, state_);
             handBackFetchDue_ = true;
             reportOwedBeforePosts_ = true;

@@ -424,16 +424,19 @@ the executor.
 entry leaves, the state, the playlist, the program copy and that entry's
 execution ids are written to `/etc/showmesh-fpp-plugin/fallback-state.json` at
 mode 0600. A plugin that starts while FPP is playing the playlist the file
-names resumes the state it left and sends nothing for the entry already
-handled. An entry a restart interrupted is retried with its recorded execution
-ids, so a node that already ran it answers `replayed-execution`. A plugin that
-starts while FPP plays nothing, or another playlist, hands back.
+names, before the cutoff, resumes the state it left and sends nothing for the
+entry already handled. An entry a restart interrupted is retried with its
+recorded execution ids, so a node that already ran it answers
+`replayed-execution`. A plugin that starts while FPP plays nothing or another
+playlist, or after the cutoff, hands back: the playlist name alone cannot tell
+the same run from a later one, so the cutoff bounds a resume.
 
 **The state report.** The plugin tells the coordinator its state with
 `PUT /api/v1/fallback-programs/{fppInstanceId}/fallback-state`: at once on
-start, on every change, every 10 seconds while the coordinator answers, and as
-the first request after a probe that succeeds following one that failed. No
-answer changes the plugin's state.
+start (after the first probe that succeeds), on every change, every 10 seconds
+while the coordinator answers, and as the first request after a probe that
+succeeds following one that failed. It names the playlist as FPP's own status
+spells it. No answer changes the plugin's state.
 
 While it is not in `normal`, while loss is confirmed, and until that first
 report has gone, the worker skips its observation and definition posts.
