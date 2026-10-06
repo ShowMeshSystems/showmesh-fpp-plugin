@@ -173,11 +173,21 @@ inline std::string StateReportProblem(const StateReportAnswer& answer) {
         case StateReportAnswerKind::kNotAllowed:
         case StateReportAnswerKind::kNotYet:
         case StateReportAnswerKind::kOtherStatus:
-            return "The coordinator answered " + std::to_string(answer.statusCode) + " to this player's state" +
-                   (answer.detail.empty() ? std::string("") : ": " + answer.detail) +
-                   ". Check this player's pairing on the coordinator.";
+            break;
     }
-    return std::string();
+    // The action fits the answer: pairing advice only when the pairing was refused.
+    const char* action = "Check the coordinator's log.";
+    if (answer.kind == StateReportAnswerKind::kNotAllowed) {
+        action = "Check this player's pairing on the coordinator.";
+    } else if (answer.kind == StateReportAnswerKind::kInvalid) {
+        action = "Check that the coordinator and this plugin are versions that work together.";
+    } else if (answer.kind == StateReportAnswerKind::kNotYet) {
+        action = "Check that the coordinator can reach this player.";
+    } else if (answer.statusCode >= 500) {
+        action = "Check the coordinator; the plugin keeps sending this player's state.";
+    }
+    return "The coordinator answered " + std::to_string(answer.statusCode) + " to this player's state" +
+           (answer.detail.empty() ? std::string("") : ": " + answer.detail) + ". " + action;
 }
 
 }  // namespace fallback

@@ -56,7 +56,11 @@ constexpr TimeMillis kFiveMinutesMillis = 300000;
 
 // Atomic because some cases run the runtime worker and the executor's own thread.
 std::atomic<TimeMillis> gClock{kCompiledAtMillis + kFiveMinutesMillis};
-TimeMillis fixtureClock() { return gClock.load(); }
+// How far the wall clock was stepped away from the time that really passed.
+std::atomic<TimeMillis> gWallClockStep{0};
+TimeMillis fixtureClock() { return gClock.load() + gWallClockStep.load(); }
+// The same passage of time from another origin, as a monotonic clock has.
+TimeMillis fixtureMonotonicClock() { return gClock.load() - kCompiledAtMillis; }
 
 std::string readFile(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
@@ -352,6 +356,7 @@ class Bench {
  public:
     explicit Bench(bool paired = true) {
         gClock = kCompiledAtMillis + kFiveMinutesMillis;
+        gWallClockStep = 0;
         char buffer[] = "/tmp/showmesh-fallback-executor-XXXXXX";
         root_ = ::mkdtemp(buffer);
         std::filesystem::create_directories(stateDir());
@@ -403,6 +408,8 @@ class Bench {
         executor.reset();
         FallbackExecutorOptions options;
         options.clock = fixtureClock;
+        options.monotonicClock = fixtureMonotonicClock;
+        if (writeState) options.writeState = writeState;
         options.fppInstanceUuid = kFppUuid;
         options.stateDir = stateDir();
         options.credentialDir = credentialDir();
@@ -427,7 +434,7 @@ class Bench {
                                                     showmesh::kDefaultSafeCeilingPercent, executor.get());
     }
 
-    void tick() { executor->tick(gClock); }
+    void tick() { executor->tick(fixtureClock()); }
 
     void advanceAndTick(TimeMillis millis) {
         gClock += millis;
@@ -482,6 +489,8 @@ class Bench {
     std::vector<int> pauses;
     // Runs inside every wait between delivery attempts.
     std::function<void()> onPause;
+    // Stands in for the write of the state file in executors made after it is set.
+    std::function<bool(const std::string&, const FallbackExecutionState&)> writeState;
     std::unique_ptr<FallbackExecutor> executor;
     std::unique_ptr<ShowMeshRuntime> runtime;
 
@@ -1523,9 +1532,14 @@ TEST(NoAnswerToAStateReportChangesTheStateAndThePluginKeepsReporting) {
         CHECK_EQ(!problem.empty(), c.problemExpected);
         if (c.status == 404) CHECK(problem.find("too old") != std::string::npos);
         if (c.problemExpected && c.status != 404) {
+            const char* action = c.status == 400   ? "Check that the coordinator and this plugin are versions "
+                                                     "that work together."
+                                 : c.status == 409 ? "Check that the coordinator can reach this player."
+                                 : c.status == 500 ? "Check the coordinator; the plugin keeps sending this "
+                                                     "player's state."
+                                                   : "Check this player's pairing on the coordinator.";
             CHECK_EQ(problem, "The coordinator answered " + std::to_string(c.status) +
-                                  " to this player's state: the coordinator says why. Check this player's "
-                                  "pairing on the coordinator.");
+                                  " to this player's state: the coordinator says why. " + action);
         }
         const showmesh::json::Value file = parseJson(readFile(bench.stateDir() + "/" + kFallbackStatusFilename));
         CHECK_EQ(member(file, "stateReportProblem"), problem);
@@ -2189,6 +2203,11 @@ TEST(AHandBackAcknowledgementThatFailsStaysOwedAndIsRetriedAtEveryProbeUntilItSu
     bench.tick();
     CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(1));
     CHECK_EQ(bench.executor->status().programRevision, std::string("rev-b"));
+    // The status says it is owed and waiting.
+    CHECK(bench.executor->status().acknowledgementOwed);
+    CHECK_EQ(bench.executor->status().acknowledgementProblem, std::string(kAcknowledgementWaitingMessage));
+    const showmesh::json::Value waitingFile = parseJson(readFile(bench.stateDir() + "/" + kFallbackStatusFilename));
+    CHECK_EQ(member(waitingFile, "acknowledgementProblem"), std::string(kAcknowledgementWaitingMessage));
 
     // Not on every 250 ms tick, on the probe cadence.
     for (int i = 0; i < 19; ++i) bench.advanceAndTick(250);
@@ -2208,6 +2227,178 @@ TEST(AHandBackAcknowledgementThatFailsStaysOwedAndIsRetriedAtEveryProbeUntilItSu
     for (int i = 0; i < 14; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
     CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(3));
     CHECK(bench.network.count("GET", kProgramRoute) >= 2);
+    CHECK(!bench.executor->status().acknowledgementOwed);
+    CHECK(bench.executor->status().acknowledgementProblem.empty());
+}
+
+namespace {
+
+// A bench handed back with a newer copy published and the next acknowledgements scripted.
+void handBackWithAcknowledgementAnswers(Bench* bench, const std::vector<HttpResponse>& answers) {
+    enterFallback(bench);
+    ProgramSpec newer = twoEntryProgram(*bench);
+    newer.revision = "rev-b";
+    newer.packageId = "pkg-b";
+    newer.expiresAt = "2026-10-06T12:00:00Z";
+    bench->network.coordinatorUp = true;
+    bench->network.programEnvelope = getEnvelope(signedProgram(newer));
+    bench->advanceAndTick(kHypothesisProbeIntervalMillis);
+    for (const HttpResponse& response : answers) bench->network.scriptAcknowledge(response);
+    stopPlaylist(bench);
+    bench->tick();
+}
+
+std::size_t acknowledgements(Bench* bench) { return bench->network.count("POST", "/acknowledge"); }
+
+}  // namespace
+
+TEST(AnAcknowledgementTheCoordinatorRefusesIsNotAskedAgainUntilANewPairingOrANewCopy) {
+    Bench bench;
+    const HttpResponse forbidden = answer(403, "{\"title\":\"Forbidden\"}");
+    const HttpResponse badRequest = answer(400, "{}");
+    handBackWithAcknowledgementAnswers(&bench, {forbidden, forbidden, badRequest, badRequest, badRequest});
+    CHECK_EQ(acknowledgements(&bench), static_cast<std::size_t>(1));
+
+    // An hour of probes and refetches: it is not asked again, and it is recorded once.
+    for (int i = 0; i < 720; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(acknowledgements(&bench), static_cast<std::size_t>(1));
+    std::size_t refusedLines = 0;
+    for (const std::string& line : bench.logs) refusedLines += line.find("acknowledge refused") == 0 ? 1 : 0;
+    CHECK_EQ(refusedLines, static_cast<std::size_t>(1));
+    const std::string pairAgain = "The coordinator refused to record which plan this player holds and answered 403. "
+                                  "Pair this player with the coordinator again.";
+    CHECK(bench.executor->status().acknowledgementOwed);
+    CHECK_EQ(bench.executor->status().acknowledgementProblem, pairAgain);
+    const showmesh::json::Value file = parseJson(readFile(bench.stateDir() + "/" + kFallbackStatusFilename));
+    CHECK_EQ(member(file, "acknowledgementProblem"), pairAgain);
+    CHECK(isOperatorCopy(pairAgain));
+
+    // A new pairing: one more try, refused again, and it stops again.
+    bench.pair("token-two");
+    for (int i = 0; i < 30; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(acknowledgements(&bench), static_cast<std::size_t>(2));
+    // A second hand-back while the same copy is refused does not ask either.
+    bench.loseCoordinator();
+    bench.callback("playing", 0);
+    bench.network.coordinatorUp = true;
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    stopPlaylist(&bench);
+    for (int i = 0; i < 30; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(acknowledgements(&bench), static_cast<std::size_t>(2));
+
+    // A newly installed copy is asked for, even the same package and revision with a later expiry.
+    ProgramSpec refreshed = twoEntryProgram(bench);
+    refreshed.revision = "rev-b";
+    refreshed.packageId = "pkg-b";
+    refreshed.expiresAt = "2026-10-07T12:00:00Z";
+    bench.network.programEnvelope = getEnvelope(signedProgram(refreshed));
+    for (int i = 0; i < 30; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(acknowledgements(&bench), static_cast<std::size_t>(3));
+    CHECK_EQ(member(parseJson(lastSent(&bench, "POST", "/acknowledge").body), "revision"), std::string("rev-b"));
+    const std::string versions = "The coordinator refused to record which plan this player holds and answered 400. "
+                                 "Check that the coordinator and this plugin are versions that work together.";
+    CHECK_EQ(bench.executor->status().acknowledgementProblem, versions);
+    CHECK(isOperatorCopy(versions));
+    CHECK(isOperatorCopy(kAcknowledgementWaitingMessage));
+    // A refusal is remembered for that copy only: another published copy this player refuses is reported.
+    ProgramSpec expired = twoEntryProgram(bench);
+    expired.revision = "rev-x";
+    expired.packageId = "pkg-x";
+    expired.expiresAt = "2026-10-05T12:01:00Z";
+    bench.network.programEnvelope = getEnvelope(signedProgram(expired));
+    for (int i = 0; i < 30; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(acknowledgements(&bench), static_cast<std::size_t>(4));
+    CHECK_EQ(member(parseJson(lastSent(&bench, "POST", "/acknowledge").body), "revision"), std::string("rev-x"));
+
+    // So is a different copy, whose refusal is its own.
+    ProgramSpec newest = twoEntryProgram(bench);
+    newest.revision = "rev-c";
+    newest.packageId = "pkg-c";
+    newest.expiresAt = "2026-10-06T12:00:00Z";
+    bench.network.programEnvelope = getEnvelope(signedProgram(newest));
+    for (int i = 0; i < 30; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(acknowledgements(&bench), static_cast<std::size_t>(5));
+    CHECK_EQ(member(parseJson(lastSent(&bench, "POST", "/acknowledge").body), "revision"), std::string("rev-c"));
+
+    // The next pairing asks once more, and a success clears what the status said.
+    bench.pair("token-three");
+    for (int i = 0; i < 3; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(acknowledgements(&bench), static_cast<std::size_t>(6));
+    CHECK(!bench.executor->status().acknowledgementOwed);
+    CHECK(bench.executor->status().acknowledgementProblem.empty());
+}
+
+TEST(ATimeoutA408A429AndA5xxKeepTheAcknowledgementRetriedOnTheProbeCadence) {
+    Bench bench;
+    handBackWithAcknowledgementAnswers(
+        &bench, {noResponse(), answer(408, "{}"), answer(429, "{}"), answer(500, "{}"), answer(503, "{}")});
+    for (std::size_t expected = 1; expected <= 5; ++expected) {
+        CHECK_EQ(acknowledgements(&bench), expected);
+        CHECK(bench.executor->status().acknowledgementOwed);
+        CHECK_EQ(bench.executor->status().acknowledgementProblem, std::string(kAcknowledgementWaitingMessage));
+        bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    }
+    CHECK_EQ(acknowledgements(&bench), static_cast<std::size_t>(6));
+    CHECK(!bench.executor->status().acknowledgementOwed);
+}
+
+TEST(AStateReportProblemGivesTheActionThatFitsTheAnswer) {
+    auto problem = [](StateReportAnswerKind kind, int status) {
+        StateReportAnswer answer;
+        answer.kind = kind;
+        answer.statusCode = status;
+        return StateReportProblem(answer);
+    };
+    const std::string pairing = "Check this player's pairing on the coordinator.";
+    CHECK(problem(StateReportAnswerKind::kNotAllowed, 401).find(pairing) != std::string::npos);
+    CHECK(problem(StateReportAnswerKind::kNotAllowed, 403).find(pairing) != std::string::npos);
+    CHECK_EQ(problem(StateReportAnswerKind::kInvalid, 400),
+             std::string("The coordinator answered 400 to this player's state. Check that the coordinator and this "
+                         "plugin are versions that work together."));
+    CHECK_EQ(problem(StateReportAnswerKind::kNotYet, 409),
+             std::string("The coordinator answered 409 to this player's state. Check that the coordinator can reach "
+                         "this player."));
+    CHECK_EQ(problem(StateReportAnswerKind::kOtherStatus, 503),
+             std::string("The coordinator answered 503 to this player's state. Check the coordinator; the plugin "
+                         "keeps sending this player's state."));
+    CHECK_EQ(problem(StateReportAnswerKind::kOtherStatus, 418),
+             std::string("The coordinator answered 418 to this player's state. Check the coordinator's log."));
+    for (int status : {400, 409, 418, 500, 503}) {
+        const StateReportAnswerKind kind = status == 400   ? StateReportAnswerKind::kInvalid
+                                           : status == 409 ? StateReportAnswerKind::kNotYet
+                                                           : StateReportAnswerKind::kOtherStatus;
+        CHECK(problem(kind, status).find("pairing") == std::string::npos);
+        CHECK(isOperatorCopy(problem(kind, status)));
+    }
+}
+
+TEST(AWallClockStepAfterAStartNeitherEndsTheSettleWindowEarlyNorHandsBackAtOnce) {
+    for (TimeMillis step : {static_cast<TimeMillis>(-3600000), static_cast<TimeMillis>(120000)}) {
+        Bench bench;
+        ProgramSpec longLived = twoEntryProgram(bench);
+        longLived.expiresAt = "2026-10-06T12:00:00Z";
+        bench.writeFile(bench.installPath(), signedProgram(longLived));
+        bench.loseCoordinator();
+        bench.callback("playing", 0);
+        bench.network.coordinatorUp = true;
+        restartPlugin(&bench);
+        bench.tick();
+
+        // The player's clock is set, back an hour or forward two minutes, one second after the start.
+        gClock += 1000;
+        gWallClockStep = step;
+        bench.tick();
+        CHECK(bench.executor->status().waitingForFpp);
+        CHECK(bench.executor->status().state.mode == FallbackMode::kFallback);
+        gClock += kHypothesisRestartSettleMillis - 1001;
+        bench.tick();
+        CHECK(bench.executor->status().waitingForFpp);
+        // Thirty seconds really passed.
+        gClock += 1;
+        bench.tick();
+        CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
+        CHECK(!std::filesystem::exists(bench.statePath()));
+    }
 }
 
 TEST(AnExpiredCopyIsNeverAcknowledgedAsVerified) {
@@ -2713,25 +2904,254 @@ TEST(TwoThreads_TheCutoffArrivesWhileEntriesKeepStarting) {
     CHECK_EQ(bench.activations().size(), sent);
 }
 
-TEST(TwoThreads_ASettleWindowHandBackRacingFppsFirstCallbackLeavesTheFileAgreeingWithTheState) {
-    for (int round = 0; round < 6; ++round) {
-        Bench bench;
-        enterFallback(&bench);
-        gClock += 2000;
-        restartPlugin(&bench);
-        bench.runtime->start();
-        // The settle window ends on the executor's thread just as FPP names the playlist on the worker.
-        gClock += kHypothesisRestartSettleMillis - (round % 2 == 0 ? 0 : 1);
-        fppCallback(&bench, "playing", 1, 0);
-        CHECK(waitUntil([&] { return bench.runtime->handoff().pending() == 0; }));
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
-        bench.runtime->stop();
+namespace {
 
-        // Either outcome is allowed at the edge. A file that disagrees with the state is not.
-        const FallbackMode mode = bench.executor->status().state.mode;
-        CHECK(modeOnDisk(&bench) == mode);
-        CHECK(mode == FallbackMode::kNormal || mode == FallbackMode::kFallback);
+// Stands in for the write of the state file. The save that matches `gated`
+// is held, with the file lock, until `proceed` says the other thread has
+// changed the state, and then a little longer so a second writer that is not
+// kept out has time to get in. Every write is counted and remembered.
+struct GatedStateWriter {
+    std::function<bool(const FallbackExecutionState&)> gated;
+    std::function<bool()> proceed;
+    std::atomic<bool> gateReached{false};
+    std::atomic<bool> gateUsed{false};
+    std::atomic<int> writing{0};
+    std::atomic<int> mostWritingAtOnce{0};
+    std::mutex mutex;
+    std::vector<std::pair<std::thread::id, FallbackMode>> writes;
+
+    bool write(const std::string& credentialDir, const FallbackExecutionState& state) {
+        const int now = ++writing;
+        int most = mostWritingAtOnce.load();
+        while (now > most && !mostWritingAtOnce.compare_exchange_weak(most, now)) {
+        }
+        if (gated(state) && !gateUsed.exchange(true)) {
+            gateReached = true;
+            for (int waited = 0; waited < 8000 && !proceed(); waited += 2) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            for (int waited = 0; waited < 300 && writing.load() < 2; waited += 2) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+        const bool saved = SaveFallbackState(credentialDir, state);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            writes.emplace_back(std::this_thread::get_id(), state.mode);
+        }
+        --writing;
+        return saved;
     }
+
+    // How many distinct threads wrote the file.
+    std::size_t writerThreads() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::set<std::thread::id> ids;
+        for (const auto& w : writes) ids.insert(w.first);
+        return ids.size();
+    }
+    FallbackMode lastWritten() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return writes.empty() ? FallbackMode::kNormal : writes.back().second;
+    }
+};
+
+// One probe a second and loss after two, so a case can walk the executor's own thread by the clock.
+void useAFastDetector(Bench* bench) {
+    bench->detectorConfig.probeIntervalMillis = 1000;
+    bench->detectorConfig.failedProbesToConfirm = 2;
+    bench->detectorConfig.minimumLossMillis = 0;
+}
+
+// Moves the clock a second at a time, each time waiting for the executor's own thread to probe.
+bool probeUntil(Bench* bench, const std::function<bool()>& done) {
+    for (int step = 0; step < 40; ++step) {
+        if (done()) return true;
+        const std::size_t probes = bench->network.count("GET", "/healthz");
+        gClock += 1000;
+        if (!waitUntil([&] { return bench->network.count("GET", "/healthz") > probes; }, 3000)) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return done();
+}
+
+}  // namespace
+
+// The cutoff transition and its save run on the executor's own thread while
+// the runtime worker is inside a save of the entry it is starting.
+TEST(TwoThreads_TheCutoffOnTheExecutorsThreadOverlapsASaveOnTheWorkerAndTheNewerStateIsWhatIsOnDisk) {
+    Bench bench;
+    GatedStateWriter writer;
+    writer.gated = [](const FallbackExecutionState& state) { return state.mode == FallbackMode::kFallback; };
+    writer.proceed = [&] { return bench.executor->status().state.mode == FallbackMode::kResting; };
+    bench.writeState = [&](const std::string& dir, const FallbackExecutionState& state) {
+        return writer.write(dir, state);
+    };
+    useAFastDetector(&bench);
+    bench.makeExecutor();
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    bench.network.coordinatorUp = false;
+    bench.runtime->start();
+    CHECK(probeUntil(&bench, [&] { return bench.executor->coordinatorLost(); }));
+
+    // The worker enters fallback and is held inside its first save, before the activation leaves.
+    fppCallback(&bench, "playing", 0, 0);
+    CHECK(waitUntil([&] { return writer.gateReached.load(); }));
+    // The clock crosses the cutoff: the executor's own thread makes the transition and goes to save.
+    gClock = kCompiledAtMillis + 15 * 60 * 1000;
+    CHECK(waitUntil([&] { return bench.executor->status().state.mode == FallbackMode::kResting; }));
+    CHECK(waitUntil([&] { return bench.runtime->handoff().pending() == 0 && writer.writing.load() == 0; }));
+    CHECK(waitUntil([&] { return writer.lastWritten() == FallbackMode::kResting; }));
+    bench.runtime->stop();
+
+    CHECK_EQ(writer.mostWritingAtOnce.load(), 1);
+    CHECK_EQ(writer.writerThreads(), static_cast<std::size_t>(2));
+    CHECK(modeOnDisk(&bench) == FallbackMode::kResting);
+    CHECK(bench.executor->status().state.mode == FallbackMode::kResting);
+    // The entry the worker was starting got no activation after the cutoff.
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(0));
+}
+
+// The settle-window hand-back and its save run on the executor's own thread
+// while the runtime worker enters fallback again and saves.
+TEST(TwoThreads_AHandBackOnTheExecutorsThreadOverlapsASaveOnTheWorkerAndTheNewerStateIsWhatIsOnDisk) {
+    Bench bench;
+    ProgramSpec longLived = twoEntryProgram(bench);
+    longLived.expiresAt = "2026-10-06T12:00:00Z";
+    bench.writeFile(bench.installPath(), signedProgram(longLived));
+    bench.loseCoordinator();
+    bench.callback("playing", 0);
+    CHECK(bench.executor->status().state.mode == FallbackMode::kFallback);
+
+    GatedStateWriter writer;
+    writer.gated = [](const FallbackExecutionState& state) { return state.mode == FallbackMode::kNormal; };
+    writer.proceed = [&] { return bench.executor->status().state.mode == FallbackMode::kFallback; };
+    bench.writeState = [&](const std::string& dir, const FallbackExecutionState& state) {
+        return writer.write(dir, state);
+    };
+    useAFastDetector(&bench);
+    restartPlugin(&bench);
+    bench.runtime->start();
+    CHECK(probeUntil(&bench, [&] { return bench.executor->status().coordinatorLost; }));
+    CHECK(bench.executor->status().waitingForFpp);
+
+    // FPP stays idle: the executor's own thread hands back and is held inside the save of normal.
+    gClock += kHypothesisRestartSettleMillis;
+    CHECK(waitUntil([&] { return writer.gateReached.load(); }));
+    CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
+    // FPP starts the playlist, the coordinator is still lost, and the worker enters fallback and goes to save.
+    fppCallback(&bench, "playing", 1, 0);
+    CHECK(waitUntil([&] { return bench.activations().size() == 2; }));
+    CHECK(waitUntil([&] { return bench.runtime->handoff().pending() == 0 && writer.writing.load() == 0; }));
+    bench.runtime->stop();
+
+    CHECK_EQ(writer.mostWritingAtOnce.load(), 1);
+    CHECK_EQ(writer.writerThreads(), static_cast<std::size_t>(2));
+    CHECK(bench.executor->status().state.mode == FallbackMode::kFallback);
+    CHECK(modeOnDisk(&bench) == FallbackMode::kFallback);
+    std::size_t handBacks = 0;
+    for (const std::string& line : bench.logs) handBacks += line.find("handed back") == 0 ? 1 : 0;
+    CHECK_EQ(handBacks, static_cast<std::size_t>(1));
+}
+
+namespace {
+
+void spinFor(std::int64_t nanos) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(nanos);
+    while (std::chrono::steady_clock::now() < until) {
+    }
+}
+
+}  // namespace
+
+// The settle tick on one thread and FPP's first callback on another, aimed
+// at the same instant: whichever takes the lock first decides, and the other
+// does nothing. No round may both resume and hand back. Each round moves the
+// aim toward the edge between the two outcomes, so the rounds stay close to it.
+TEST(TwoThreads_TheSettleTickAndFppsFirstCallbackNeverBothDecideInThreeThousandRounds) {
+    Bench bench;
+    ProgramSpec longLived = twoEntryProgram(bench);
+    longLived.expiresAt = "2026-10-06T12:00:00Z";
+    bench.writeFile(bench.installPath(), signedProgram(longLived));
+    bench.loseCoordinator();
+    bench.callback("playing", 0);
+    const std::string saved = readFile(bench.statePath());
+    bench.network.coordinatorUp = true;
+    const TimeMillis startAt = gClock;
+
+    // The probe is the tick's last step before the settle check. The callback
+    // is released from inside it, and one side is then held back by `lead`.
+    std::atomic<bool> armed{false};
+    std::atomic<bool> released{false};
+    std::atomic<std::int64_t> leadNanos{0};
+    bench.network.beforeAnswer = [&](const std::string&, const std::string& url) {
+        if (url.find("/healthz") == std::string::npos || !armed.exchange(false)) return;
+        released = true;
+        if (leadNanos.load() > 0) spinFor(leadNanos.load());
+    };
+
+    int resumedRounds = 0;
+    int handedBackRounds = 0;
+    int bothRounds = 0;
+    int otherwiseWrongRounds = 0;
+    for (int round = 0; round < 3000; ++round) {
+        gClock = startAt;
+        bench.writeFile(bench.statePath(), saved);
+        ::chmod(bench.statePath().c_str(), 0600);
+        restartPlugin(&bench);
+        bench.tick();
+        {
+            std::lock_guard<std::mutex> lock(bench.recordMutex);
+            bench.logs.clear();
+        }
+        const std::size_t activationsBefore = bench.activations().size();
+        const std::size_t observationsBefore = bench.sink.published.size();
+        gClock += kHypothesisRestartSettleMillis;
+
+        released = false;
+        armed = true;
+        std::thread calling([&] {
+            while (!released.load()) {
+            }
+            if (leadNanos.load() < 0) spinFor(-leadNanos.load());
+            bench.runtime->observeCallback(kPlaylistName, "playing", "mainPlaylist", 1, "a.fseq", "", 0);
+            bench.runtime->drainOnce();
+        });
+        bench.executor->tick(fixtureClock());
+        calling.join();
+
+        bool resumed = false;
+        bool handedBack = false;
+        {
+            std::lock_guard<std::mutex> lock(bench.recordMutex);
+            for (const std::string& line : bench.logs) {
+                resumed = resumed || line.find("resumed the saved state") == 0;
+                handedBack = handedBack || line.find("handed back") == 0;
+            }
+        }
+        const FallbackMode mode = bench.executor->status().state.mode;
+        const bool activated = bench.activations().size() > activationsBefore;
+        const bool observed = bench.sink.published.size() > observationsBefore;
+        if (resumed && handedBack) ++bothRounds;
+        if (resumed && !handedBack) ++resumedRounds;
+        if (handedBack && !resumed) ++handedBackRounds;
+        // Resumed: still the executor, the cue sent, nothing posted, the file kept.
+        // Handed back: normal, nothing sent, the entry posted, the file gone.
+        const bool resumedRight = resumed && mode == FallbackMode::kFallback && activated && !observed &&
+                                  modeOnDisk(&bench) == FallbackMode::kFallback;
+        const bool handedBackRight = handedBack && mode == FallbackMode::kNormal && !activated && observed &&
+                                     !std::filesystem::exists(bench.statePath());
+        if (resumedRight == handedBackRight) ++otherwiseWrongRounds;
+        // The callback won: let the tick go sooner next time. The tick won: hold it back.
+        leadNanos += resumed ? -500 : 500;
+    }
+    bench.network.beforeAnswer = nullptr;
+    CHECK_EQ(bothRounds, 0);
+    CHECK_EQ(otherwiseWrongRounds, 0);
+    CHECK_EQ(resumedRounds + handedBackRounds, 3000);
+    // Both orders happened often, so the rounds did race.
+    CHECK(resumedRounds > 300);
+    CHECK(handedBackRounds > 300);
 }
 
 TEST(BothShippingAdaptersConstructTheDeliveryAndHandItsRecorderToTheRuntime) {
