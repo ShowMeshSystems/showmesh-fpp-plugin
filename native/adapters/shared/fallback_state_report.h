@@ -167,13 +167,15 @@ inline std::string StateReportProblem(const StateReportAnswer& answer) {
         case StateReportAnswerKind::kOlderCoordinator:
             return "The coordinator is too old to be told this player's state. Update the coordinator.";
         case StateReportAnswerKind::kUnreachable:
-            return "The coordinator could not be told this player's state: " + answer.detail + ".";
+            return "The coordinator could not be told this player's state: " + answer.detail +
+                   ". Check the network between this player and the coordinator.";
         case StateReportAnswerKind::kInvalid:
         case StateReportAnswerKind::kNotAllowed:
         case StateReportAnswerKind::kNotYet:
         case StateReportAnswerKind::kOtherStatus:
             return "The coordinator answered " + std::to_string(answer.statusCode) + " to this player's state" +
-                   (answer.detail.empty() ? std::string(".") : ": " + answer.detail);
+                   (answer.detail.empty() ? std::string("") : ": " + answer.detail) +
+                   ". Check this player's pairing on the coordinator.";
     }
     return std::string();
 }

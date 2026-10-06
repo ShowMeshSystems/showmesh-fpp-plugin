@@ -4,7 +4,7 @@
 // its copy on disk (contract section 5.13). The file sits beside the pairing
 // token at mode 0600 and is what lets a restarted plugin resume, not repeat.
 //
-//   {"state":"fallback","playlistName":"...","sinceMillis":0,"packageId":"...",
+//   {"version":1,"state":"fallback","playlistName":"...","sinceMillis":0,"packageId":"...",
 //    "packageRevision":"...","cutoffAt":"<expiresAt as written>",
 //    "occurrence":{"entryKey":"...","identityResolved":true,"playlistLoop":2,
 //                  "delivered":false,"executionIds":{"<nodeId>":"<uuid>"}}}
@@ -24,6 +24,8 @@ namespace showmesh {
 namespace fallback {
 
 constexpr const char* kFallbackStateFilename = "fallback-state.json";
+// The file's own version. A file that says another is never resumed.
+constexpr int kFallbackStateFileVersion = 1;
 
 enum class FallbackMode { kNormal, kFallback, kResting };
 
@@ -116,6 +118,7 @@ inline std::string RenderFallbackState(const FallbackExecutionState& state) {
         occurrence.emplace_back("playlistLoop", Value::makeNumber(*state.occurrence.playlistLoop));
     }
     std::vector<Value::Member> members = {
+        {"version", Value::makeNumber(kFallbackStateFileVersion)},
         {"state", Value::makeString(FallbackModeName(state.mode))},
         {"playlistName", Value::makeString(state.playlistName)},
         {"sinceMillis", Value::makeNumber(static_cast<double>(state.sinceMillis))},
@@ -127,12 +130,23 @@ inline std::string RenderFallbackState(const FallbackExecutionState& state) {
     return showmesh::json::canonicalize(Value::makeObject(std::move(members))).text;
 }
 
-// False when text is not a fallback or resting record this build can resume.
-inline bool ParseFallbackState(const std::string& text, FallbackExecutionState* out) {
+enum class SavedStateRead {
+    // Missing, or not a record this build can read: section 5.13 says normal.
+    kNone,
+    // A record written by a build with another file version. Never resumed.
+    kUnknownVersion,
+    kLoaded,
+};
+
+inline SavedStateRead ParseFallbackState(const std::string& text, FallbackExecutionState* out) {
     using showmesh::json::Type;
     const showmesh::json::ParseResult parsed = showmesh::json::parse(text);
-    if (!parsed.ok || parsed.value.type() != Type::kObject) return false;
+    if (!parsed.ok || parsed.value.type() != Type::kObject) return SavedStateRead::kNone;
     auto find = [](const showmesh::json::Value& object, const char* name) { return detail::findMember(object, name); };
+    const showmesh::json::Value* version = find(parsed.value, "version");
+    if (version == nullptr || version->type() != Type::kNumber || version->number() != kFallbackStateFileVersion) {
+        return SavedStateRead::kUnknownVersion;
+    }
     auto text_ = [&](const showmesh::json::Value& object, const char* name, std::string* value) {
         const showmesh::json::Value* v = find(object, name);
         if (v == nullptr || v->type() != Type::kString) return false;
@@ -146,16 +160,16 @@ inline bool ParseFallbackState(const std::string& text, FallbackExecutionState* 
         !text_(parsed.value, "packageId", &state.packageId) ||
         !text_(parsed.value, "packageRevision", &state.packageRevision) ||
         !text_(parsed.value, "cutoffAt", &state.cutoffAt) || since == nullptr || since->type() != Type::kNumber) {
-        return false;
+        return SavedStateRead::kNone;
     }
     if (mode == FallbackModeName(FallbackMode::kFallback)) {
         state.mode = FallbackMode::kFallback;
     } else if (mode == FallbackModeName(FallbackMode::kResting)) {
         state.mode = FallbackMode::kResting;
     } else {
-        return false;
+        return SavedStateRead::kNone;
     }
-    if (state.playlistName.empty()) return false;
+    if (state.playlistName.empty()) return SavedStateRead::kNone;
     state.sinceMillis = static_cast<TimeMillis>(since->number());
 
     const showmesh::json::Value* occurrence = find(parsed.value, "occurrence");
@@ -167,19 +181,19 @@ inline bool ParseFallbackState(const std::string& text, FallbackExecutionState* 
         if (!text_(*occurrence, "entryKey", &state.occurrence.entryKey) || resolved == nullptr ||
             resolved->type() != Type::kBool || delivered == nullptr || delivered->type() != Type::kBool ||
             ids == nullptr || ids->type() != Type::kObject) {
-            return false;
+            return SavedStateRead::kNone;
         }
         state.occurrence.present = true;
         state.occurrence.identityResolved = resolved->boolean();
         state.occurrence.delivered = delivered->boolean();
         if (loop != nullptr && loop->type() == Type::kNumber) state.occurrence.playlistLoop = static_cast<int>(loop->number());
         for (const auto& id : ids->members()) {
-            if (id.second.type() != Type::kString) return false;
+            if (id.second.type() != Type::kString) return SavedStateRead::kNone;
             state.occurrence.executionIds.emplace_back(id.first, id.second.string());
         }
     }
     *out = state;
-    return true;
+    return SavedStateRead::kLoaded;
 }
 
 inline std::string FallbackStatePath(const std::string& credentialDir) {
@@ -196,11 +210,16 @@ inline bool SaveFallbackState(const std::string& credentialDir, const FallbackEx
     return detail::writeExecutorKeyFile(path, RenderFallbackState(state));
 }
 
-// A file that is missing or cannot be read means normal: false is returned.
-inline bool LoadFallbackState(const std::string& credentialDir, FallbackExecutionState* out) {
+inline SavedStateRead LoadFallbackState(const std::string& credentialDir, FallbackExecutionState* out) {
     std::string text;
-    if (!showmesh::readFileWhole(FallbackStatePath(credentialDir), &text)) return false;
+    if (!showmesh::readFileWhole(FallbackStatePath(credentialDir), &text)) return SavedStateRead::kNone;
     return ParseFallbackState(text, out);
+}
+
+// Moves a file this build must not resume out of the way, keeping it for a person to read.
+inline void SetAsideFallbackState(const std::string& credentialDir) {
+    const std::string path = FallbackStatePath(credentialDir);
+    std::rename(path.c_str(), (path + ".unknown-version").c_str());
 }
 
 }  // namespace fallback

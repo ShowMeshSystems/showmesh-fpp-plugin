@@ -300,8 +300,15 @@ persistence and the FPP 10 shutdown-predicate changes in place:
 | `A6_clean_teardown` | `fppd` exits after the stop signal with the plugin still resident and writes no crash signature to the log tail taken after that signal; on FPP 10, additionally that a runtime unload returns `loaded:false` **and** withdraws the plugin's registered command, and that a second shutdown with the plugin unloaded is also clean. | PASS | PASS |
 | `A7_no_second_multisync_listener` | Exactly one UDP 32320 socket exists, held by `fppd`, both before and after a restart. | PASS | PASS |
 | `A8_restart_survival` | The command is registered again after a container recreate, and that restart's own log tail carries the load line with no load-failure line. | PASS | PASS |
+| `A10_restart_resumes_saved_fallback_state` | With a saved fallback state on disk for a playlist FPP's scheduler is playing, fppd is restarted in place (`fppd_stop`, `fppd_start`), the scheduler starts the playlist again, and the plugin's own status says `fallback` under that playlist. | PASS | PASS |
+| `A11_idle_restart_hands_back_after_settle_window` | With the same saved state and FPP idle, the plugin's status says `fallback` after the restart, then `normal` no sooner than the 30 second settle window, and the state file is removed. | PASS | PASS |
 
 **Both runs exit 0, with all eight assertions passing on both majors.**
+
+`A10` and `A11` were added later and observed on 2026-10-06 on an x86_64 host
+running the `amd64` image natively: FPP's first callback came 19 ms (FPP 9.5.3)
+and 21 ms (FPP 10.0) after the plugin loaded, and the idle hand-back came
+30.0 s after it. `A9` is described where it is defined in the script.
 
 ### A6 on FPP 9 caught a real product defect, since fixed
 

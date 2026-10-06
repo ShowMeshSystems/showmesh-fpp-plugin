@@ -4,7 +4,7 @@
 // coordinator and a real node agent.
 //
 //   fallback_plugin_driver <state-dir> <credential-dir> <coordinator-public-key-base64>
-//                          <fpp-instance-uuid> <playlist-definition.json> [playlist-playing-at-start]
+//                          <fpp-instance-uuid> <playlist-definition.json>
 //
 // <state-dir> holds config.json ({"coordinatorUrl":"..."}) and receives the
 // status files and the installed program. Input lines:
@@ -71,7 +71,7 @@ class PrintingNotifier : public showmesh::fallback::FallbackStateNotifier {
 int main(int argc, char** argv) {
     if (argc < 6) {
         std::fprintf(stderr, "usage: %s <state-dir> <credential-dir> <coordinator-public-key-base64> "
-                             "<fpp-instance-uuid> <playlist-definition.json> [playlist-playing-at-start]\n",
+                             "<fpp-instance-uuid> <playlist-definition.json>\n",
                      argv[0]);
         return 2;
     }
@@ -106,7 +106,6 @@ int main(int argc, char** argv) {
     options.credentialDir = credentialDir;
     options.installPath = showmesh::joinPath(stateDir, "fallback-program.json");
     options.pinnedKey = pinnedKey;
-    options.playingPlaylistAtStart = argc > 6 ? argv[6] : "";
     options.notifier = &notifier;
     options.log = logLine;
     showmesh::fallback::FallbackExecutor executor(options, &transport);

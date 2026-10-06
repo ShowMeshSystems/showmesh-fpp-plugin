@@ -388,8 +388,9 @@ interval and then at double the wait each time, up to ten minutes.
 `GET {coordinatorUrl}/healthz`. Only a 2xx counts as reached. Loss is confirmed
 after a run of failed probes that also spans a minimum time, never on one
 failed or slow request. The defaults are hypotheses, not measurements, and each
-is an FPP setting. While loss is confirmed the probe runs at least every 10
-seconds whatever the setting says, and is never backed off.
+is an FPP setting. Outside `normal`, and while loss is confirmed, the probe
+runs at least every 10 seconds whatever the setting says, and is never backed
+off.
 
 | Setting | Default |
 |---|---|
@@ -408,7 +409,9 @@ the identical body. Nothing is ever sent in place of a refused activation.
 
 **The cutoff.** The cutoff is the expiry of the program copy fallback was
 entered with, checked at every entry and every probe. At the cutoff the plugin
-goes to `resting`: it sends no further activation and stops nothing. It never
+goes to `resting`: it sends no further activation and stops nothing. The
+cutoff is also checked before every request to a node, so a retry already
+waiting and a program a node asked for are not sent after it. It never
 extends, refetches or relaxes a program during an outage.
 
 **The hand-back.** A coordinator that answers again does not take the show back
@@ -417,19 +420,39 @@ playlist it entered under, or names a different one. At that moment it goes to
 `normal`, reports that, fetches its program at once, acknowledges the copy it
 then holds whether or not it changed, and hands it to the nodes. If the
 coordinator is still lost then, it does the same after the first probe that
-succeeds. It never posts an observation for an entry that began while it was
-the executor.
+succeeds. A fetch that gets no answer, and an acknowledgement that gets no
+success answer, stay owed and are tried again at every probe: the coordinator
+holds the player until the acknowledgement lands. An expired copy is never
+acknowledged as verified. The plugin never posts an observation for an entry
+that began while it was the executor.
 
 **A plugin restart is not a hand-back.** Before the first activation of an
 entry leaves, the state, the playlist, the program copy and that entry's
 execution ids are written to `/etc/showmesh-fpp-plugin/fallback-state.json` at
-mode 0600. A plugin that starts while FPP is playing the playlist the file
-names, before the cutoff, resumes the state it left and sends nothing for the
-entry already handled. An entry a restart interrupted is retried with its
-recorded execution ids, so a node that already ran it answers
-`replayed-execution`. A plugin that starts while FPP plays nothing or another
-playlist, or after the cutoff, hands back: the playlist name alone cannot tell
-the same run from a later one, so the cutoff bounds a resume.
+mode 0600, one writer at a time. FPP 9 and FPP 10 both load plugins before
+their main loop starts any playlist, so a plugin cannot read what FPP is
+playing when it starts. A plugin that starts with a saved state whose cutoff
+has not passed is therefore undecided, and until FPP decides it the plugin
+behaves as the saved state: it posts no observation, reports the saved state,
+and fetches, acknowledges and hands back nothing.
+
+- The first callback that names the saved playlist resumes the state. The
+  first entry callback for the recorded entry key is the entry already handled
+  and gets no Cue, whatever its pass counter says, because FPP's counter starts
+  over with fppd.
+- A callback that names another playlist, a `stop`, or FPP naming no playlist
+  for 30 seconds after the plugin started, hands back. The 30 seconds are a
+  hypothesis (`kHypothesisRestartSettleMillis`): in the container bench FPP's
+  first callback came 19 ms after the plugin loaded on FPP 9.5.3 and 21 ms on
+  FPP 10.0. A real player has not been measured.
+- An entry a restart interrupted is not tried again: a Cue started well inside
+  an entry is worse than a missed one. It is recorded as
+  `interrupted-by-restart`.
+- A saved state whose cutoff has passed, and a file written by another version
+  of the plugin, are never resumed: the plugin starts in `normal` with the
+  hand-back steps owed. The playlist name cannot tell the run fallback was
+  entered in from a later run of the same playlist, so the cutoff is what
+  bounds a resume.
 
 **The state report.** The plugin tells the coordinator its state with
 `PUT /api/v1/fallback-programs/{fppInstanceId}/fallback-state`: at once on
@@ -453,8 +476,9 @@ The same lines go to FPP's log.
 
 FPP's warning list carries one notice while the coordinator is lost or the
 plugin is not in `normal`, and the status file's `message` is the same text. It
-names the playlist and the cutoff, and says this player is starting the planned
-cues only while that is true.
+names the playlist and the cutoff, says this player is starting the planned
+cues only while that is true, and asks the operator to restore the coordinator
+only while it is not answering.
 
 Routes this depends on, beyond the two the sending half uses:
 

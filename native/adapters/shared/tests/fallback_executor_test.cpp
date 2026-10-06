@@ -5,6 +5,7 @@
 
 #include <sys/stat.h>
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <condition_variable>
@@ -53,8 +54,9 @@ const char* kNodeB = "192.0.2.22:80";
 constexpr TimeMillis kCompiledAtMillis = 1791201600000;
 constexpr TimeMillis kFiveMinutesMillis = 300000;
 
-TimeMillis gClock = kCompiledAtMillis + kFiveMinutesMillis;
-TimeMillis fixtureClock() { return gClock; }
+// Atomic because some cases run the runtime worker and the executor's own thread.
+std::atomic<TimeMillis> gClock{kCompiledAtMillis + kFiveMinutesMillis};
+TimeMillis fixtureClock() { return gClock.load(); }
 
 std::string readFile(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
@@ -240,12 +242,20 @@ class FakeNetwork : public showmesh::HttpTransport {
         return lines;
     }
 
+    // The next acknowledgements get these answers, in order, instead of 200.
+    void scriptAcknowledge(HttpResponse response) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        acknowledgeScript_.push_back(std::move(response));
+    }
+
     void scriptActivation(const std::string& address, HttpResponse response) {
         std::lock_guard<std::mutex> lock(mutex_);
         activationScript_[address].push_back(std::move(response));
     }
 
-    bool coordinatorUp = true;
+    std::atomic<bool> coordinatorUp{true};
+    // The coordinator answers its health probe while the program fetch gets no answer.
+    std::atomic<bool> programFetchUnreachable{false};
     int healthStatus = 200;
     int registrationStatus = 200;
     bool registrationChanged = true;
@@ -275,12 +285,18 @@ class FakeNetwork : public showmesh::HttpTransport {
                 if (registrationStatus != 200) return answer(registrationStatus, registrationRefusalBody);
                 return answer(200, std::string("{\"changed\":") + (registrationChanged ? "true" : "false") + "}");
             }
-            if (path.find("/acknowledge") != std::string::npos) return answer(200, "{}");
+            if (path.find("/acknowledge") != std::string::npos) {
+                if (acknowledgeScript_.empty()) return answer(200, "{}");
+                HttpResponse next = acknowledgeScript_.front();
+                acknowledgeScript_.pop_front();
+                return next;
+            }
             if (path.find("/fallback-state") != std::string::npos) {
                 if (stateReportStatus != 200) return answer(stateReportStatus, stateReportRefusalBody);
                 return answer(200, std::string("{\"recorded\":") + (stateReportRecorded ? "true" : "false") +
                                        ",\"state\":\"normal\"}");
             }
+            if (programFetchUnreachable.load()) return noResponse();
             return answer(200, programEnvelope);
         }
         const std::string address = request.url.substr(7, request.url.find('/', 7) - 7);
@@ -296,6 +312,7 @@ class FakeNetwork : public showmesh::HttpTransport {
     std::mutex mutex_;
     std::vector<Sent> sent_;
     std::map<std::string, std::deque<HttpResponse>> activationScript_;
+    std::deque<HttpResponse> acknowledgeScript_;
 };
 
 class RecordingNotifier : public FallbackStateNotifier {
@@ -392,12 +409,16 @@ class Bench {
         options.installPath = installPath();
         options.pinnedKey = pinnedKey;
         options.detector = detectorConfig;
-        options.playingPlaylistAtStart = playingPlaylistAtStart;
         options.randomBytes = fixtureRandom;
         options.notifier = &notifier;
-        options.log = [this](bool, const std::string& line) { logs.push_back(line); };
+        options.log = [this](bool, const std::string& line) {
+            std::lock_guard<std::mutex> lock(recordMutex);
+            logs.push_back(line);
+        };
         options.pause = [this](int millis) {
+            std::lock_guard<std::mutex> lock(recordMutex);
             pauses.push_back(millis);
+            if (onPause) onPause();
             return true;
         };
         sink.network = &network;
@@ -452,14 +473,15 @@ class Bench {
 
     PinnedKeyLoadResult pinnedKey = fixturePinnedKey();
     OutageDetectorConfig detectorConfig;
-    // What FPP is playing when the next executor is made: a plugin restart reads it once.
-    std::string playingPlaylistAtStart;
     FakeNetwork network;
     RecordingNotifier notifier;
     FixedDefinitions definitions;
     CountingSink sink;
+    std::mutex recordMutex;
     std::vector<std::string> logs;
     std::vector<int> pauses;
+    // Runs inside every wait between delivery attempts.
+    std::function<void()> onPause;
     std::unique_ptr<FallbackExecutor> executor;
     std::unique_ptr<ShowMeshRuntime> runtime;
 
@@ -1198,6 +1220,9 @@ TEST(EveryNoticeIsOperatorCopyAndNamesThePlaylistAndTheCutoffWhileItHoldsOne) {
                 facts.coordinatorLost = true;
                 facts.coordinatorReachable = reachable;
                 CHECK(isOperatorCopy(FallbackNotice(facts)));
+                facts.waitingForFpp = true;
+                CHECK(isOperatorCopy(FallbackNotice(facts)));
+                facts.waitingForFpp = false;
                 for (const PlayerOutcomeCopy& copy : kPlayerOutcomeCopy) {
                     facts.problem = copy.word;
                     CHECK(isOperatorCopy(FallbackNotice(facts)));
@@ -1299,8 +1324,10 @@ TEST(ABoundaryNoNodeAcceptedSaysSoAndTheNextOneThatStartsRestoresTheNotice) {
     bench.network.scriptActivation(kNodeA, nodeAnswer(403, "cue-not-authorized"));
     bench.loseCoordinator();
     bench.callback("playing", 0);
-    CHECK_EQ(bench.executor->notice(), std::string(kNotStartingPrefix) + "no node started the last planned cue" +
-                                           kRestoreCoordinatorAction);
+    CHECK_EQ(bench.executor->notice(),
+             std::string("The coordinator stopped answering, and this player is not starting the planned cues for "
+                         "playlist Main Show because no node started the last planned cue") +
+                 kRestoreCoordinatorAction);
 
     bench.callback("query_next", 0);
     bench.callback("playing", 1);
@@ -1315,8 +1342,11 @@ TEST(ACueStartedOnOnlySomeNodesSaysSo) {
     bench.network.nodesDown.insert(kNodeB);
     bench.loseCoordinator();
     bench.callback("playing", 0);
-    CHECK_EQ(bench.executor->notice(), std::string(kStartedOnSomeNodesMessage));
-    CHECK_EQ(bench.statusMessage(), std::string(kStartedOnSomeNodesMessage));
+    const std::string someNodes = "The coordinator stopped answering, and this player started the last planned cue for "
+                                  "playlist Main Show on only some of its nodes. Check the nodes and restore the "
+                                  "coordinator.";
+    CHECK_EQ(bench.executor->notice(), someNodes);
+    CHECK_EQ(bench.statusMessage(), someNodes);
 }
 
 TEST(ActivationRecordsAreNotPushedOutByProgramHandOffs) {
@@ -1408,10 +1438,8 @@ void enterFallback(Bench* bench) {
 void stopPlaylist(Bench* bench) { bench->callback("playing", 0, std::nullopt, ""); }
 
 // A plugin restart: a new executor and runtime over the same directories.
-void restartPlugin(Bench* bench, const std::string& fppIsPlaying) {
-    bench->playingPlaylistAtStart = fppIsPlaying;
-    bench->makeExecutor();
-}
+// Nothing tells it what FPP is playing; only FPP's callbacks and time do.
+void restartPlugin(Bench* bench) { bench->makeExecutor(); }
 
 }  // namespace
 
@@ -1496,7 +1524,8 @@ TEST(NoAnswerToAStateReportChangesTheStateAndThePluginKeepsReporting) {
         if (c.status == 404) CHECK(problem.find("too old") != std::string::npos);
         if (c.problemExpected && c.status != 404) {
             CHECK_EQ(problem, "The coordinator answered " + std::to_string(c.status) +
-                                  " to this player's state: the coordinator says why");
+                                  " to this player's state: the coordinator says why. Check this player's "
+                                  "pairing on the coordinator.");
         }
         const showmesh::json::Value file = parseJson(readFile(bench.stateDir() + "/" + kFallbackStatusFilename));
         CHECK_EQ(member(file, "stateReportProblem"), problem);
@@ -1551,7 +1580,7 @@ TEST(AtTheCutoffThePluginRestsSendsNothingMoreAndSaysSo) {
     bench.tick();
     FallbackStatusSnapshot status = bench.executor->status();
     CHECK(status.state.mode == FallbackMode::kResting);
-    CHECK_EQ(status.state.sinceMillis, gClock);
+    CHECK_EQ(status.state.sinceMillis, gClock.load());
     const std::string notice = bench.executor->notice();
     CHECK(notice.find("This player stopped starting cues for playlist Main Show at 12:15 UTC on 2026-10-05") == 0);
     CHECK_EQ(bench.statusMessage(), notice);
@@ -1836,11 +1865,11 @@ TEST(TheStateIsOnDiskBesideTheTokenBeforeTheFirstActivationLeaves) {
     }
     const std::string executionId = requestMember(bench.activation(0), "executionId");
     FallbackExecutionState atSend;
-    CHECK(ParseFallbackState(onDiskAtSend, &atSend));
+    CHECK(ParseFallbackState(onDiskAtSend, &atSend) == SavedStateRead::kLoaded);
     CHECK_EQ(modeAtSend, 0600);
     CHECK(atSend.mode == FallbackMode::kFallback);
     CHECK_EQ(atSend.playlistName, std::string(kPlaylistName));
-    CHECK_EQ(atSend.sinceMillis, gClock);
+    CHECK_EQ(atSend.sinceMillis, gClock.load());
     CHECK_EQ(atSend.occurrence.entryKey, bench.entryKey(0));
     CHECK_EQ(atSend.occurrence.playlistLoop.value_or(-1), 3);
     CHECK(!atSend.occurrence.delivered);
@@ -1850,55 +1879,99 @@ TEST(TheStateIsOnDiskBesideTheTokenBeforeTheFirstActivationLeaves) {
     CHECK_EQ(atSend.occurrence.executionIds[0].second, executionId);
 
     FallbackExecutionState after;
-    CHECK(LoadFallbackState(bench.credentialDir(), &after));
+    CHECK(LoadFallbackState(bench.credentialDir(), &after) == SavedStateRead::kLoaded);
     CHECK(after.occurrence.delivered);
     CHECK(!std::filesystem::exists(bench.statePath() + ".tmp"));
 }
 
-TEST(APluginRestartInFallbackResumesItUnderTheSamePlaylistAndDoesNotSendTheEntryAgain) {
+// A restarted plugin is told nothing about what FPP is playing: FPP loads
+// plugins before it starts any playlist. Every case below decides from the
+// callbacks FPP then sends, through the runtime entry point, or from time.
+
+TEST(APluginThatStartsWithASavedStateBehavesAsThatStateUntilFppDecidesIt) {
     Bench bench;
     enterFallback(&bench);
     const FallbackExecutionState before = bench.executor->status().state;
     const std::string firstBoot = bench.executor->bootId();
-    const std::string firstId = requestMember(bench.activation(0), "executionId");
-
-    // The plugin restarts while FPP keeps playing the same playlist.
-    gClock += 30000;
-    restartPlugin(&bench, kPlaylistName);
-    const FallbackExecutionState resumed = bench.executor->status().state;
-    CHECK(resumed.mode == FallbackMode::kFallback);
-    CHECK_EQ(resumed.playlistName, before.playlistName);
-    CHECK_EQ(resumed.sinceMillis, before.sinceMillis);
-    CHECK_EQ(resumed.cutoffAt, before.cutoffAt);
-    CHECK_NE(bench.executor->bootId(), firstBoot);
-    // From its first moment it posts nothing: the coordinator must not start what this player started.
-    CHECK(bench.executor->coordinatorLost());
-
-    bench.tick();
-    bench.callback("playing", 0);
-    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
-    CHECK_EQ(bench.sink.published.size(), static_cast<std::size_t>(0));
-
-    bench.callback("query_next", 0);
-    bench.callback("playing", 1);
-    const std::vector<Sent> activations = bench.activations();
-    CHECK_EQ(activations.size(), static_cast<std::size_t>(2));
-    if (activations.size() < 2) return;
-    CHECK_NE(requestMember(activations[1], "executionId"), firstId);
-
-    // Its report carries the state it left, under a new boot id.
     bench.network.coordinatorUp = true;
-    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    bench.network.programEnvelope = getEnvelope(fixture("program.json"));
+
+    gClock += 2000;
+    restartPlugin(&bench);
+    // Undecided: for everything the coordinator sees it is still in the saved state.
+    FallbackExecutionState now = bench.executor->status().state;
+    CHECK(now.mode == FallbackMode::kFallback);
+    CHECK_EQ(now.playlistName, before.playlistName);
+    CHECK_EQ(now.sinceMillis, before.sinceMillis);
+    CHECK(bench.executor->coordinatorLost());
+    CHECK(std::filesystem::exists(bench.statePath()));
+
+    const std::size_t mark = bench.network.order().size();
+    bench.tick();
+    // It reports the saved state after its first probe, and fetches, acknowledges and hands back nothing.
+    CHECK_EQ(joined(orderSince(&bench, mark)), "GET /healthz\nPUT " + kStateRoute + "\n");
     const showmesh::json::Value report = lastReport(&bench);
     CHECK_EQ(member(report, "state"), std::string("fallback"));
     CHECK_EQ(member(report, "playlistName"), std::string(kPlaylistName));
     CHECK_EQ(member(report, "since"), std::string("2026-10-05T12:05:20Z"));
-    CHECK_EQ(member(report, "bootId"), bench.executor->bootId());
-    CHECK_EQ(numberMember(report, "sequence"), 1.0);
-    CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(0));
+    CHECK_NE(member(report, "bootId"), firstBoot);
+    CHECK(bench.executor->status().state.mode == FallbackMode::kFallback);
+    CHECK_EQ(bench.sink.published.size(), static_cast<std::size_t>(0));
+    // What an operator reads says it is waiting, not that cues are being started.
+    CHECK(bench.executor->status().waitingForFpp);
+    const std::string waiting = "This player's plugin restarted while it was running playlist Main Show without the "
+                                "coordinator, and it is waiting for FPP to say what it is playing. Nothing to do.";
+    CHECK_EQ(bench.executor->notice(), waiting);
+    CHECK_EQ(bench.statusMessage(), waiting);
+
+    bench.callback("playing", 0);
+    CHECK(!bench.executor->status().waitingForFpp);
+    CHECK_EQ(bench.executor->notice(), bench.activeNotice(/*coordinatorAnswering=*/true));
 }
 
-TEST(ARestartThatInterruptedAnEntryRetriesItWithTheSameExecutionIdsSoTheNodeRunsItOnce) {
+TEST(TheFirstCallbackThatNamesTheSavedPlaylistResumesAndTheEntryAlreadyHandledGetsNoCue) {
+    Bench bench;
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    bench.loseCoordinator();
+    // FPP was on its third pass of the playlist when fallback started entry 0's cue.
+    bench.callback("playing", 0, 2);
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
+    const std::string firstId = requestMember(bench.activation(0), "executionId");
+
+    // fppd restarts and resumes the playlist at the same entry. Its pass counter starts over.
+    gClock += 5000;
+    restartPlugin(&bench);
+    bench.tick();
+    bench.callback("start", 0, 0);
+    CHECK(bench.executor->status().state.mode == FallbackMode::kFallback);
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.sink.published.size(), static_cast<std::size_t>(0));
+    // FPP repeating the callback for that entry changes nothing either.
+    bench.callback("playing", 0, 0);
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
+
+    // The next entry is a boundary like any other, with a new execution id.
+    bench.callback("query_next", 0, 0);
+    bench.callback("playing", 1, 0);
+    const std::vector<Sent> activations = bench.activations();
+    CHECK_EQ(activations.size(), static_cast<std::size_t>(2));
+    if (activations.size() < 2) return;
+    CHECK_NE(requestMember(activations[1], "executionId"), firstId);
+    CHECK_EQ(requestMember(activations[1], "entryKey"), bench.entryKey(1));
+}
+
+TEST(AResumeIntoALaterEntryThanTheRecordedOneStartsThatEntrysCue) {
+    Bench bench;
+    enterFallback(&bench);
+    gClock += 5000;
+    restartPlugin(&bench);
+    // FPP moved on while the plugin was down: this entry was never handled.
+    bench.callback("playing", 1, 0);
+    CHECK(bench.executor->status().state.mode == FallbackMode::kFallback);
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(2));
+}
+
+TEST(AnEntryARestartInterruptedIsNotTriedAgainAndIsRecordedAsSuch) {
     Bench bench;
     bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
     bench.loseCoordinator();
@@ -1909,52 +1982,339 @@ TEST(ARestartThatInterruptedAnEntryRetriesItWithTheSameExecutionIdsSoTheNodeRuns
         }
     };
     bench.callback("playing", 0);
-    const Sent first = bench.activation(0);
-
-    // The plugin died after the node ran the cue and before it could record that: the file says unfinished.
     bench.network.beforeAnswer = nullptr;
+
+    // The plugin died while that cue was being started: the file says unfinished.
     bench.writeFile(bench.statePath(), onDiskAtSend);
     ::chmod(bench.statePath().c_str(), 0600);
-    bench.network.scriptActivation(kNodeA, nodeAnswer(409, "replayed-execution", ",\"firstOutcome\":\"authorized\""));
-    restartPlugin(&bench, kPlaylistName);
+    gClock += 40000;
+    restartPlugin(&bench);
     bench.tick();
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
 
-    const std::vector<Sent> activations = bench.activations();
-    CHECK_EQ(activations.size(), static_cast<std::size_t>(2));
-    if (activations.size() < 2) return;
-    CHECK_EQ(activations[1].body, first.body);
-    CHECK_EQ(bench.lastActivationRecord().outcome, std::string("authorized"));
+    // FPP is forty seconds into that entry. A cue started now would be worse than a missed one.
+    bench.callback("playing", 0);
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
+    const FallbackRecord record = bench.lastActivationRecord();
+    CHECK_EQ(record.outcome, std::string(kOutcomeInterruptedByRestart));
+    CHECK_EQ(record.entryKey, bench.entryKey(0));
+    CHECK(!record.nodeAnswered);
     FallbackExecutionState after;
-    CHECK(LoadFallbackState(bench.credentialDir(), &after));
+    CHECK(LoadFallbackState(bench.credentialDir(), &after) == SavedStateRead::kLoaded);
     CHECK(after.occurrence.delivered);
 
-    // Done once: a later tick and FPP repeating the callback send nothing more.
-    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
-    bench.callback("playing", 0);
+    bench.callback("query_next", 0);
+    bench.callback("playing", 1);
     CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(2));
 }
 
-TEST(ARestartAfterTheCutoffDoesNotResumeEvenUnderTheSamePlaylistName) {
-    // The name cannot tell this run from a later run of the playlist. The plan's expiry bounds a resume.
+TEST(WhenFppStaysIdleForTheSettleWindowAfterAStartThePluginHandsBack) {
+    Bench bench;
+    enterFallback(&bench);
+    const std::string held = readFile(bench.installPath());
+    bench.network.coordinatorUp = true;
+    bench.network.programEnvelope = getEnvelope(held);
+
+    gClock += 2000;
+    restartPlugin(&bench);
+    const TimeMillis startedAt = gClock;
+    bench.tick();
+    // One probe interval short of the window: still the saved state, nothing fetched.
+    while (gClock + kHypothesisProbeIntervalMillis < startedAt + kHypothesisRestartSettleMillis) {
+        bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    }
+    CHECK(bench.executor->status().state.mode == FallbackMode::kFallback);
+    CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(0));
+    CHECK_EQ(member(lastReport(&bench), "state"), std::string("fallback"));
+    CHECK(std::filesystem::exists(bench.statePath()));
+
+    const std::size_t mark = bench.network.order().size();
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
+    CHECK(!std::filesystem::exists(bench.statePath()));
+    const std::string order = joined(orderSince(&bench, mark));
+    CHECK(order.find("PUT " + kStateRoute + "\nGET " + kProgramRoute + "\nPOST " + kAcknowledgeRoute) !=
+          std::string::npos);
+    CHECK_EQ(member(lastReport(&bench), "state"), std::string("normal"));
+    CHECK(!bench.executor->coordinatorLost());
+
+    // A playlist that starts now is the coordinator's.
+    bench.callback("playing", 0);
+    CHECK_EQ(bench.sink.published.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
+}
+
+TEST(ACallbackThatNamesAnotherPlaylistAfterAStartHandsBackAtOnce) {
+    Bench bench;
+    enterFallback(&bench);
+    bench.network.coordinatorUp = true;
+    gClock += 2000;
+    restartPlugin(&bench);
+    bench.tick();
+    const std::size_t mark = bench.network.order().size();
+    bench.callback("start", 0, 0, "Other Show");
+    CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
+    CHECK(!std::filesystem::exists(bench.statePath()));
+    CHECK_EQ(joined(orderSince(&bench, mark)), "PUT " + kStateRoute + "\nOBSERVE\n");
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
+}
+
+TEST(TheSettleWindowIsANamedHypothesis) { CHECK_EQ(kHypothesisRestartSettleMillis, 30000); }
+
+TEST(ARestartAfterTheCutoffHandsBackAtOnceWhateverFppIsDoing) {
     for (bool restingWhenItStopped : {true, false}) {
         Bench bench;
         enterFallback(&bench);
+        const std::string held = readFile(bench.installPath());
         if (restingWhenItStopped) {
             gClock = kCompiledAtMillis + 15 * 60 * 1000;
             bench.tick();
             CHECK(bench.executor->status().state.mode == FallbackMode::kResting);
         }
         gClock = kCompiledAtMillis + 16 * 60 * 1000;
-        restartPlugin(&bench, kPlaylistName);
+        restartPlugin(&bench);
         CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
         CHECK(!std::filesystem::exists(bench.statePath()));
+        // Nothing is posted before the report that must come first.
+        CHECK(bench.executor->coordinatorLost());
+        (void)held;
+    }
+    // One second before the cutoff the same restart is undecided, in the saved state.
+    Bench early;
+    enterFallback(&early);
+    gClock = kCompiledAtMillis + 15 * 60 * 1000 - 1000;
+    restartPlugin(&early);
+    CHECK(early.executor->status().state.mode == FallbackMode::kFallback);
+}
 
-        // One second before the cutoff the same restart resumes.
-        Bench early;
-        enterFallback(&early);
-        gClock = kCompiledAtMillis + 15 * 60 * 1000 - 1000;
-        restartPlugin(&early, kPlaylistName);
-        CHECK(early.executor->status().state.mode == FallbackMode::kFallback);
+TEST(AStateFileThatCannotBeReadMeansNormal) {
+    for (const char* contents : {"", "not json", "{\"version\":1,\"state\":\"fallback\"}",
+                                 "{\"version\":1,\"state\":\"dancing\",\"playlistName\":\"Main Show\","
+                                 "\"sinceMillis\":1,\"packageId\":\"p\",\"packageRevision\":\"r\",\"cutoffAt\":\"c\"}"}) {
+        Bench bench;
+        bench.writeFile(bench.statePath(), contents);
+        restartPlugin(&bench);
+        CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
+        bench.tick();
+        CHECK_EQ(member(lastReport(&bench), "state"), std::string("normal"));
+    }
+}
+
+TEST(AStateFileFromAnotherVersionIsSetAsideNeverResumedAndAHandBackFetchIsOwed) {
+    Bench bench;
+    enterFallback(&bench);
+    bench.network.coordinatorUp = true;
+    bench.network.programEnvelope = getEnvelope(readFile(bench.installPath()));
+    std::string saved = readFile(bench.statePath());
+    CHECK(saved.find("\"version\":1") != std::string::npos);
+    const std::string later = "\"version\":2";
+    saved.replace(saved.find("\"version\":1"), later.size(), later);
+    bench.writeFile(bench.statePath(), saved);
+
+    gClock += 2000;
+    restartPlugin(&bench);
+    CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
+    CHECK(!std::filesystem::exists(bench.statePath()));
+    CHECK(std::filesystem::exists(bench.statePath() + ".unknown-version"));
+    bench.tick();
+    CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(1));
+
+    // A file with no version member is treated the same way.
+    FallbackExecutionState ignored;
+    CHECK(ParseFallbackState("{\"state\":\"fallback\",\"playlistName\":\"Main Show\",\"sinceMillis\":1,"
+                             "\"packageId\":\"p\",\"packageRevision\":\"r\",\"cutoffAt\":\"2026-10-05T12:15:00Z\"}",
+                             &ignored) == SavedStateRead::kUnknownVersion);
+}
+
+TEST(APluginRestartInNormalStartsInNormalWithNothingSaved) {
+    Bench bench;
+    bench.network.programEnvelope = getEnvelope(fixture("program.json"));
+    bench.tick();
+    restartPlugin(&bench);
+    CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
+    CHECK(!std::filesystem::exists(bench.statePath()));
+    CHECK(!bench.executor->coordinatorLost());
+    bench.tick();
+    bench.callback("playing", 0);
+    CHECK_EQ(bench.sink.published.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(0));
+}
+
+TEST(ProbingIsBoundedToTenSecondsWheneverThePluginIsNotInNormalEvenWithAFreshDetector) {
+    Bench bench;
+    bench.detectorConfig.probeIntervalMillis = 60000;
+    bench.detectorConfig.minimumLossMillis = 60000;
+    bench.makeExecutor();
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    bench.network.coordinatorUp = false;
+    for (int i = 0; i < 4; ++i) bench.advanceAndTick(60000);
+    CHECK(bench.executor->coordinatorLost());
+    gClock = kCompiledAtMillis + kFiveMinutesMillis;
+    bench.callback("playing", 0);
+    CHECK(bench.executor->status().state.mode == FallbackMode::kFallback);
+
+    // A restart: this run's detector has confirmed nothing, and the coordinator answers.
+    bench.network.coordinatorUp = true;
+    restartPlugin(&bench);
+    bench.tick();
+    const std::size_t before = bench.network.count("GET", "/healthz");
+    for (int second = 0; second < 25; ++second) bench.advanceAndTick(1000);
+    // Undecided, twenty-five seconds: probes at 10 s and 20 s although the setting says 60 s.
+    CHECK_EQ(bench.network.count("GET", "/healthz") - before, static_cast<std::size_t>(2));
+    CHECK(!bench.executor->status().coordinatorLost);
+
+    bench.callback("playing", 0);
+    const std::size_t resumed = bench.network.count("GET", "/healthz");
+    for (int second = 0; second < 60; ++second) bench.advanceAndTick(1000);
+    CHECK_EQ(bench.network.count("GET", "/healthz") - resumed, static_cast<std::size_t>(6));
+}
+
+// --- what is owed to the coordinator after a hand-back ------------------------
+
+TEST(AHandBackAcknowledgementThatFailsStaysOwedAndIsRetriedAtEveryProbeUntilItSucceeds) {
+    Bench bench;
+    enterFallback(&bench);
+    ProgramSpec newer = twoEntryProgram(bench);
+    newer.revision = "rev-b";
+    newer.packageId = "pkg-b";
+    bench.network.coordinatorUp = true;
+    bench.network.programEnvelope = getEnvelope(signedProgram(newer));
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+
+    // The coordinator has just come back: its first answers are a timeout and a 5xx.
+    bench.network.scriptAcknowledge(noResponse());
+    bench.network.scriptAcknowledge(answer(503, "{\"title\":\"Unavailable\"}"));
+    stopPlaylist(&bench);
+    bench.tick();
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.executor->status().programRevision, std::string("rev-b"));
+
+    // Not on every 250 ms tick, on the probe cadence.
+    for (int i = 0; i < 19; ++i) bench.advanceAndTick(250);
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(1));
+    bench.advanceAndTick(250);
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(2));
+    // The fetch between says unchanged; the acknowledgement is still owed.
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    const std::vector<Sent> acks = bench.network.sent("POST", "/acknowledge");
+    CHECK_EQ(acks.size(), static_cast<std::size_t>(3));
+    if (acks.size() < 3) return;
+    for (const Sent& ack : acks) {
+        CHECK_EQ(member(parseJson(ack.body), "revision"), std::string("rev-b"));
+        CHECK_EQ(member(parseJson(ack.body), "verificationResult"), std::string("verified"));
+    }
+    // It succeeded: nothing more is sent, through a full refetch interval of unchanged fetches.
+    for (int i = 0; i < 14; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(3));
+    CHECK(bench.network.count("GET", kProgramRoute) >= 2);
+}
+
+TEST(AnExpiredCopyIsNeverAcknowledgedAsVerified) {
+    Bench bench;
+    enterFallback(&bench);
+    const std::string held = readFile(bench.installPath());
+    // The outage outlasts the plan; the coordinator comes back still serving the same expired copy.
+    gClock = kCompiledAtMillis + 15 * 60 * 1000;
+    bench.tick();
+    CHECK(bench.executor->status().state.mode == FallbackMode::kResting);
+    bench.network.coordinatorUp = true;
+    bench.network.programEnvelope = getEnvelope(held);
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    stopPlaylist(&bench);
+    for (int i = 0; i < 3; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+
+    const std::vector<Sent> acks = bench.network.sent("POST", "/acknowledge");
+    CHECK(!acks.empty());
+    for (const Sent& ack : acks) {
+        CHECK_EQ(member(parseJson(ack.body), "verificationResult"), std::string("mismatched-program"));
+    }
+}
+
+TEST(AHandBackFetchThatGetsNoAnswerIsRetriedOnTheProbeCadenceNotOnEveryTick) {
+    Bench bench;
+    enterFallback(&bench);
+    bench.network.coordinatorUp = true;
+    bench.network.programEnvelope = getEnvelope(readFile(bench.installPath()));
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    bench.network.programFetchUnreachable = true;
+    stopPlaylist(&bench);
+    bench.tick();
+    CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(1));
+    for (int i = 0; i < 19; ++i) bench.advanceAndTick(250);
+    CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(1));
+    bench.advanceAndTick(250);
+    CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(2));
+
+    bench.network.programFetchUnreachable = false;
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(3));
+    CHECK_EQ(bench.network.count("POST", "/acknowledge"), static_cast<std::size_t>(1));
+}
+
+// --- nothing leaves after the cutoff ------------------------------------------
+
+TEST(ARetryAlreadyWaitingIsNotSentAfterTheCutoffAndNeitherIsAProgram) {
+    Bench bench;
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    bench.loseCoordinator();
+    bench.network.nodesDown.insert(kNodeA);
+    // The entry starts 100 ms before the cutoff. The node does not answer, and the wait before the retry crosses it.
+    gClock = kCompiledAtMillis + 15 * 60 * 1000 - 100;
+    bench.onPause = [] { gClock += 250; };
+    bench.callback("playing", 0);
+
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(0));
+    const FallbackRecord record = bench.lastActivationRecord();
+    CHECK_EQ(record.outcome, std::string(kOutcomeCutoffPassed));
+    CHECK_EQ(record.attempts, 1);
+    CHECK(!record.nodeAnswered);
+    CHECK(record.reason.find("ran out before the node answered") != std::string::npos);
+
+    Bench programAsked;
+    programAsked.writeFile(programAsked.installPath(), signedProgram(twoEntryProgram(programAsked)));
+    programAsked.loseCoordinator();
+    programAsked.network.scriptActivation(kNodeA, nodeAnswer(409, "program-not-installed"));
+    gClock = kCompiledAtMillis + 15 * 60 * 1000 - 100;
+    programAsked.network.beforeAnswer = [](const std::string& method, const std::string&) {
+        if (method == "POST") gClock += 200;
+    };
+    programAsked.callback("playing", 0);
+    // The node asked for the program, but by then the cutoff had passed: no program and no retry.
+    CHECK_EQ(programAsked.activations().size(), static_cast<std::size_t>(1));
+    CHECK_EQ(programAsked.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(0));
+    CHECK_EQ(programAsked.lastActivationRecord().outcome, std::string(kOutcomeCutoffPassed));
+}
+
+TEST(TheNoticesAreTrueWhenTheCoordinatorIsAnsweringAgain) {
+    Bench bench;
+    enterFallback(&bench);
+    gClock = kCompiledAtMillis + 15 * 60 * 1000;
+    bench.tick();
+    const std::string restingWhileLost = bench.executor->notice();
+    CHECK(restingWhileLost.find("Restore the coordinator") != std::string::npos);
+
+    bench.network.coordinatorUp = true;
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    const std::string restingWhileBack = bench.executor->notice();
+    CHECK(restingWhileBack.find("This player stopped starting cues for playlist Main Show at 12:15 UTC on "
+                                "2026-10-05") == 0);
+    CHECK(restingWhileBack.find("Restore the coordinator") == std::string::npos);
+    CHECK(restingWhileBack.find(kCoordinatorTakesOverAction) != std::string::npos);
+    CHECK_EQ(bench.statusMessage(), restingWhileBack);
+
+    for (BoundaryResult result : {BoundaryResult::kNotStarted, BoundaryResult::kStartedOnSomeNodes}) {
+        NoticeFacts facts;
+        facts.state.mode = FallbackMode::kFallback;
+        facts.state.playlistName = "Main Show";
+        facts.state.cutoffAt = "2026-10-05T12:15:00Z";
+        facts.state.lastBoundary = result;
+        facts.coordinatorReachable = true;
+        const std::string notice = FallbackNotice(facts);
+        CHECK(notice.rfind("The coordinator is answering again", 0) == 0);
+        CHECK(notice.find("stopped answering") == std::string::npos);
+        CHECK(notice.find("estore the coordinator") == std::string::npos);
     }
 }
 
@@ -1971,61 +2331,6 @@ TEST(TheReportNamesThePlaylistAsFppsOwnStatusSpellsIt) {
     CHECK_EQ(member(parseJson(StateReportBody(report)), "playlistName"), std::string("Main Show"));
 }
 
-TEST(ARestartAfterThePlaylistEndedHandsBackBecauseTheBoundaryPassedWhileThePluginWasDown) {
-    for (const char* fppIsPlaying : {"", "Other Show"}) {
-        Bench bench;
-        enterFallback(&bench);
-        const std::string held = readFile(bench.installPath());
-        bench.network.coordinatorUp = true;
-        bench.network.programEnvelope = getEnvelope(held);
-
-        gClock += 30000;
-        restartPlugin(&bench, fppIsPlaying);
-        CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
-        CHECK(!std::filesystem::exists(bench.statePath()));
-        // Nothing is posted before the report that must come first.
-        CHECK(bench.executor->coordinatorLost());
-
-        const std::size_t mark = bench.network.order().size();
-        bench.tick();
-        const std::vector<std::string> after = orderSince(&bench, mark);
-        CHECK_EQ(at(after, 0), std::string("GET /healthz"));
-        CHECK_EQ(at(after, 1), "PUT " + kStateRoute);
-        CHECK_EQ(at(after, 2), "GET " + kProgramRoute);
-        CHECK_EQ(at(after, 3), "POST " + kAcknowledgeRoute);
-        const showmesh::json::Value report = lastReport(&bench);
-        CHECK_EQ(member(report, "state"), std::string("normal"));
-        CHECK_EQ(member(report, "since"), std::string("2026-10-05T12:05:50Z"));
-        CHECK(!bench.executor->coordinatorLost());
-    }
-}
-
-TEST(AStateFileThatCannotBeReadMeansNormal) {
-    for (const char* contents : {"", "not json", "{\"state\":\"fallback\"}", "{\"state\":\"dancing\",\"playlistName\":\"Main Show\","
-                                 "\"sinceMillis\":1,\"packageId\":\"p\",\"packageRevision\":\"r\",\"cutoffAt\":\"c\"}"}) {
-        Bench bench;
-        bench.writeFile(bench.statePath(), contents);
-        restartPlugin(&bench, kPlaylistName);
-        CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
-        bench.tick();
-        CHECK_EQ(member(lastReport(&bench), "state"), std::string("normal"));
-    }
-}
-
-TEST(APluginRestartInNormalStartsInNormalWithNothingSaved) {
-    Bench bench;
-    bench.network.programEnvelope = getEnvelope(fixture("program.json"));
-    bench.tick();
-    restartPlugin(&bench, kPlaylistName);
-    CHECK(bench.executor->status().state.mode == FallbackMode::kNormal);
-    CHECK(!std::filesystem::exists(bench.statePath()));
-    CHECK(!bench.executor->coordinatorLost());
-    bench.tick();
-    bench.callback("playing", 0);
-    CHECK_EQ(bench.sink.published.size(), static_cast<std::size_t>(1));
-    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(0));
-}
-
 TEST(TheSavedStateSurvivesBeingWrittenAndReadBack) {
     FallbackExecutionState state;
     state.enter(1234, "Main Show", "pkg", "rev", "2026-10-05T12:15:00Z");
@@ -2036,7 +2341,7 @@ TEST(TheSavedStateSurvivesBeingWrittenAndReadBack) {
     state.occurrence.executionIds = {{"node-a", "id-a"}, {"node-b", "id-b"}};
     state.rest(5678);
     FallbackExecutionState read;
-    CHECK(ParseFallbackState(RenderFallbackState(state), &read));
+    CHECK(ParseFallbackState(RenderFallbackState(state), &read) == SavedStateRead::kLoaded);
     CHECK(read.mode == FallbackMode::kResting);
     CHECK_EQ(read.sinceMillis, static_cast<TimeMillis>(5678));
     CHECK_EQ(read.playlistName, std::string("Main Show"));
@@ -2302,6 +2607,133 @@ TEST(StopDuringTheProgramFetchSkipsTheAcknowledgeAndTheHandOuts) {
     CHECK_EQ(bench.network.count("PUT", kNodeProgramPathPrefix), static_cast<std::size_t>(0));
 }
 
+// --- the worker and the executor's own thread together ------------------------
+//
+// These cases start the runtime, so the runtime worker and the executor's
+// thread run at once. They are what the thread sanitizer run is for.
+
+namespace {
+
+bool waitUntil(const std::function<bool()>& done, int millis = 8000) {
+    for (int waited = 0; waited < millis; waited += 5) {
+        if (done()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return done();
+}
+
+// Moves the fixture clock forward one probe interval at a time until done.
+bool advanceUntil(const std::function<bool()>& done) {
+    for (int step = 0; step < 200; ++step) {
+        if (done()) return true;
+        gClock += kHypothesisProbeIntervalMillis;
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    }
+    return done();
+}
+
+void fppCallback(Bench* bench, const char* action, int position, int loop, const char* playlist = kPlaylistName) {
+    bench->runtime->observeCallback(playlist, action, "mainPlaylist", position, "a.fseq", "", loop);
+}
+
+FallbackMode modeOnDisk(Bench* bench) {
+    FallbackExecutionState onDisk;
+    return LoadFallbackState(bench->credentialDir(), &onDisk) == SavedStateRead::kLoaded ? onDisk.mode
+                                                                                         : FallbackMode::kNormal;
+}
+
+}  // namespace
+
+TEST(TwoThreads_OutageDeliveryRecoveryAndHandBack) {
+    Bench bench;
+    ProgramSpec longLived = twoEntryProgram(bench);
+    longLived.expiresAt = "2026-10-06T12:00:00Z";
+    const std::string program = signedProgram(longLived);
+    bench.writeFile(bench.installPath(), program);
+    bench.network.programEnvelope = getEnvelope(program);
+    bench.network.coordinatorUp = false;
+    bench.runtime->start();
+
+    CHECK(advanceUntil([&] { return bench.executor->coordinatorLost(); }));
+    // The worker delivers and saves the state while the executor's thread keeps probing.
+    fppCallback(&bench, "playing", 0, 0);
+    CHECK(waitUntil([&] { return bench.activations().size() == 1; }));
+    fppCallback(&bench, "query_next", 0, 0);
+    fppCallback(&bench, "playing", 1, 0);
+    CHECK(waitUntil([&] { return bench.activations().size() == 2; }));
+
+    bench.network.coordinatorUp = true;
+    CHECK(advanceUntil([&] { return bench.executor->status().coordinatorReachable; }));
+    CHECK(waitUntil([&] { return bench.network.count("PUT", "/fallback-state") >= 1; }));
+
+    // The worker hands back while the executor's thread reports and then fetches.
+    bench.runtime->observeCallback("", "stop", "", 0, "", "");
+    CHECK(waitUntil([&] { return bench.executor->status().state.mode == FallbackMode::kNormal; }));
+    CHECK(advanceUntil([&] { return bench.network.count("POST", "/acknowledge") >= 1; }));
+    bench.runtime->stop();
+
+    CHECK(!std::filesystem::exists(bench.statePath()));
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(2));
+    CHECK_EQ(bench.sink.published.size(), static_cast<std::size_t>(0));
+    CHECK_EQ(member(lastReport(&bench), "state"), std::string("normal"));
+}
+
+TEST(TwoThreads_TheCutoffArrivesWhileEntriesKeepStarting) {
+    Bench bench;
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    bench.network.coordinatorUp = false;
+    bench.runtime->start();
+    CHECK(advanceUntil([&] { return bench.executor->coordinatorLost(); }));
+    fppCallback(&bench, "playing", 0, 0);
+    CHECK(waitUntil([&] { return bench.executor->status().state.mode == FallbackMode::kFallback; }));
+
+    // Entries keep starting on the worker while the clock crosses the cutoff under the executor's thread.
+    gClock = kCompiledAtMillis + 15 * 60 * 1000 - 2000;
+    for (int pass = 1; pass <= 40; ++pass) {
+        fppCallback(&bench, "query_next", pass % 2, pass);
+        fppCallback(&bench, "playing", (pass + 1) % 2, pass);
+        gClock += 250;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(waitUntil([&] { return bench.executor->status().state.mode == FallbackMode::kResting; }));
+    CHECK(waitUntil([&] { return bench.runtime->handoff().pending() == 0; }));
+    bench.runtime->stop();
+
+    // Whichever thread saw the cutoff first, the file agrees with the state and nothing was sent after it.
+    CHECK(modeOnDisk(&bench) == FallbackMode::kResting);
+    const std::size_t sent = bench.activations().size();
+    for (const FallbackRecord& record : bench.executor->status().recentActivations) {
+        if (record.outcome == "authorized") CHECK(record.atMillis < kCompiledAtMillis + 15 * 60 * 1000);
+    }
+    bench.runtime->start();
+    fppCallback(&bench, "query_next", 0, 99);
+    fppCallback(&bench, "playing", 1, 99);
+    CHECK(waitUntil([&] { return bench.runtime->handoff().pending() == 0; }));
+    bench.runtime->stop();
+    CHECK_EQ(bench.activations().size(), sent);
+}
+
+TEST(TwoThreads_ASettleWindowHandBackRacingFppsFirstCallbackLeavesTheFileAgreeingWithTheState) {
+    for (int round = 0; round < 6; ++round) {
+        Bench bench;
+        enterFallback(&bench);
+        gClock += 2000;
+        restartPlugin(&bench);
+        bench.runtime->start();
+        // The settle window ends on the executor's thread just as FPP names the playlist on the worker.
+        gClock += kHypothesisRestartSettleMillis - (round % 2 == 0 ? 0 : 1);
+        fppCallback(&bench, "playing", 1, 0);
+        CHECK(waitUntil([&] { return bench.runtime->handoff().pending() == 0; }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        bench.runtime->stop();
+
+        // Either outcome is allowed at the edge. A file that disagrees with the state is not.
+        const FallbackMode mode = bench.executor->status().state.mode;
+        CHECK(modeOnDisk(&bench) == mode);
+        CHECK(mode == FallbackMode::kNormal || mode == FallbackMode::kFallback);
+    }
+}
+
 TEST(BothShippingAdaptersConstructTheDeliveryAndHandItsRecorderToTheRuntime) {
     for (const char* adapter : {"fpp9/plugin.cpp", "fpp10/plugin.cpp"}) {
         const std::string source = readFile(adapter);
@@ -2312,9 +2744,8 @@ TEST(BothShippingAdaptersConstructTheDeliveryAndHandItsRecorderToTheRuntime) {
         CHECK(source.find("runtime_.observeCallback(") != std::string::npos);
     }
     const std::string delivery = readFile("shared/fallback_activation_delivery.h");
-    // What FPP is playing is read once at construction, for a saved state to be resumed or handed back.
-    CHECK(delivery.find("Player::INSTANCE.IsPlaying()") != std::string::npos);
-    CHECK(delivery.find("options.playingPlaylistAtStart = Player::INSTANCE.GetPlaylistName();") != std::string::npos);
+    // Nothing about what FPP is playing is read at construction: FPP loads plugins before any playlist starts.
+    CHECK(delivery.find("Player::INSTANCE") == std::string::npos);
     CHECK(delivery.find("showmesh::fallback::FallbackExecutor executor_;") != std::string::npos);
     CHECK(delivery.find("recorder() { return &executor_; }") != std::string::npos);
 }
