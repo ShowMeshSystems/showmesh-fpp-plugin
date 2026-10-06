@@ -2,8 +2,9 @@
 
 The files this plugin's tests need, copied unchanged from
 `test/fixtures/fallback-activation/` in
-`ShowMeshSystems/showmesh`, branch `claude/node-fallback-activation-ingress`,
-at commit `fde36268e3a99caa31392038da8a20322a99aaca`. They are the shared data
+`ShowMeshSystems/showmesh`. They are byte-identical at commit
+`7a9be7497864aa184f437d86e80547664b4386df`, the contract commit this plugin
+was last built against. They are the shared data
 for section 5 of that repository's
 `docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md`: the node agent (Go) and this
 plugin (C++) implement the same signing and canonicalization rules

@@ -290,7 +290,8 @@ bool ShowMeshRuntime::drainOnce() {
         if (sequenceStore_ != nullptr && !sequenceStore_->store(observation.sequence)) ++sequencePersistFailures_;
         lastPlaying_.reset();
         playlistEnded_ = true;
-        const bool postsSuspended = notifyFallbackRecorder(PlaylistAction::kStop, evidence, std::string());
+        const bool postsSuspended = notifyFallbackRecorder(PlaylistAction::kStop, evidence, std::string(),
+                                                           observation.identity.playlistName);
         if (!postsSuspended && sink_ != nullptr && sink_->publish(observation)) {
             ++published_;
             unacknowledgedCoalesced_ = 0;
@@ -342,7 +343,7 @@ bool ShowMeshRuntime::drainOnce() {
         observation.unavailable = IdentityUnavailable::kTruncatedIdentityField;
         observation.identity.instanceUuid = instanceUuid;
         ++unavailable_;
-        const bool postsSuspended = notifyFallbackRecorder(fallbackAction, evidence, std::string());
+        const bool postsSuspended = notifyFallbackRecorder(fallbackAction, evidence, std::string(), evidence.playlistName);
         // An unavailable observation is still an observation the
         // coordinator can acknowledge: only clear the gap on acceptance,
         // never on a refusal, which must still ride forward.
@@ -365,7 +366,7 @@ bool ShowMeshRuntime::drainOnce() {
         observation.identity.section = evidence.section;
         observation.identity.position = evidence.position;
         ++unavailable_;
-        const bool postsSuspended = notifyFallbackRecorder(fallbackAction, evidence, std::string());
+        const bool postsSuspended = notifyFallbackRecorder(fallbackAction, evidence, std::string(), evidence.playlistName);
         if (!postsSuspended && sink_ != nullptr && sink_->publishUnavailable(observation)) {
             unacknowledgedCoalesced_ = 0;
         }
@@ -376,7 +377,7 @@ bool ShowMeshRuntime::drainOnce() {
     observation.entryKey = resolution.entryKey;
     // Before the coordinator posts below, so an activation during an outage
     // never waits behind their retry budget.
-    const bool postsSuspended = notifyFallbackRecorder(fallbackAction, evidence, resolution.entryKey);
+    const bool postsSuspended = notifyFallbackRecorder(fallbackAction, evidence, resolution.entryKey, evidence.playlistName);
     // Before the observation citing it, not after: an observation whose
     // definition has not arrived is still accepted, but Track H holds the
     // binding as having no definition until it does. The return value is
@@ -401,10 +402,11 @@ bool ShowMeshRuntime::drainOnce() {
 }
 
 bool ShowMeshRuntime::notifyFallbackRecorder(PlaylistAction action, const CallbackEvidence& evidence,
-                                             const std::string& entryKey) {
+                                             const std::string& entryKey, const std::string& playlistName) {
     if (fallbackRecorder_ == nullptr) return false;
     FallbackEntryEvent event;
     event.action = action;
+    event.playlistName = playlistName;
     event.identityResolved = !entryKey.empty();
     event.entryKey = entryKey;
     event.playlistLoop = evidence.playlistLoop;

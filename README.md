@@ -355,23 +355,28 @@ per-frame dirty mark `modifyChannelData` relies on.
 
 When the coordinator is lost during a show, the plugin delivers the Cue
 activations the coordinator authorized in advance, and nothing else. This is
-ADR-048 and Track J step J4; the wire is section 5 of the coordinator
+ADR-048 and Track J steps J4 and J5; the wire is section 5 of the coordinator
 repository's `docs/build/FPP-PLUGIN-COORDINATOR-CONTRACTS.md`. The code is
 `native/adapters/shared/fallback_*.h`, assembled by `FallbackExecutor` and wired
 into both adapters by `FallbackActivationDelivery`.
 
-**While the coordinator answers**, the executor's own thread:
+**The plugin is always in one of three states**, held in `FallbackExecutionState`:
+
+| State | The plugin |
+|---|---|
+| `normal` | posts playlist-entry observations, keeps its key registered and its program current, and sends no activation |
+| `fallback` | posts no observation and fetches no program. At each entry boundary it sends the activations the installed program maps for that entry |
+| `resting` | posts no observation, fetches no program, and sends nothing to any node |
+
+**In `normal`, while the coordinator answers**, the executor's own thread:
 
 - creates an Ed25519 executor key once the plugin holds a pairing token, stores
   the private key as `/etc/showmesh-fpp-plugin/fallback-executor-key` at mode
   0600, and registers the public key on every start and after every pairing;
-- asks for the signed program again every
-  `ShowMeshFallbackProgramRefetchIntervalMillis` (default 60000, a hypothesis),
-  and never later than one third of the installed program's own validity
-  (`expiresAt` minus `compiledAt`);
-- verifies, installs and acknowledges a program that changed, and hands it to
-  every distinct node address it names. The same program again is not
-  rewritten, acknowledged or handed out.
+- asks for the signed program again every 60 seconds, whatever its validity;
+- verifies, installs and acknowledges a program whose package id, revision or
+  expiry changed, and hands it to every distinct node address it names. The
+  same copy again is not rewritten, acknowledged or handed out.
 
 A registration the coordinator answers `409` is asked again at every program
 fetch, because it clears once the coordinator has read this player. Any other
@@ -383,7 +388,8 @@ interval and then at double the wait each time, up to ten minutes.
 `GET {coordinatorUrl}/healthz`. Only a 2xx counts as reached. Loss is confirmed
 after a run of failed probes that also spans a minimum time, never on one
 failed or slow request. The defaults are hypotheses, not measurements, and each
-is an FPP setting:
+is an FPP setting. While loss is confirmed the probe runs at least every 10
+seconds whatever the setting says, and is never backed off.
 
 | Setting | Default |
 |---|---|
@@ -392,35 +398,60 @@ is an FPP setting:
 | `ShowMeshCoordinatorLossFailedProbes` | 3 |
 | `ShowMeshCoordinatorLossMinimumMillis` | 15000 |
 
-**In fallback.** The plugin enters fallback at the first playlist entry that
-starts after loss is confirmed, never in the middle of an entry, and stays in
-it until that playlist stops or the plugin restarts. At each entry it resolves
-the entry key in the installed program and, only when the program carries this
-host's executor key, sends one signed activation per target node to the address
-the program gives. A retry reuses the execution id and the identical body. An
-unknown entry, an expired or missing program, a target with no address, and a
-node's refusal each end with no activation and a recorded reason. Nothing is
-ever sent in place of a refused activation.
+**Entering `fallback`.** Only at the `playing` callback of a new entry
+occurrence, never in the middle of an entry, and only when all three hold: loss
+is confirmed; the installed program is usable (verified, before its expiry,
+carrying this host's executor key, with exactly the four rule values this build
+knows); and the program maps the playing entry. Otherwise the plugin stays in
+`normal`, sends nothing, and records why. A retry reuses the execution id and
+the identical body. Nothing is ever sent in place of a refused activation.
 
-While loss is confirmed or fallback is active the worker skips its observation
-and definition posts, so an activation never waits behind their retry budget.
+**The cutoff.** The cutoff is the expiry of the program copy fallback was
+entered with, checked at every entry and every probe. At the cutoff the plugin
+goes to `resting`: it sends no further activation and stops nothing. It never
+extends, refetches or relaxes a program during an outage.
+
+**The hand-back.** A coordinator that answers again does not take the show back
+in the middle of a playlist. The plugin stays the executor until FPP stops the
+playlist it entered under, or names a different one. At that moment it goes to
+`normal`, reports that, fetches its program at once, acknowledges the copy it
+then holds whether or not it changed, and hands it to the nodes. If the
+coordinator is still lost then, it does the same after the first probe that
+succeeds. It never posts an observation for an entry that began while it was
+the executor.
+
+**A plugin restart is not a hand-back.** Before the first activation of an
+entry leaves, the state, the playlist, the program copy and that entry's
+execution ids are written to `/etc/showmesh-fpp-plugin/fallback-state.json` at
+mode 0600. A plugin that starts while FPP is playing the playlist the file
+names resumes the state it left and sends nothing for the entry already
+handled. An entry a restart interrupted is retried with its recorded execution
+ids, so a node that already ran it answers `replayed-execution`. A plugin that
+starts while FPP plays nothing, or another playlist, hands back.
+
+**The state report.** The plugin tells the coordinator its state with
+`PUT /api/v1/fallback-programs/{fppInstanceId}/fallback-state`: at once on
+start, on every change, every 10 seconds while the coordinator answers, and as
+the first request after a probe that succeeds following one that failed. No
+answer changes the plugin's state.
+
+While it is not in `normal`, while loss is confirmed, and until that first
+report has gone, the worker skips its observation and definition posts.
 Sequence numbers are still issued, so the coordinator sees a gap afterwards,
-which it accepts. Nothing is refetched, registered or handed out during that
-time.
+which it accepts.
 
 **What an operator can read.** `<state-dir>/fallback-status.json` holds the
-mode, whether the coordinator is reachable, the installed program, the count of
-skipped posts, the 50 most recent deliveries and refusals, and separately the
-20 most recent program hand-offs. Each record carries an outcome word, who
-answered (`node` or `player`), and a reason: the node's own, or a whole
-sentence from this player. The same lines go to FPP's log.
+state, the playlist it is held under, the cutoff, whether the coordinator is
+reachable, the installed program, the count of skipped posts, the 50 most
+recent deliveries and refusals, and separately the 20 most recent program
+hand-offs. Each record carries an outcome word, who answered (`node` or
+`player`), and a reason: the node's own, or a whole sentence from this player.
+The same lines go to FPP's log.
 
-FPP's warning list carries one notice while the coordinator is lost, and the
-status file's `message` is the same text. It says this player is starting the
-planned cues only while that is true. When the player holds nothing it could
-send (no coordinator key, no plan, a plan that has run out or does not carry
-its key, no key of its own) or no node started the last cue, the notice says
-the cues are not being started and why.
+FPP's warning list carries one notice while the coordinator is lost or the
+plugin is not in `normal`, and the status file's `message` is the same text. It
+names the playlist and the cutoff, and says this player is starting the planned
+cues only while that is true.
 
 Routes this depends on, beyond the two the sending half uses:
 
@@ -429,13 +460,18 @@ Routes this depends on, beyond the two the sending half uses:
 | `GET /healthz` | coordinator, unauthenticated, outside `/api/v1` | the loss probe |
 | `GET /api/v1/fallback-programs/{fppInstanceId}` and `.../acknowledge` | coordinator | the signed program |
 | `PUT /api/v1/fallback-programs/{fppInstanceId}/executor-key` | coordinator | executor key registration |
+| `PUT /api/v1/fallback-programs/{fppInstanceId}/fallback-state` | coordinator | the state report |
 | `PUT /showmesh/v1/fallback/programs/{fppInstanceUuid}` | node | handing a node its program |
 | `POST /showmesh/v1/fallback/activations` | node | one signed activation |
 
-Not built here: the cutoff, the rest or hold rules, and the hand-back at the
-next scheduled-show boundary. `FallbackExecutionState` is the object they
-extend. `/healthz` says only that the coordinator process answers, so a
-coordinator that is up but cut off from its broker is not detected as lost.
+`/healthz` says only that the coordinator process answers, so a coordinator
+that is up but cut off from its broker is not detected as lost.
+
+`native/adapters/shared/tests/tools/` holds two bench tools that ship in no
+artifact: `fallback_delivery_driver` sends one node one activation, and
+`fallback_plugin_driver` runs the plugin's own runtime and executor with FPP
+replaced by lines on standard input, for a run against a real coordinator and
+node agent.
 
 ## The FPP adapters
 

@@ -88,8 +88,8 @@ enum class FallbackFetchOutcomeKind {
     // The only success outcome: verified, matches this host, not
     // expired, and durably installed.
     kInstalled,
-    // Verified, current, and byte for byte the document already installed.
-    // Nothing was written and there is nothing new to acknowledge.
+    // Verified, current, and the same packageId, revision and expiresAt as
+    // the installed copy (section 5.12). Nothing was written.
     kUnchanged,
 };
 
@@ -160,6 +160,13 @@ struct FallbackFetchOutcome {
 // are "nothing to acknowledge", never a rejection: acknowledging one of
 // them would tell the coordinator this host rejected a program it never
 // received.
+// What identifies one published copy of a program, section 5.12.
+struct InstalledProgramIdentity {
+    std::string packageId;
+    std::string revision;
+    std::string expiresAt;
+};
+
 inline bool ShouldAcknowledgeFallbackFetchOutcome(const FallbackFetchOutcome& outcome) {
     switch (outcome.kind) {
         case FallbackFetchOutcomeKind::kVerificationRefused:
@@ -185,6 +192,7 @@ inline bool ShouldAcknowledgeFallbackFetchOutcome(const FallbackFetchOutcome& ou
 inline std::string FallbackFetchOutcomeVerificationResult(FallbackFetchOutcomeKind kind) {
     switch (kind) {
         case FallbackFetchOutcomeKind::kInstalled:
+        case FallbackFetchOutcomeKind::kUnchanged:
             return kVerificationResultVerified;
         case FallbackFetchOutcomeKind::kVerificationRefused:
             return kVerificationResultSignatureInvalid;
@@ -494,7 +502,7 @@ inline FallbackFetchOutcome FetchAndInstallFallbackProgram(HttpTransport* transp
                                                             const std::string& expectedFppInstanceUuid,
                                                             const std::vector<uint8_t>& coordinatorPublicKey,
                                                             const std::string& installPath, Clock clock,
-                                                            const std::string* installedDocument = nullptr) {
+                                                            const InstalledProgramIdentity* installed = nullptr) {
     FallbackFetchOutcome outcome;
 
     std::string token;
@@ -629,8 +637,9 @@ inline FallbackFetchOutcome FetchAndInstallFallbackProgram(HttpTransport* transp
         return outcome;
     }
 
-    // installedDocument, when given, is the exact bytes already installed.
-    if (installedDocument != nullptr && *installedDocument == reconstructedDocument) {
+    if (installed != nullptr && installed->packageId == verified.program->packageId() &&
+        installed->revision == verified.program->revision() &&
+        installed->expiresAt == verified.program->expiresAt()) {
         outcome.kind = FallbackFetchOutcomeKind::kUnchanged;
         outcome.detail = "fallback: the published program is the one already installed";
         outcome.packageId = verified.program->packageId();
@@ -638,8 +647,8 @@ inline FallbackFetchOutcome FetchAndInstallFallbackProgram(HttpTransport* transp
         return outcome;
     }
 
-    const InstallResult installed = InstallFallbackProgram(*verified.program, installPath);
-    if (!installed.ok) {
+    const InstallResult installResult = InstallFallbackProgram(*verified.program, installPath);
+    if (!installResult.ok) {
         // Not its own outcome kind: an install failure after a good
         // verification is still "verified", just not durably recorded,
         // and InstallFallbackProgram's own guarantee (the previous
@@ -647,16 +656,16 @@ inline FallbackFetchOutcome FetchAndInstallFallbackProgram(HttpTransport* transp
         // returns. Reported as a refusal so a caller does not read a
         // failed install as success.
         outcome.kind = FallbackFetchOutcomeKind::kVerificationRefused;
-        outcome.detail = installed.refusalReason;
+        outcome.detail = installResult.refusalReason;
         outcome.packageId = verified.program->packageId();
         outcome.revision = verified.program->revision();
         return outcome;
     }
 
     outcome.kind = FallbackFetchOutcomeKind::kInstalled;
-    outcome.installedReport = installed.report;
-    outcome.packageId = installed.report.packageId;
-    outcome.revision = installed.report.revision;
+    outcome.installedReport = installResult.report;
+    outcome.packageId = installResult.report.packageId;
+    outcome.revision = installResult.report.revision;
     return outcome;
 }
 

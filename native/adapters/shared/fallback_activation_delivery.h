@@ -6,6 +6,7 @@
 
 #include <string>
 
+#include "Player.h"
 #include "Warnings.h"
 #include "curl_http_transport.h"
 #include "fallback_executor.h"
@@ -86,9 +87,9 @@ class FallbackActivationDelivery {
         options.credentialDir = std::move(credentialDir);
         options.installPath = showmesh::fallback::DefaultFallbackProgramPath();
         options.detector = resolveOutageDetectorConfig();
-        options.programRefetchIntervalMillis =
-            resolveOutageSetting(showmesh::fallback::kProgramRefetchIntervalSettingName, 5000, 3600000,
-                                 showmesh::fallback::kHypothesisProgramRefetchIntervalMillis);
+        // Read once, here, on FPP's own thread: what FPP is playing decides
+        // whether a saved fallback or resting state is resumed.
+        if (Player::INSTANCE.IsPlaying()) options.playingPlaylistAtStart = Player::INSTANCE.GetPlaylistName();
         options.notifier = notifier;
         options.log = [](bool isError, const std::string& line) {
             if (isError) {
