@@ -399,6 +399,25 @@ off.
 | `ShowMeshCoordinatorLossFailedProbes` | 3 |
 | `ShowMeshCoordinatorLossMinimumMillis` | 15000 |
 
+**The coordinator's key.** The plugin trusts a program only when it is signed by
+the coordinator's Ed25519 public key. A successful pairing delivers that key in
+the claim answer's `coordinatorPublicKey` member, and when the plugin runs as
+root (as `fppd` does) it stores the key in
+`/etc/showmesh-fpp-plugin-trust/coordinator-fallback-public-key`, mode 0644, in a
+root-owned directory of mode 0755 the packaging creates. The directory is
+separate from the credential directory because the loader trusts a key only
+when its directory and file are root-owned and not writable by anyone else,
+while the credential directory belongs to the account the web interface runs
+as. A later pairing replaces the key, and the executor reads it again on the
+probe cadence, so a new key takes effect without restarting `fppd`. A key that
+has loaded stays in use if a later read is refused, and a different key makes the
+player install the program signed by it. Nothing
+else writes this file and the plugin never asks the coordinator for the key. A
+coordinator that sends none, a malformed key, or a plugin that is not root
+leaves the pairing intact, and the log says why no key was saved. Fallback keeps
+using a key the player already has, and has none until the player pairs again
+if it had none.
+
 **Entering `fallback`.** Only at the `playing` callback of a new entry
 occurrence, never in the middle of an entry, and only when all three hold: loss
 is confirmed; the installed program is usable (verified, before its expiry,

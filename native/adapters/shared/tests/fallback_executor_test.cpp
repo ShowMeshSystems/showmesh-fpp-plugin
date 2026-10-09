@@ -26,6 +26,7 @@
 
 #include "check.h"
 #include "fallback_executor.h"
+#include "fallback_pinned_key_store.h"
 #include "showmesh/playlist_identity.h"
 #include "showmesh/runtime.h"
 
@@ -140,6 +141,7 @@ struct ProgramSpec {
     std::string packageId = "pkg-test";
     std::string revision = "rev-test";
     std::string restHold = "hold";  // any other value is a rule this build does not know
+    std::string signerSeedHex = kCoordinatorTestSeedHex;
 };
 
 // A program document signed the way the coordinator signs one, under the
@@ -170,7 +172,7 @@ std::string signedProgram(const ProgramSpec& spec) {
     const showmesh::json::CanonicalResult canonical = showmesh::json::canonicalize(program.str());
     CHECK(canonical.ok);
     std::string signature;
-    CHECK(signWithExecutorKey(keyFromHex(kCoordinatorTestSeedHex), canonical.text, &signature));
+    CHECK(signWithExecutorKey(keyFromHex(spec.signerSeedHex), canonical.text, &signature));
     return "{\"program\":" + program.str() + ",\"signature\":\"" + signature + "\"}";
 }
 
@@ -374,6 +376,7 @@ class Bench {
 
     std::string stateDir() const { return root_ + "/state"; }
     std::string credentialDir() const { return root_ + "/credential"; }
+    std::string trustDir() const { return root_ + "/trust"; }
     std::string installPath() const { return root_ + "/state/fallback-program.json"; }
     std::string keyPath() const { return credentialDir() + "/" + kExecutorKeyFilename; }
     std::string statePath() const { return credentialDir() + "/" + kFallbackStateFilename; }
@@ -415,6 +418,7 @@ class Bench {
         options.credentialDir = credentialDir();
         options.installPath = installPath();
         options.pinnedKey = pinnedKey;
+        if (watchTrustDir) options.trustDir = trustDir();
         options.detector = detectorConfig;
         options.randomBytes = fixtureRandom;
         options.notifier = &notifier;
@@ -479,6 +483,7 @@ class Bench {
     }
 
     PinnedKeyLoadResult pinnedKey = fixturePinnedKey();
+    bool watchTrustDir = false;
     OutageDetectorConfig detectorConfig;
     FakeNetwork network;
     RecordingNotifier notifier;
@@ -1325,6 +1330,102 @@ TEST(OnConfirmedLossAPlayerThatHoldsNothingToSendSaysItCannotStartThePlannedCues
                                                      "it has no key of its own for the nodes" +
                                                      kRestoreCoordinatorAction);
     }
+}
+
+// Needs root: the loader trusts only a root-owned directory, which a test can create only as root.
+TEST(AKeyStoredByAPairingIsPickedUpWithoutARestartAndAReplacedKeyIsToo) {
+    if (::geteuid() != 0) {
+        std::fprintf(stderr, "SKIP AKeyStoredByAPairingIsPickedUpWithoutARestartAndAReplacedKeyIsToo: not root\n");
+        return;
+    }
+    Bench bench;
+    bench.pinnedKey = PinnedKeyLoadResult();
+    bench.watchTrustDir = true;
+    bench.makeExecutor();
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    bench.loseCoordinator();
+    const std::string noKey = std::string(kCannotStartPrefix) + "it has no coordinator key to check a plan with" +
+                              kRestoreCoordinatorAction;
+    CHECK_EQ(bench.executor->notice(), noKey);
+
+    const std::string fixtureKey = member(parseJson(fixture("keys.json")), "coordinatorPublicKey");
+    std::string error;
+    CHECK(StoreCoordinatorPublicKey(bench.trustDir(), fixtureKey, &error));
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK(bench.executor->notice() != noKey);
+    CHECK(bench.executor->notice().find("no coordinator key") == std::string::npos);
+    const std::string withFixtureKey = bench.executor->notice();
+
+    const std::vector<uint8_t> otherKey(32, 7);
+    CHECK(StoreCoordinatorPublicKey(bench.trustDir(), base64Encode(otherKey.data(), otherKey.size()), &error));
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK(bench.executor->notice() != withFixtureKey);
+    CHECK(bench.executor->notice().find("no coordinator key") == std::string::npos);
+}
+
+// Needs root, like the test above.
+TEST(ALoadedKeyIsKeptWhenALaterReReadIsRefusedAndTheRefusalIsLoggedOnce) {
+    if (::geteuid() != 0) {
+        std::fprintf(stderr, "SKIP ALoadedKeyIsKeptWhenALaterReReadIsRefusedAndTheRefusalIsLoggedOnce: not root\n");
+        return;
+    }
+    Bench bench;
+    bench.pinnedKey = PinnedKeyLoadResult();
+    bench.watchTrustDir = true;
+    bench.makeExecutor();
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    std::string error;
+    CHECK(StoreCoordinatorPublicKey(bench.trustDir(), member(parseJson(fixture("keys.json")), "coordinatorPublicKey"),
+                                    &error));
+    bench.loseCoordinator();
+    const std::string healthy = bench.executor->notice();
+    CHECK(healthy.find("no coordinator key") == std::string::npos);
+
+    CHECK_EQ(::chmod(bench.trustDir().c_str(), 0777), 0);
+    CHECK(LoadPinnedCoordinatorPublicKey(bench.trustDir()).status == PinnedKeyLoadStatus::kOwnershipUntrusted);
+    for (int i = 0; i < 3; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(bench.executor->notice(), healthy);
+    bench.callback("playing", 0);
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
+
+    int refusals = 0;
+    {
+        std::lock_guard<std::mutex> lock(bench.recordMutex);
+        for (const std::string& line : bench.logs) {
+            if (line.find("reading it again failed") != std::string::npos) ++refusals;
+        }
+    }
+    CHECK_EQ(refusals, 1);
+}
+
+// Needs root, like the test above.
+TEST(ADifferentKeyInstallsTheProgramSignedByItEvenWhenTheInstalledCopyHasTheSameIdentity) {
+    if (::geteuid() != 0) {
+        std::fprintf(stderr, "SKIP ADifferentKeyInstallsTheProgramSignedByItEvenWhenTheInstalledCopyHasTheSameIdentity: not root\n");
+        return;
+    }
+    Bench bench;
+    bench.pinnedKey = PinnedKeyLoadResult();
+    bench.watchTrustDir = true;
+    bench.makeExecutor();
+    std::string error;
+    CHECK(StoreCoordinatorPublicKey(bench.trustDir(), member(parseJson(fixture("keys.json")), "coordinatorPublicKey"),
+                                    &error));
+    const std::string firstDocument = signedProgram(twoEntryProgram(bench));
+    bench.network.programEnvelope = getEnvelope(firstDocument);
+    bench.tick();
+    CHECK_EQ(readFile(bench.installPath()), firstDocument);
+
+    const std::string otherSeed(64, '7');
+    ProgramSpec resigned = twoEntryProgram(bench);
+    resigned.signerSeedHex = otherSeed;
+    const std::string resignedDocument = signedProgram(resigned);
+    CHECK(resignedDocument != firstDocument);
+    bench.network.programEnvelope = getEnvelope(resignedDocument);
+    CHECK(StoreCoordinatorPublicKey(bench.trustDir(), keyFromHex(otherSeed).publicKeyBase64, &error));
+    for (int i = 0; i < 3; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+
+    CHECK_EQ(readFile(bench.installPath()), resignedDocument);
 }
 
 TEST(ABoundaryNoNodeAcceptedSaysSoAndTheNextOneThatStartsRestoresTheNotice) {

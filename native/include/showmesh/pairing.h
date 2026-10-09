@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -65,6 +66,11 @@ std::string generateSecretHex(RandomBytesFn randomBytes = readRandomBytes);
 // from.
 std::string deriveCrockfordPairingCode(const std::string& secretHex);
 
+// Receives the claim answer's coordinatorPublicKey after the credential is
+// saved. present is false when the member is absent; keyBase64 is empty when it
+// is not a string. It cannot fail the pairing.
+using CoordinatorKeySink = std::function<void(bool present, const std::string& keyBase64)>;
+
 enum class PairingState { kIdle, kWaiting, kPaired, kExpired, kFailed };
 
 const char* pairingStateWireValue(PairingState state);
@@ -121,7 +127,8 @@ class PairingWorker {
     // BrightnessFileStore's and SequenceFileStore's own construction-time
     // reads already are.
     PairingWorker(std::string stateDir, std::string credentialDir, HttpTransport* transport,
-                  CoordinatorUrlSource* urlSource, Clock clock, RandomBytesFn randomBytes = readRandomBytes);
+                  CoordinatorUrlSource* urlSource, Clock clock, RandomBytesFn randomBytes = readRandomBytes,
+                  CoordinatorKeySink keySink = nullptr);
     ~PairingWorker();
 
     // Starts the background thread. Safe to call more than once (a repeat
@@ -173,6 +180,7 @@ class PairingWorker {
     CoordinatorUrlSource* urlSource_;
     Clock clock_;
     RandomBytesFn randomBytes_;
+    CoordinatorKeySink keySink_;
 
     // Touched only from run() (or directly from a test that never calls
     // start()): secretHex_, expiresAtMillis_, lastClaimAttemptMillis_ and

@@ -134,13 +134,15 @@ std::string renderPairingStatus(const PairingStatus& status) {
 }
 
 PairingWorker::PairingWorker(std::string stateDir, std::string credentialDir, HttpTransport* transport,
-                             CoordinatorUrlSource* urlSource, Clock clock, RandomBytesFn randomBytes)
+                             CoordinatorUrlSource* urlSource, Clock clock, RandomBytesFn randomBytes,
+                             CoordinatorKeySink keySink)
     : stateDir_(std::move(stateDir)),
       credentialDir_(std::move(credentialDir)),
       transport_(transport),
       urlSource_(urlSource),
       clock_(clock),
-      randomBytes_(randomBytes == nullptr ? readRandomBytes : randomBytes) {
+      randomBytes_(randomBytes == nullptr ? readRandomBytes : randomBytes),
+      keySink_(std::move(keySink)) {
     reconcileStartupState();
 }
 
@@ -387,6 +389,13 @@ void PairingWorker::attemptClaim(TimeMillis now) {
         setState(PairingState::kFailed, now, writeError);
         writeStatusFile();
         return;
+    }
+
+    if (keySink_) {
+        std::string coordinatorKey;
+        const bool present = memberOf(parsed.value, "coordinatorPublicKey") != nullptr;
+        stringMember(parsed.value, "coordinatorPublicKey", &coordinatorKey);
+        keySink_(present, coordinatorKey);
     }
 
     // The claim is single use: the coordinator has already deleted its

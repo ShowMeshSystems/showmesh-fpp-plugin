@@ -142,8 +142,9 @@ TEST(TheCredentialSourceRereadsTheFileOnlyAfterItIsInvalidated) {
     CHECK_EQ(token, std::string("second-token"));
 }
 
-TEST(TheCredentialDirectoryIsFixedAndNotConfigurable) {
+TEST(TheCredentialAndTrustDirectoriesAreFixedAndNotConfigurable) {
     CHECK_EQ(showmesh::resolveCredentialDir(), std::string("/etc/showmesh-fpp-plugin"));
+    CHECK_EQ(showmesh::resolveTrustDir(), std::string("/etc/showmesh-fpp-plugin-trust"));
 }
 
 TEST(ARouteIsJoinedToTheBaseUrlWithExactlyOneSeparator) {

@@ -1,14 +1,9 @@
 #pragma once
 
-// Loads the coordinator's Ed25519 public key ADR-025 decision 3 requires
-// be "delivered once, at enrollment, and pinned on the node" and never
-// fetched, refreshed, or revalidated over the network by any boot,
-// startup, or fallback path. This file implements the READ half of that
-// decision, not the decision itself: no enrollment flow exists in either
-// repository to write this file, so this loader never writes the key,
-// never contacts the coordinator, and never fabricates a key when the
-// file is absent. Whether the resolved directory actually holds a key
-// this host was enrolled with is entirely outside this file's knowledge.
+// Loads the coordinator's Ed25519 public key that ADR-025 decision 3 requires
+// be pinned on the node. Pairing writes the file (fallback_pinned_key_store.h);
+// this loader only reads it and never contacts the coordinator, and an absent
+// file is reported as absent, never replaced with a key of its own.
 //
 // ADR-025 decision 4's operative sentence is the reason this file stats
 // before it reads: "The pinned key must not be writable by anything that
@@ -65,8 +60,8 @@ namespace fallback {
 // into kNoProgramInstalled: that name means the coordinator has nothing
 // published for this host, which may be entirely correct, while every
 // kind below means a person has to go fix something on this host):
-//   kMissing            no file at the resolved path: an enrollment gap,
-//                        sends a person to enroll this host.
+//   kMissing            no file at the resolved path: this player has not
+//                        paired since the coordinator began sending its key.
 //   kOwnershipUntrusted  the file or its containing directory is not
 //                        root-owned, or is group- or other-writable: the
 //                        ADR-025 decision-4 failure, sends a person to
@@ -108,15 +103,8 @@ struct PinnedKeyLoadResult {
     std::vector<uint8_t> publicKey;
 };
 
-// The filename this loader reads, under whatever directory its caller
-// resolves (LoadPinnedCoordinatorPublicKey's own credentialDir
-// parameter). PROVISIONAL, PENDING AN ENROLLMENT FLOW: ADR-025 specifies
-// the key's required ownership and write protection, not a path or a
-// filename, so this name is a plugin-side reading convention, not
-// something the ADR itself names. It becomes the de facto place an
-// enrollment flow must write once one exists, which is a real decision
-// an operator may want to take deliberately rather than one this file
-// quietly settles by being first to pick a name.
+// The filename under the trust directory (showmesh::resolveTrustDir()).
+// ADR-025 fixes the key's ownership, not its name; pairing writes this name.
 inline const char* kPinnedCoordinatorPublicKeyFilename = "coordinator-fallback-public-key";
 
 namespace detail {
@@ -124,7 +112,7 @@ namespace detail {
 // Owner must be root and neither group nor other may hold the write bit.
 // Unlike the file's own check below, this is not an exact-mode match: a
 // directory legitimately carries execute bits (0755 is ordinary for
-// /etc/showmesh-fpp-plugin) that would make an exact-match check refuse
+// the trust directory) that would make an exact-match check refuse
 // a perfectly safe directory, so only the two bits that actually matter
 // (S_IWGRP, S_IWOTH) are checked.
 inline bool statPassesOwnershipCheck(const struct ::stat& info) {
@@ -135,48 +123,46 @@ inline bool statPassesOwnershipCheck(const struct ::stat& info) {
 
 }  // namespace detail
 
-// Resolves <credentialDir>/kPinnedCoordinatorPublicKeyFilename, checks
+// Resolves <trustDir>/kPinnedCoordinatorPublicKeyFilename, checks
 // the containing directory's ownership and write protection, then the
-// file's, then reads and decodes it. The order matters: this function
-// checks the path it was actually asked to read, never a default it
-// silently substitutes, so a caller that resolves credentialDir from a
-// constructor parameter (see fallback_activation_delivery.h, which never
-// reads an environment variable for this path) gets checks that apply to
-// wherever it actually pointed.
+// file's, then reads and decodes it. It checks the path it was asked to
+// read, never a default it substitutes, so a caller that passes trustDir
+// through a constructor (no environment variable) gets checks that apply
+// to wherever it pointed.
 //
 // The file holds the key base64-encoded (RFC 4648, the same strict
 // decoder fallback_program_verifier.h's signature check already uses),
 // on one line, optionally trailing whitespace.
-inline PinnedKeyLoadResult LoadPinnedCoordinatorPublicKey(const std::string& credentialDir) {
+inline PinnedKeyLoadResult LoadPinnedCoordinatorPublicKey(const std::string& trustDir) {
     PinnedKeyLoadResult result;
 
     struct ::stat dirInfo {};
-    if (::stat(credentialDir.c_str(), &dirInfo) != 0) {
+    if (::stat(trustDir.c_str(), &dirInfo) != 0) {
         result.status = PinnedKeyLoadStatus::kMissing;
-        result.error = "pinned coordinator public key directory " + credentialDir +
-                       " does not exist; this host has not been enrolled for fallback activation";
+        result.error = "pinned coordinator public key directory " + trustDir +
+                       " does not exist; this player has not stored the coordinator's key yet";
         return result;
     }
     if (!S_ISDIR(dirInfo.st_mode)) {
         result.status = PinnedKeyLoadStatus::kOwnershipUntrusted;
-        result.error = "pinned coordinator public key path " + credentialDir + " is not a directory";
+        result.error = "pinned coordinator public key path " + trustDir + " is not a directory";
         return result;
     }
     if (!detail::statPassesOwnershipCheck(dirInfo)) {
         result.status = PinnedKeyLoadStatus::kOwnershipUntrusted;
-        result.error = "pinned coordinator public key directory " + credentialDir +
+        result.error = "pinned coordinator public key directory " + trustDir +
                        " is not root-owned and non-group/other-writable; refusing to trust a key whose "
                        "containing directory the agent's own account could rewrite";
         return result;
     }
 
-    const std::string path = showmesh::joinPath(credentialDir, kPinnedCoordinatorPublicKeyFilename);
+    const std::string path = showmesh::joinPath(trustDir, kPinnedCoordinatorPublicKeyFilename);
 
     struct ::stat info {};
     if (::stat(path.c_str(), &info) != 0) {
         result.status = PinnedKeyLoadStatus::kMissing;
         result.error = "pinned coordinator public key file " + path +
-                       " does not exist; this host has not been enrolled for fallback activation";
+                       " does not exist; this player has not stored the coordinator's key yet";
         return result;
     }
     if (!S_ISREG(info.st_mode)) {

@@ -13,6 +13,7 @@
 // coordinator fixture and against FPP 10's actual GetInfo() shape.
 
 #include <csignal>
+#include <filesystem>
 #include <cstdio>
 #include <fstream>
 #include <optional>
@@ -28,10 +29,13 @@
 #include "check.h"
 #include "fallback_activation_resolver.h"
 #include "fallback_pinned_key_loader.h"
+#include "fallback_pinned_key_store.h"
 #include "fallback_program_fetch.h"
 #include "fallback_program_installer.h"
 #include "fallback_program_verifier.h"
 #include "section_names.h"
+#include "showmesh/http_transport.h"
+#include "showmesh/pairing.h"
 #include "showmesh/playlist_identity.h"
 
 using showmesh::EntryIdentity;
@@ -1174,4 +1178,239 @@ TEST(PinnedKeyLoadStatusNameIsTheEnumsOwnSpelling) {
              std::string("kOwnershipUntrusted"));
     CHECK_EQ(std::string(PinnedKeyLoadStatusName(PinnedKeyLoadStatus::kMalformed)), std::string("kMalformed"));
     CHECK_EQ(std::string(PinnedKeyLoadStatusName(PinnedKeyLoadStatus::kLoaded)), std::string("kLoaded"));
+}
+
+// --- storing the coordinator's key at pairing -------------------------------
+
+namespace {
+
+constexpr const char* kKeyA = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+constexpr const char* kKeyB = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+class TrustRoot {
+ public:
+    TrustRoot() {
+        char buffer[] = "/tmp/showmesh-trust-store-test-XXXXXX";
+        const char* made = ::mkdtemp(buffer);
+        CHECK(made != nullptr);
+        root_ = made != nullptr ? std::string(made) : std::string();
+    }
+    ~TrustRoot() {
+        std::error_code ec;
+        std::filesystem::remove_all(root_, ec);
+    }
+    std::string root() const { return root_; }
+    std::string dir() const { return root_ + "/trust"; }
+    std::string keyPath() const { return dir() + "/coordinator-fallback-public-key"; }
+    std::string keyFile() const {
+        std::ifstream in(keyPath(), std::ios::binary);
+        std::ostringstream out;
+        out << in.rdbuf();
+        return out.str();
+    }
+
+ private:
+    std::string root_;
+};
+
+bool skipUnlessRoot(const char* name) {
+    if (::geteuid() == 0) return false;
+    std::fprintf(stderr, "SKIP %s: not running as root\n", name);
+    return true;
+}
+
+class ClaimTransport : public showmesh::HttpTransport {
+ public:
+    std::vector<std::string> answers;
+    showmesh::HttpResponse post(const showmesh::HttpRequest&) override {
+        showmesh::HttpResponse r;
+        r.transportOk = true;
+        r.statusCode = 200;
+        r.body = answers.empty() ? std::string() : answers.front();
+        if (answers.size() > 1) answers.erase(answers.begin());
+        return r;
+    }
+    showmesh::HttpResponse get(const showmesh::HttpRequest& request) override { return post(request); }
+    showmesh::HttpResponse put(const showmesh::HttpRequest& request) override { return post(request); }
+};
+
+class OneUrl : public showmesh::CoordinatorUrlSource {
+ public:
+    std::string currentBaseUrl() const override { return "http://coordinator.invalid:8080"; }
+};
+
+std::string claimAnswer(const std::string& extraMembers) {
+    return "{\"token\":\"smsh_token\",\"principalId\":\"p-1\",\"instanceId\":\"i-1\"" + extraMembers + "}";
+}
+
+showmesh::TimeMillis gStoreTestNow = 0;
+showmesh::TimeMillis storeTestClock() { return gStoreTestNow; }
+
+bool counting(std::uint8_t* out, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) out[i] = static_cast<std::uint8_t>(i);
+    return true;
+}
+
+// Pairs once through a real PairingWorker whose sink is the real store; returns whether it ended paired.
+bool pairOnce(const TrustRoot& root, const std::string& answer) {
+    const std::string stateDir = root.root() + "/state";
+    const std::string credentialDir = root.root() + "/credential";
+    std::filesystem::create_directories(stateDir);
+    std::filesystem::create_directories(credentialDir);
+    ClaimTransport transport;
+    transport.answers = {answer};
+    OneUrl url;
+    const std::string trustDir = root.dir();
+    showmesh::PairingWorker worker(
+        stateDir, credentialDir, &transport, &url, storeTestClock, counting,
+        [trustDir](bool present, const std::string& key) {
+            std::string error;
+            if (present) showmesh::fallback::StoreCoordinatorPublicKey(trustDir, key, &error);
+        });
+    std::ofstream(stateDir + "/pairing-request") << "{}";
+    gStoreTestNow += 100000;
+    worker.tick(gStoreTestNow);
+    return worker.status().state == showmesh::PairingState::kPaired;
+}
+
+}  // namespace
+
+TEST(AStoredKeyLoadsBackWithTheSameBytesAndTheDirectoryAndFileModes) {
+    if (skipUnlessRoot("AStoredKeyLoadsBackWithTheSameBytesAndTheDirectoryAndFileModes")) return;
+    TrustRoot root;
+    std::string error;
+    CHECK(showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyA, &error));
+    CHECK_EQ(root.keyFile(), std::string(kKeyA) + "\n");
+
+    const showmesh::fallback::PinnedKeyLoadResult loaded = showmesh::fallback::LoadPinnedCoordinatorPublicKey(root.dir());
+    CHECK(loaded.status == showmesh::fallback::PinnedKeyLoadStatus::kLoaded);
+    CHECK_EQ(loaded.publicKey.size(), static_cast<size_t>(32));
+    CHECK_EQ(static_cast<int>(loaded.publicKey[0]), 0);
+
+    struct ::stat dirInfo {};
+    struct ::stat fileInfo {};
+    CHECK_EQ(::stat(root.dir().c_str(), &dirInfo), 0);
+    CHECK_EQ(::stat(root.keyPath().c_str(), &fileInfo), 0);
+    CHECK_EQ(static_cast<int>(dirInfo.st_mode & 07777), 0755);
+    CHECK_EQ(static_cast<int>(fileInfo.st_mode & 07777), 0644);
+    CHECK(!std::filesystem::exists(root.dir() + "/.coordinator-fallback-public-key.tmp"));
+}
+
+TEST(ANonRootPluginStoresNothingAndSaysWhy) {
+    if (::geteuid() == 0) {
+        std::fprintf(stderr, "SKIP ANonRootPluginStoresNothingAndSaysWhy: running as root\n");
+        return;
+    }
+    TrustRoot root;
+    std::string error;
+    CHECK(!showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyA, &error));
+    CHECK(!error.empty());
+    CHECK(!std::filesystem::exists(root.dir()));
+}
+
+TEST(AMalformedKeyIsRefusedAndNothingIsWritten) {
+    TrustRoot root;
+    std::string error;
+    const std::string tooShort = "AAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const std::string tooLong = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    for (const std::string& bad : {std::string(), std::string("not base64!"), tooShort, tooLong,
+                                   std::string("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                                   std::string(kKeyA) + "\n"}) {
+        error.clear();
+        CHECK(!showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), bad, &error));
+        CHECK(!error.empty());
+    }
+    CHECK(!std::filesystem::exists(root.dir()));
+}
+
+TEST(AMalformedKeyNeverReplacesAGoodStoredKey) {
+    if (skipUnlessRoot("AMalformedKeyNeverReplacesAGoodStoredKey")) return;
+    TrustRoot root;
+    std::string error;
+    CHECK(showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyA, &error));
+    CHECK(!showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), "AAAAAAAAAAAAAAAAAAAAAAAAAAA=", &error));
+    CHECK_EQ(root.keyFile(), std::string(kKeyA) + "\n");
+}
+
+TEST(ASecondStoreReplacesTheKey) {
+    if (skipUnlessRoot("ASecondStoreReplacesTheKey")) return;
+    TrustRoot root;
+    std::string error;
+    CHECK(showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyA, &error));
+    CHECK(showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyB, &error));
+    CHECK_EQ(root.keyFile(), std::string(kKeyB) + "\n");
+    const showmesh::fallback::PinnedKeyLoadResult loaded = showmesh::fallback::LoadPinnedCoordinatorPublicKey(root.dir());
+    CHECK(loaded.status == showmesh::fallback::PinnedKeyLoadStatus::kLoaded);
+    CHECK_EQ(static_cast<int>(loaded.publicKey[0]), 1);
+}
+
+TEST(AFailedWriteLeavesTheEarlierKeyInPlace) {
+    if (skipUnlessRoot("AFailedWriteLeavesTheEarlierKeyInPlace")) return;
+    TrustRoot root;
+    std::string error;
+    CHECK(showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyA, &error));
+    // A directory where the temporary file belongs cannot be replaced by a file.
+    std::filesystem::create_directory(root.dir() + "/.coordinator-fallback-public-key.tmp");
+    error.clear();
+    CHECK(!showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyB, &error));
+    CHECK(!error.empty());
+    CHECK_EQ(root.keyFile(), std::string(kKeyA) + "\n");
+}
+
+TEST(ASymlinkAtTheTrustDirectoryIsRefused) {
+    if (skipUnlessRoot("ASymlinkAtTheTrustDirectoryIsRefused")) return;
+    TrustRoot root;
+    std::filesystem::create_directories(root.root() + "/elsewhere");
+    std::filesystem::create_directory_symlink(root.root() + "/elsewhere", root.dir());
+    std::string error;
+    CHECK(!showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyA, &error));
+    CHECK(!std::filesystem::exists(root.root() + "/elsewhere/coordinator-fallback-public-key"));
+}
+
+TEST(TheLoaderStillRefusesAFileOrDirectoryNotOwnedByRoot) {
+    if (skipUnlessRoot("TheLoaderStillRefusesAFileOrDirectoryNotOwnedByRoot")) return;
+    TrustRoot root;
+    std::string error;
+    CHECK(showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyA, &error));
+
+    CHECK_EQ(::chown(root.keyPath().c_str(), 65534, 65534), 0);
+    CHECK(showmesh::fallback::LoadPinnedCoordinatorPublicKey(root.dir()).status ==
+          showmesh::fallback::PinnedKeyLoadStatus::kOwnershipUntrusted);
+    CHECK_EQ(::chown(root.keyPath().c_str(), 0, 0), 0);
+    CHECK(showmesh::fallback::LoadPinnedCoordinatorPublicKey(root.dir()).status ==
+          showmesh::fallback::PinnedKeyLoadStatus::kLoaded);
+
+    CHECK_EQ(::chown(root.dir().c_str(), 65534, 65534), 0);
+    CHECK(showmesh::fallback::LoadPinnedCoordinatorPublicKey(root.dir()).status ==
+          showmesh::fallback::PinnedKeyLoadStatus::kOwnershipUntrusted);
+    showmesh::fallback::PinnedKeyLoadStatus readBack = showmesh::fallback::PinnedKeyLoadStatus::kLoaded;
+    CHECK(!showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyB, &error, &readBack));
+    CHECK(readBack == showmesh::fallback::PinnedKeyLoadStatus::kOwnershipUntrusted);
+    readBack = showmesh::fallback::PinnedKeyLoadStatus::kOwnershipUntrusted;
+    CHECK(!showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), "bad", &error, &readBack));
+    CHECK(readBack == showmesh::fallback::PinnedKeyLoadStatus::kLoaded);
+}
+
+TEST(PairingStoresTheKeyAndALaterPairingReplacesItAndAnAnswerWithoutAKeyKeepsIt) {
+    if (skipUnlessRoot("PairingStoresTheKeyAndALaterPairingReplacesItAndAnAnswerWithoutAKeyKeepsIt")) return;
+    TrustRoot root;
+    CHECK(pairOnce(root, claimAnswer(std::string(",\"coordinatorPublicKey\":\"") + kKeyA + "\"")));
+    CHECK_EQ(root.keyFile(), std::string(kKeyA) + "\n");
+
+    CHECK(pairOnce(root, claimAnswer(std::string(",\"coordinatorPublicKey\":\"") + kKeyB + "\"")));
+    CHECK_EQ(root.keyFile(), std::string(kKeyB) + "\n");
+
+    CHECK(pairOnce(root, claimAnswer("")));
+    CHECK_EQ(root.keyFile(), std::string(kKeyB) + "\n");
+
+    CHECK(pairOnce(root, claimAnswer(",\"coordinatorPublicKey\":\"AAAA\"")));
+    CHECK_EQ(root.keyFile(), std::string(kKeyB) + "\n");
+}
+
+TEST(PairingSucceedsAndStoresNothingWhenTheKeyCannotBeStored) {
+    TrustRoot root;
+    // Not root: the store refuses. Root: a file sits where the directory belongs.
+    if (::geteuid() == 0) std::ofstream(root.dir()) << "x";
+    CHECK(pairOnce(root, claimAnswer(std::string(",\"coordinatorPublicKey\":\"") + kKeyA + "\"")));
+    CHECK(!std::filesystem::exists(root.keyPath()));
 }
