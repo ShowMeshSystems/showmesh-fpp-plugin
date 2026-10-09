@@ -10,9 +10,11 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <sstream>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -831,6 +833,14 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         key_ = std::move(loaded);
     }
 
+    // The installed document's own signature check under key, nothing else.
+    bool installedVerifiesUnder(const std::vector<uint8_t>& key) const {
+        std::ifstream in(options_.installPath, std::ios::binary);
+        std::ostringstream document;
+        document << in.rdbuf();
+        return in && VerifyFallbackProgram(document.str(), key).accepted;
+    }
+
     PinnedKeyLoadResult pinnedKeyCopy() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return options_.pinnedKey;
@@ -1003,10 +1013,7 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
 
         // A copy that no longer verifies (signed by a key since replaced) is not
         // presented as installed, so the same published copy is installed again.
-        const auto verifyAt = std::chrono::system_clock::time_point(std::chrono::milliseconds(options_.clock()));
-        const bool heldVerifies =
-            before.present && ResolveInstalledActivation(std::string(), options_.installPath, pinnedKey.publicKey,
-                                                         verifyAt).kind != ActivationResolveKind::kProgramFailedReverification;
+        const bool heldVerifies = before.present && installedVerifiesUnder(pinnedKey.publicKey);
         const InstalledProgramIdentity identity{before.packageId, before.revision, before.expiresAt};
         const FallbackFetchOutcome outcome = FetchAndInstallFallbackProgram(
             transport_, &credentials_, baseUrl, options_.fppInstanceUuid, pinnedKey.publicKey,

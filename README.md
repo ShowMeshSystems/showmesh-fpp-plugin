@@ -414,8 +414,9 @@ has loaded stays in use if a later read is refused, and a different key makes th
 player install the program signed by it. Nothing
 else writes this file and the plugin never asks the coordinator for the key. A
 coordinator that sends none, a malformed key, or a plugin that is not root
-leaves the pairing intact and logs that the key was not stored. Fallback is then
-unavailable until the player pairs again.
+leaves the pairing intact, and the log says why no key was saved. Fallback keeps
+using a key the player already has, and has none until the player pairs again
+if it had none.
 
 **Entering `fallback`.** Only at the `playing` callback of a new entry
 occurrence, never in the middle of an entry, and only when all three hold: loss

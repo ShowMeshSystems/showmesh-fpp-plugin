@@ -1383,7 +1383,12 @@ TEST(TheLoaderStillRefusesAFileOrDirectoryNotOwnedByRoot) {
     CHECK_EQ(::chown(root.dir().c_str(), 65534, 65534), 0);
     CHECK(showmesh::fallback::LoadPinnedCoordinatorPublicKey(root.dir()).status ==
           showmesh::fallback::PinnedKeyLoadStatus::kOwnershipUntrusted);
-    CHECK(!showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyB, &error));
+    showmesh::fallback::PinnedKeyLoadStatus readBack = showmesh::fallback::PinnedKeyLoadStatus::kLoaded;
+    CHECK(!showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), kKeyB, &error, &readBack));
+    CHECK(readBack == showmesh::fallback::PinnedKeyLoadStatus::kOwnershipUntrusted);
+    readBack = showmesh::fallback::PinnedKeyLoadStatus::kOwnershipUntrusted;
+    CHECK(!showmesh::fallback::StoreCoordinatorPublicKey(root.dir(), "bad", &error, &readBack));
+    CHECK(readBack == showmesh::fallback::PinnedKeyLoadStatus::kLoaded);
 }
 
 TEST(PairingStoresTheKeyAndALaterPairingReplacesItAndAnAnswerWithoutAKeyKeepsIt) {

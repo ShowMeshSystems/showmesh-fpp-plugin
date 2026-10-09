@@ -52,8 +52,11 @@ inline int openTrustDirectory(const std::string& trustDir, std::string* error) {
 // the coordinator sent it) under trustDir and loads it back with the loader.
 // Until the rename, a failure leaves the previous stored key as it was; a
 // failed read-back leaves the new key in the file.
+// When the file was written but the loader refused it, *readBack (if given)
+// is set to the loader's status; otherwise it is left as kLoaded.
 inline bool StoreCoordinatorPublicKey(const std::string& trustDir, const std::string& keyBase64,
-                                      std::string* error) {
+                                      std::string* error, PinnedKeyLoadStatus* readBack = nullptr) {
+    if (readBack != nullptr) *readBack = PinnedKeyLoadStatus::kLoaded;
     std::vector<uint8_t> key;
     if (!detail::base64Decode(keyBase64, &key) || key.size() != 32) {
         *error = "the key is not a base64-encoded 32-byte Ed25519 public key";
@@ -89,6 +92,9 @@ inline bool StoreCoordinatorPublicKey(const std::string& trustDir, const std::st
 
     const PinnedKeyLoadResult loaded = LoadPinnedCoordinatorPublicKey(trustDir);
     if (loaded.status != PinnedKeyLoadStatus::kLoaded || loaded.publicKey != key) {
+        if (readBack != nullptr) {
+            *readBack = loaded.status != PinnedKeyLoadStatus::kLoaded ? loaded.status : PinnedKeyLoadStatus::kMalformed;
+        }
         *error = loaded.status != PinnedKeyLoadStatus::kLoaded ? loaded.error : "the stored key did not read back the same";
         return false;
     }

@@ -29,21 +29,26 @@ class PairingDelivery {
  private:
     static CoordinatorKeySink storeCoordinatorKey(std::string trustDir) {
         return [trustDir](bool present, const std::string& keyBase64) {
-            std::string error;
-            if (present && fallback::StoreCoordinatorPublicKey(trustDir, keyBase64, &error)) return;
-            const bool storedKeyRemains =
-                fallback::LoadPinnedCoordinatorPublicKey(trustDir).status == fallback::PinnedKeyLoadStatus::kLoaded;
             if (!present) {
-                if (storedKeyRemains) {
-                    LogInfo(VB_PLUGIN, "The coordinator sent no key, so the key stored earlier stays in use.\n");
-                } else {
-                    LogErr(VB_PLUGIN,
-                           "The coordinator sent no key, so fallback is not available. Update the coordinator and pair this player again.\n");
-                }
+                LogErr(VB_PLUGIN,
+                       "The coordinator sent no key. Fallback keeps using a key this player already has. If it has none, update the coordinator and pair this player again.\n");
                 return;
             }
-            LogErr(VB_PLUGIN, "The coordinator's key was not stored: %s. Fallback is not available until this player pairs again.\n",
-                   error.c_str());
+            std::string error;
+            fallback::PinnedKeyLoadStatus readBack = fallback::PinnedKeyLoadStatus::kLoaded;
+            if (fallback::StoreCoordinatorPublicKey(trustDir, keyBase64, &error, &readBack)) return;
+            if (readBack == fallback::PinnedKeyLoadStatus::kLoaded) {
+                LogErr(VB_PLUGIN,
+                       "The coordinator's key could not be saved: %s. Fallback keeps using a key this player already has. If it has none, fix this and pair this player again.\n",
+                       error.c_str());
+                return;
+            }
+            const char* reason = readBack == fallback::PinnedKeyLoadStatus::kOwnershipUntrusted
+                                     ? "the key directory is not owned by root or can be written by other accounts"
+                                     : "the saved key could not be read back correctly";
+            LogErr(VB_PLUGIN,
+                   "The coordinator's key was saved but cannot be trusted: %s. Fallback keeps using a key this player already has. If it has none, fix this and pair this player again.\n",
+                   reason);
         };
     }
 
