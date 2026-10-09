@@ -63,11 +63,14 @@ inline showmesh::fallback::OutageDetectorConfig resolveOutageDetectorConfig() {
 class FallbackActivationDelivery {
  public:
     // Construction reads local files and settings only, never the network, so
-    // it is safe on FPP's plugin load path. credentialDir has no environment
-    // override: it holds the pinned key, the pairing token and the executor key.
+    // it is safe on FPP's plugin load path. Neither directory has an environment
+    // override: credentialDir holds the pairing token and the executor key,
+    // trustDir holds the pinned coordinator key.
     FallbackActivationDelivery(showmesh::Clock clock, std::string fppInstanceUuid,
-                               std::string credentialDir = showmesh::resolveCredentialDir())
-        : executor_(makeOptions(clock, std::move(fppInstanceUuid), std::move(credentialDir), &notifier_),
+                               std::string credentialDir = showmesh::resolveCredentialDir(),
+                               std::string trustDir = showmesh::resolveTrustDir())
+        : executor_(makeOptions(clock, std::move(fppInstanceUuid), std::move(credentialDir), std::move(trustDir),
+                                &notifier_),
                     &transport_) {}
 
     // What ShowMeshRuntime drives: every drained playlist callback, and the
@@ -77,12 +80,14 @@ class FallbackActivationDelivery {
  private:
     static showmesh::fallback::FallbackExecutorOptions makeOptions(showmesh::Clock clock, std::string fppInstanceUuid,
                                                                     std::string credentialDir,
+                                                                    std::string trustDir,
                                                                     showmesh::fallback::FallbackStateNotifier* notifier) {
         showmesh::fallback::FallbackExecutorOptions options;
         options.clock = clock;
         options.fppInstanceUuid = std::move(fppInstanceUuid);
         options.stateDir = showmesh::resolveSequenceStateDir();
-        options.pinnedKey = showmesh::fallback::LoadPinnedCoordinatorPublicKey(credentialDir);
+        options.pinnedKey = showmesh::fallback::LoadPinnedCoordinatorPublicKey(trustDir);
+        options.trustDir = std::move(trustDir);
         options.credentialDir = std::move(credentialDir);
         options.installPath = showmesh::fallback::DefaultFallbackProgramPath();
         options.detector = resolveOutageDetectorConfig();

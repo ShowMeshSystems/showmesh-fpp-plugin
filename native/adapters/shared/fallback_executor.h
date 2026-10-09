@@ -334,6 +334,9 @@ struct FallbackExecutorOptions {
     std::string credentialDir;
     std::string installPath;
     PinnedKeyLoadResult pinnedKey;
+    // When set, the key is read again from here on the probe cadence, so a key
+    // stored by a pairing takes effect without a restart.
+    std::string trustDir;
     OutageDetectorConfig detector;
     int programRefetchIntervalMillis = kProgramRefetchIntervalMillis;
     // How long a saved state waits for FPP to name a playlist before FPP is taken as idle.
@@ -818,6 +821,7 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
             // The first report goes out as soon as there is a pairing token.
             reportDue_ = true;
         }
+        refreshPinnedKey();
         if (keyCopy().usable()) return;
         ExecutorKeyResult loaded = LoadOrCreateExecutorKey(options_.credentialDir, options_.randomBytes);
         if (loaded.status == ExecutorKeyStatus::kCreated) log(false, "created this player's executor key");
@@ -825,6 +829,27 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         keyProblem_ = loaded.detail;
         std::lock_guard<std::mutex> lock(mutex_);
         key_ = std::move(loaded);
+    }
+
+    PinnedKeyLoadResult pinnedKeyCopy() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return options_.pinnedKey;
+    }
+
+    // Background thread. A changed key is fetched against at once, because the
+    // installed program may have been signed by the key it replaces.
+    void refreshPinnedKey() {
+        if (options_.trustDir.empty()) return;
+        PinnedKeyLoadResult loaded = LoadPinnedCoordinatorPublicKey(options_.trustDir);
+        const bool nowLoaded = loaded.status == PinnedKeyLoadStatus::kLoaded;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (loaded.status == options_.pinnedKey.status && loaded.publicKey == options_.pinnedKey.publicKey) return;
+            options_.pinnedKey = std::move(loaded);
+        }
+        pinnedKeyProblemLogged_ = false;
+        nextFetchAtMillis_ = 0;
+        if (nowLoaded) log(false, "coordinator key loaded");
     }
 
     ExecutorKeyResult keyCopy() const {
@@ -947,11 +972,11 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         lastFetchReachedCoordinator_ = false;
         nextFetchAtMillis_ = now + options_.programRefetchIntervalMillis;
         const InstalledProgram before = readInstalledProgram();
-        if (options_.pinnedKey.status != PinnedKeyLoadStatus::kLoaded) {
+        const PinnedKeyLoadResult pinnedKey = pinnedKeyCopy();
+        if (pinnedKey.status != PinnedKeyLoadStatus::kLoaded) {
             if (!pinnedKeyProblemLogged_) {
-                log(true, std::string("no usable fallback program: ") +
-                              PinnedKeyLoadStatusName(options_.pinnedKey.status) + " (" + options_.pinnedKey.error +
-                              ")");
+                log(true, std::string("no usable fallback program: ") + PinnedKeyLoadStatusName(pinnedKey.status) +
+                              " (" + pinnedKey.error + ")");
             }
             pinnedKeyProblemLogged_ = true;
             // Nothing can be fetched or acknowledged without the key, so nothing is owed.
@@ -961,7 +986,7 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
 
         const InstalledProgramIdentity identity{before.packageId, before.revision, before.expiresAt};
         const FallbackFetchOutcome outcome = FetchAndInstallFallbackProgram(
-            transport_, &credentials_, baseUrl, options_.fppInstanceUuid, options_.pinnedKey.publicKey,
+            transport_, &credentials_, baseUrl, options_.fppInstanceUuid, pinnedKey.publicKey,
             options_.installPath, options_.clock, before.present ? &identity : nullptr);
         lastFetchReachedCoordinator_ = outcome.kind != FallbackFetchOutcomeKind::kTransportUnreachable &&
                                        outcome.kind != FallbackFetchOutcomeKind::kCredentialUnavailable;
@@ -1106,10 +1131,11 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
     // carrying this player's key, with exactly the four known rule values.
     // Returns this player's outcome word for what is missing, or empty.
     std::string usableProgramProblem(TimeMillis nowMillis) const {
-        if (options_.pinnedKey.status != PinnedKeyLoadStatus::kLoaded) return kOutcomeNoCoordinatorKey;
+        const PinnedKeyLoadResult pinnedKey = pinnedKeyCopy();
+        if (pinnedKey.status != PinnedKeyLoadStatus::kLoaded) return kOutcomeNoCoordinatorKey;
         const auto now = std::chrono::system_clock::time_point(std::chrono::milliseconds(nowMillis));
         const ActivationResolution installed =
-            ResolveInstalledActivation(std::string(), options_.installPath, options_.pinnedKey.publicKey, now);
+            ResolveInstalledActivation(std::string(), options_.installPath, pinnedKey.publicKey, now);
         if (installed.kind == ActivationResolveKind::kNoProgramInstalled ||
             installed.kind == ActivationResolveKind::kProgramFailedReverification ||
             installed.kind == ActivationResolveKind::kProgramExpired) {
@@ -1156,8 +1182,8 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
             detailForLog = "identity not resolved";
         } else if (problem.empty()) {
             const auto now = std::chrono::system_clock::time_point(std::chrono::milliseconds(event.observedAtMillis));
-            resolution =
-                ResolveInstalledActivation(event.entryKey, options_.installPath, options_.pinnedKey.publicKey, now);
+            resolution = ResolveInstalledActivation(event.entryKey, options_.installPath,
+                                                    pinnedKeyCopy().publicKey, now);
             problem = PlayerOutcomeWord(resolution.kind);
             detailForLog = std::string(ActivationResolveKindName(resolution.kind)) + " " + resolution.reason;
         }

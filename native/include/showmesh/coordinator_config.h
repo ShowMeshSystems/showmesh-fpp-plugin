@@ -27,6 +27,13 @@ extern const char* const kCredentialDir;
 
 std::string resolveCredentialDir();
 
+// The fixed directory holding the coordinator's public key. Separate from
+// the credential directory because the key's directory must be root-owned,
+// while the credential directory is owned by the account fppd's web side runs as.
+extern const char* const kTrustDir;
+
+std::string resolveTrustDir();
+
 struct CoordinatorUrlLoad {
     bool ok = false;
     std::string baseUrl;

@@ -17,6 +17,7 @@
 namespace showmesh {
 
 const char* const kCredentialDir = "/etc/showmesh-fpp-plugin";
+const char* const kTrustDir = "/etc/showmesh-fpp-plugin-trust";
 
 namespace {
 
@@ -67,6 +68,8 @@ bool urlHasSchemeAndHost(const std::string& url, std::string* error) {
 }  // namespace
 
 std::string resolveCredentialDir() { return kCredentialDir; }
+
+std::string resolveTrustDir() { return kTrustDir; }
 
 std::string joinUrlPath(const std::string& baseUrl, const std::string& path) {
     if (baseUrl.empty()) return path;

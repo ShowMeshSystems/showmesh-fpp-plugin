@@ -117,11 +117,12 @@ class FakeTransport : public HttpTransport {
         r.statusCode = 404;
         return r;
     }
-    static HttpResponse paired(std::string token, std::string principalId) {
+    static HttpResponse paired(std::string token, std::string principalId, std::string extraMembers = "") {
         HttpResponse r;
         r.transportOk = true;
         r.statusCode = 200;
-        r.body = "{\"token\":\"" + token + "\",\"principalId\":\"" + principalId + "\",\"instanceId\":\"i-1\"}";
+        r.body = "{\"token\":\"" + token + "\",\"principalId\":\"" + principalId + "\",\"instanceId\":\"i-1\"" +
+                 extraMembers + "}";
         return r;
     }
     static HttpResponse unparseable200() {
@@ -455,4 +456,96 @@ TEST(RequestStopReturnsPromptlyEvenWithAClaimAboutToRun) {
     // timeout this replaces; bounded by the fake's own 150ms delay plus
     // scheduling slack.
     CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() < 2000);
+}
+
+namespace {
+
+struct SinkCall {
+    bool present = false;
+    std::string key;
+    bool credentialAlreadySaved = false;
+};
+
+}  // namespace
+
+TEST(TheCoordinatorKeyInTheClaimAnswerReachesTheSinkAfterTheCredentialIsSaved) {
+    TempDir state("showmesh-pairing-state");
+    TempDir cred("showmesh-pairing-cred");
+    FakeUrlSource url;
+    url.url = "http://coordinator.invalid:8080";
+    FakeTransport transport;
+    transport.responses = {FakeTransport::paired("smsh_abc123", "principal-1",
+                                                 ",\"coordinatorPublicKey\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"")};
+    std::vector<SinkCall> calls;
+    PairingWorker worker(state.path(), cred.path(), &transport, &url, testClock, fixedBytes,
+                         [&](bool present, const std::string& key) {
+                             calls.push_back({present, key, cred.exists("credential")});
+                         });
+
+    state.write("pairing-request", "{}");
+    worker.tick(0);
+
+    CHECK(worker.status().state == PairingState::kPaired);
+    CHECK_EQ(static_cast<int>(calls.size()), 1);
+    CHECK(calls[0].present);
+    CHECK_EQ(calls[0].key, std::string("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    CHECK(calls[0].credentialAlreadySaved);
+}
+
+TEST(AClaimAnswerWithoutTheCoordinatorKeyStillPairsAndTheSinkIsToldItIsAbsent) {
+    TempDir state("showmesh-pairing-state");
+    TempDir cred("showmesh-pairing-cred");
+    FakeUrlSource url;
+    url.url = "http://coordinator.invalid:8080";
+    FakeTransport transport;
+    transport.responses = {FakeTransport::paired("smsh_abc123", "principal-1")};
+    std::vector<SinkCall> calls;
+    PairingWorker worker(state.path(), cred.path(), &transport, &url, testClock, fixedBytes,
+                         [&](bool present, const std::string& key) { calls.push_back({present, key, false}); });
+
+    state.write("pairing-request", "{}");
+    worker.tick(0);
+
+    CHECK(worker.status().state == PairingState::kPaired);
+    CHECK_EQ(cred.read("credential"), std::string("smsh_abc123"));
+    CHECK_EQ(static_cast<int>(calls.size()), 1);
+    CHECK(!calls[0].present);
+}
+
+TEST(ANonStringCoordinatorKeyIsHandedOnAsPresentAndEmpty) {
+    TempDir state("showmesh-pairing-state");
+    TempDir cred("showmesh-pairing-cred");
+    FakeUrlSource url;
+    url.url = "http://coordinator.invalid:8080";
+    FakeTransport transport;
+    transport.responses = {FakeTransport::paired("smsh_abc123", "principal-1", ",\"coordinatorPublicKey\":42")};
+    std::vector<SinkCall> calls;
+    PairingWorker worker(state.path(), cred.path(), &transport, &url, testClock, fixedBytes,
+                         [&](bool present, const std::string& key) { calls.push_back({present, key, false}); });
+
+    state.write("pairing-request", "{}");
+    worker.tick(0);
+
+    CHECK(worker.status().state == PairingState::kPaired);
+    CHECK_EQ(static_cast<int>(calls.size()), 1);
+    CHECK(calls[0].present);
+    CHECK(calls[0].key.empty());
+}
+
+TEST(NoSinkIsCalledWhenTheClaimFailsToParse) {
+    TempDir state("showmesh-pairing-state");
+    TempDir cred("showmesh-pairing-cred");
+    FakeUrlSource url;
+    url.url = "http://coordinator.invalid:8080";
+    FakeTransport transport;
+    transport.responses = {FakeTransport::unparseable200()};
+    int calls = 0;
+    PairingWorker worker(state.path(), cred.path(), &transport, &url, testClock, fixedBytes,
+                         [&](bool, const std::string&) { ++calls; });
+
+    state.write("pairing-request", "{}");
+    worker.tick(0);
+
+    CHECK(worker.status().state == PairingState::kFailed);
+    CHECK_EQ(calls, 0);
 }

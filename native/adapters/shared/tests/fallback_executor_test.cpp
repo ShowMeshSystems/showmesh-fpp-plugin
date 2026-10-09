@@ -26,6 +26,7 @@
 
 #include "check.h"
 #include "fallback_executor.h"
+#include "fallback_pinned_key_store.h"
 #include "showmesh/playlist_identity.h"
 #include "showmesh/runtime.h"
 
@@ -374,6 +375,7 @@ class Bench {
 
     std::string stateDir() const { return root_ + "/state"; }
     std::string credentialDir() const { return root_ + "/credential"; }
+    std::string trustDir() const { return root_ + "/trust"; }
     std::string installPath() const { return root_ + "/state/fallback-program.json"; }
     std::string keyPath() const { return credentialDir() + "/" + kExecutorKeyFilename; }
     std::string statePath() const { return credentialDir() + "/" + kFallbackStateFilename; }
@@ -415,6 +417,7 @@ class Bench {
         options.credentialDir = credentialDir();
         options.installPath = installPath();
         options.pinnedKey = pinnedKey;
+        if (watchTrustDir) options.trustDir = trustDir();
         options.detector = detectorConfig;
         options.randomBytes = fixtureRandom;
         options.notifier = &notifier;
@@ -479,6 +482,7 @@ class Bench {
     }
 
     PinnedKeyLoadResult pinnedKey = fixturePinnedKey();
+    bool watchTrustDir = false;
     OutageDetectorConfig detectorConfig;
     FakeNetwork network;
     RecordingNotifier notifier;
@@ -1325,6 +1329,37 @@ TEST(OnConfirmedLossAPlayerThatHoldsNothingToSendSaysItCannotStartThePlannedCues
                                                      "it has no key of its own for the nodes" +
                                                      kRestoreCoordinatorAction);
     }
+}
+
+// Needs root: the loader trusts only a root-owned directory, which a test can create only as root.
+TEST(AKeyStoredByAPairingIsPickedUpWithoutARestartAndAReplacedKeyIsToo) {
+    if (::geteuid() != 0) {
+        std::fprintf(stderr, "SKIP AKeyStoredByAPairingIsPickedUpWithoutARestartAndAReplacedKeyIsToo: not root\n");
+        return;
+    }
+    Bench bench;
+    bench.pinnedKey = PinnedKeyLoadResult();
+    bench.watchTrustDir = true;
+    bench.makeExecutor();
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    bench.loseCoordinator();
+    const std::string noKey = std::string(kCannotStartPrefix) + "it has no coordinator key to check a plan with" +
+                              kRestoreCoordinatorAction;
+    CHECK_EQ(bench.executor->notice(), noKey);
+
+    const std::string fixtureKey = member(parseJson(fixture("keys.json")), "coordinatorPublicKey");
+    std::string error;
+    CHECK(StoreCoordinatorPublicKey(bench.trustDir(), fixtureKey, &error));
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK(bench.executor->notice() != noKey);
+    CHECK(bench.executor->notice().find("no coordinator key") == std::string::npos);
+    const std::string withFixtureKey = bench.executor->notice();
+
+    const std::vector<uint8_t> otherKey(32, 7);
+    CHECK(StoreCoordinatorPublicKey(bench.trustDir(), base64Encode(otherKey.data(), otherKey.size()), &error));
+    bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK(bench.executor->notice() != withFixtureKey);
+    CHECK(bench.executor->notice().find("no coordinator key") == std::string::npos);
 }
 
 TEST(ABoundaryNoNodeAcceptedSaysSoAndTheNextOneThatStartsRestoresTheNotice) {
