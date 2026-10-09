@@ -114,8 +114,8 @@ verify-prebuilt-fpp10-reproducible:
 # Override BENCH_ID and BENCH_HTTP_PORT to run more than one at a time.
 # CPU selects the container's platform (amd64, the default, or arm64); see
 # the README for what each means for emulation.
-# LEAVES THE CONTAINER RUNNING; tear it down with
-# `scripts/test-plugin-load-fpp.sh --id <id> --down`.
+# Removes its container and network when it ends; pass --keep to the script to
+# keep them, then run `scripts/test-plugin-load-fpp.sh --id <id> --down`.
 # See bench/fpp-plugin-load/README.md.
 .PHONY: test-plugin-load-fpp
 test-plugin-load-fpp:
