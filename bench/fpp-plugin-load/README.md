@@ -137,8 +137,12 @@ scripts/test-plugin-load-fpp.sh  drives a run and reports each assertion
 scripts/test-plugin-load-fpp.sh --major fpp9
 scripts/test-plugin-load-fpp.sh --major fpp10 --id ci --port 8290
 scripts/test-plugin-load-fpp.sh --major fpp9 --cpu arm64 --id native --port 8291
-scripts/test-plugin-load-fpp.sh --id ci --down
+scripts/test-plugin-load-fpp.sh --major fpp10 --id debug --keep
+scripts/test-plugin-load-fpp.sh --major fpp10 --id debug --down
 ```
+
+A run removes its container, network and media volume when it ends. `--keep`
+leaves them for debugging, and `--down` removes what a kept run left.
 
 Or through the root `Makefile`, which forwards `MAJOR`, `CPU`, `BENCH_ID`, and
 `BENCH_HTTP_PORT` in either the make-variable or the environment form:

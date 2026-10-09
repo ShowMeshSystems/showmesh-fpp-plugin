@@ -238,6 +238,10 @@ export FPP_IMAGE FPP_TAG FPP_COMMIT FPP_BUILD_CONTEXT FPP_PLATFORM BENCH_ID BENC
 
 PROJECT="showmesh-fppbench-${BENCH_ID}"
 CONTAINER="showmesh-fppbench-${BENCH_ID}-fpp"
+DOWN_HINT="$0 --id $BENCH_ID --major $BENCH_FPP_MAJOR --cpu $BENCH_CPU --down"
+if [ "$BENCH_USE_PREBUILT" = "1" ]; then
+    DOWN_HINT="${DOWN_HINT/ --down/ --prebuilt --down}"
+fi
 COMPOSE=(docker compose -p "$PROJECT" -f "$BENCH_DIR/docker-compose.yml")
 if [ "$BENCH_USE_PREBUILT" = "1" ]; then
     COMPOSE+=(-f "$BENCH_DIR/docker-compose.prebuilt.yml")
@@ -324,6 +328,7 @@ print_summary() {
 # visible and the host temp files cleaned up.
 on_exit() {
     local rc=$?
+    trap '' INT TERM
     print_summary || true
     rm -f "/tmp/showmesh-bench-invoke.$$" "/tmp/showmesh-bench-unload.$$" 2>/dev/null || true
     teardown_run
@@ -333,19 +338,25 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Runs only once this run has reached `up`, so an early abort never removes a
-# run kept earlier under the same --id. -v for the reason --down uses it.
+# Removes only what this run created: never when the run exited before `up`,
+# and not after a failed `up` that found resources already kept under this id.
 RUN_STARTED=0
+project_has_resources() {
+    local label="label=com.docker.compose.project=$PROJECT"
+    [ -n "$(docker ps -aq --filter "$label" 2>/dev/null)" ] ||
+        [ -n "$(docker network ls -q --filter "$label" 2>/dev/null)" ] ||
+        [ -n "$(docker volume ls -q --filter "$label" 2>/dev/null)" ]
+}
 teardown_run() {
     if [ "$RUN_STARTED" != "1" ]; then
         return 0
     fi
     if [ "$KEEP" = "1" ]; then
-        echo "test-plugin-load-fpp: --keep: leaving $CONTAINER, its network and its media volume up; remove them with: $0 --id $BENCH_ID --down"
+        echo "test-plugin-load-fpp: --keep: leaving $CONTAINER, its network and its media volume up; remove them with: $DOWN_HINT"
         return 0
     fi
-    if ! "${COMPOSE[@]}" down -v >/dev/null 2>&1; then
-        echo "test-plugin-load-fpp: could not remove the container, network and media volume of run $BENCH_ID; they are still on this host. Remove them with: $0 --id $BENCH_ID --down" >&2
+    if ! "${COMPOSE[@]}" down -v >/dev/null; then
+        echo "test-plugin-load-fpp: could not remove the container, network and media volume of run $BENCH_ID; they are still on this host. Remove them with: $DOWN_HINT" >&2
     fi
 }
 
@@ -367,8 +378,11 @@ echo "test-plugin-load-fpp: FPP major=$BENCH_FPP_MAJOR tag=$FPP_TAG commit=$FPP_
 # stale apache/php pid file that crash-loops a plain second `up -d` lives, while
 # keeping the built image and the named media volume.
 echo "test-plugin-load-fpp: docker compose up -d --force-recreate"
-RUN_STARTED=1
+if ! project_has_resources; then
+    RUN_STARTED=1
+fi
 "${COMPOSE[@]}" up -d --force-recreate
+RUN_STARTED=1
 
 # The image is guaranteed to exist now, built or pulled by the up above, so
 # its real architecture and reference are read from docker itself rather than
