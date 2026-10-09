@@ -17,9 +17,6 @@
 namespace showmesh {
 namespace fallback {
 
-inline const char* kCoordinatorKeyNotStoredMessage =
-    "The coordinator's key was not stored, so fallback is not available until this player pairs again.";
-
 namespace detail {
 
 inline bool writeAll(int fd, const std::string& bytes) {
@@ -53,7 +50,8 @@ inline int openTrustDirectory(const std::string& trustDir, std::string* error) {
 
 // Stores keyBase64 (the base64 of a raw 32-byte Ed25519 public key, exactly as
 // the coordinator sent it) under trustDir and loads it back with the loader.
-// On any failure the previous stored key is left as it was.
+// Until the rename, a failure leaves the previous stored key as it was; a
+// failed read-back leaves the new key in the file.
 inline bool StoreCoordinatorPublicKey(const std::string& trustDir, const std::string& keyBase64,
                                       std::string* error) {
     std::vector<uint8_t> key;
@@ -62,7 +60,7 @@ inline bool StoreCoordinatorPublicKey(const std::string& trustDir, const std::st
         return false;
     }
     if (::geteuid() != 0) {
-        *error = "the plugin is not running as root";
+        *error = "fppd is not running as root";
         return false;
     }
 

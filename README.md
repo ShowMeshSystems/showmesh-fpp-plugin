@@ -409,7 +409,9 @@ separate from the credential directory because the loader trusts a key only
 when its directory and file are root-owned and not writable by anyone else,
 while the credential directory belongs to the account the web interface runs
 as. A later pairing replaces the key, and the executor reads it again on the
-probe cadence, so a new key takes effect without restarting `fppd`. Nothing
+probe cadence, so a new key takes effect without restarting `fppd`. A key that
+has loaded stays in use if a later read is refused, and a different key makes the
+player install the program signed by it. Nothing
 else writes this file and the plugin never asks the coordinator for the key. A
 coordinator that sends none, a malformed key, or a plugin that is not root
 leaves the pairing intact and logs that the key was not stored. Fallback is then

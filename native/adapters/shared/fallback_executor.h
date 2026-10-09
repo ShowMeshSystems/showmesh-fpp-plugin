@@ -836,20 +836,37 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         return options_.pinnedKey;
     }
 
-    // Background thread. A changed key is fetched against at once, because the
-    // installed program may have been signed by the key it replaces.
+    // Background thread. A key that loaded is never dropped by a later refused
+    // re-read; only a successful load of a different key replaces it, and that
+    // is fetched against at once.
     void refreshPinnedKey() {
         if (options_.trustDir.empty()) return;
         PinnedKeyLoadResult loaded = LoadPinnedCoordinatorPublicKey(options_.trustDir);
-        const bool nowLoaded = loaded.status == PinnedKeyLoadStatus::kLoaded;
+        std::string keptReason;
+        bool replaced = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (loaded.status == options_.pinnedKey.status && loaded.publicKey == options_.pinnedKey.publicKey) return;
-            options_.pinnedKey = std::move(loaded);
+            const bool held = options_.pinnedKey.status == PinnedKeyLoadStatus::kLoaded;
+            if (loaded.status == PinnedKeyLoadStatus::kLoaded) {
+                refusedReread_.clear();
+                if (!held || loaded.publicKey != options_.pinnedKey.publicKey) {
+                    options_.pinnedKey = std::move(loaded);
+                    replaced = true;
+                }
+            } else if (held) {
+                const std::string reason = std::string(PinnedKeyLoadStatusName(loaded.status)) + " (" + loaded.error + ")";
+                if (reason != refusedReread_) keptReason = reason;
+                refusedReread_ = reason;
+            } else if (loaded.status != options_.pinnedKey.status) {
+                options_.pinnedKey = std::move(loaded);
+                replaced = true;
+            }
         }
+        if (!keptReason.empty()) log(true, "still using the coordinator key already loaded; reading it again failed: " + keptReason);
+        if (!replaced) return;
         pinnedKeyProblemLogged_ = false;
         nextFetchAtMillis_ = 0;
-        if (nowLoaded) log(false, "coordinator key loaded");
+        if (pinnedKeyCopy().status == PinnedKeyLoadStatus::kLoaded) log(false, "coordinator key loaded");
     }
 
     ExecutorKeyResult keyCopy() const {
@@ -984,10 +1001,16 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
             return false;
         }
 
+        // A copy that no longer verifies (signed by a key since replaced) is not
+        // presented as installed, so the same published copy is installed again.
+        const auto verifyAt = std::chrono::system_clock::time_point(std::chrono::milliseconds(options_.clock()));
+        const bool heldVerifies =
+            before.present && ResolveInstalledActivation(std::string(), options_.installPath, pinnedKey.publicKey,
+                                                         verifyAt).kind != ActivationResolveKind::kProgramFailedReverification;
         const InstalledProgramIdentity identity{before.packageId, before.revision, before.expiresAt};
         const FallbackFetchOutcome outcome = FetchAndInstallFallbackProgram(
             transport_, &credentials_, baseUrl, options_.fppInstanceUuid, pinnedKey.publicKey,
-            options_.installPath, options_.clock, before.present ? &identity : nullptr);
+            options_.installPath, options_.clock, heldVerifies ? &identity : nullptr);
         lastFetchReachedCoordinator_ = outcome.kind != FallbackFetchOutcomeKind::kTransportUnreachable &&
                                        outcome.kind != FallbackFetchOutcomeKind::kCredentialUnavailable;
         const std::string outcomeLine =
@@ -1504,6 +1527,8 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
     std::string tokenHash_;
     std::string keyProblem_;
     bool pinnedKeyProblemLogged_ = false;
+    // Guarded by mutex_. Why the last re-read of the held key was refused, so each reason is logged once.
+    std::string refusedReread_;
 
     // Runtime worker thread only, after construction.
     std::optional<Boundary> lastBoundary_;

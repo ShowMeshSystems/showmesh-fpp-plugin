@@ -141,6 +141,7 @@ struct ProgramSpec {
     std::string packageId = "pkg-test";
     std::string revision = "rev-test";
     std::string restHold = "hold";  // any other value is a rule this build does not know
+    std::string signerSeedHex = kCoordinatorTestSeedHex;
 };
 
 // A program document signed the way the coordinator signs one, under the
@@ -171,7 +172,7 @@ std::string signedProgram(const ProgramSpec& spec) {
     const showmesh::json::CanonicalResult canonical = showmesh::json::canonicalize(program.str());
     CHECK(canonical.ok);
     std::string signature;
-    CHECK(signWithExecutorKey(keyFromHex(kCoordinatorTestSeedHex), canonical.text, &signature));
+    CHECK(signWithExecutorKey(keyFromHex(spec.signerSeedHex), canonical.text, &signature));
     return "{\"program\":" + program.str() + ",\"signature\":\"" + signature + "\"}";
 }
 
@@ -1360,6 +1361,71 @@ TEST(AKeyStoredByAPairingIsPickedUpWithoutARestartAndAReplacedKeyIsToo) {
     bench.advanceAndTick(kHypothesisProbeIntervalMillis);
     CHECK(bench.executor->notice() != withFixtureKey);
     CHECK(bench.executor->notice().find("no coordinator key") == std::string::npos);
+}
+
+// Needs root, like the test above.
+TEST(ALoadedKeyIsKeptWhenALaterReReadIsRefusedAndTheRefusalIsLoggedOnce) {
+    if (::geteuid() != 0) {
+        std::fprintf(stderr, "SKIP ALoadedKeyIsKeptWhenALaterReReadIsRefusedAndTheRefusalIsLoggedOnce: not root\n");
+        return;
+    }
+    Bench bench;
+    bench.pinnedKey = PinnedKeyLoadResult();
+    bench.watchTrustDir = true;
+    bench.makeExecutor();
+    bench.writeFile(bench.installPath(), signedProgram(twoEntryProgram(bench)));
+    std::string error;
+    CHECK(StoreCoordinatorPublicKey(bench.trustDir(), member(parseJson(fixture("keys.json")), "coordinatorPublicKey"),
+                                    &error));
+    bench.loseCoordinator();
+    const std::string healthy = bench.executor->notice();
+    CHECK(healthy.find("no coordinator key") == std::string::npos);
+
+    CHECK_EQ(::chmod(bench.trustDir().c_str(), 0777), 0);
+    CHECK(LoadPinnedCoordinatorPublicKey(bench.trustDir()).status == PinnedKeyLoadStatus::kOwnershipUntrusted);
+    for (int i = 0; i < 3; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    CHECK_EQ(bench.executor->notice(), healthy);
+    bench.callback("playing", 0);
+    CHECK_EQ(bench.activations().size(), static_cast<std::size_t>(1));
+
+    int refusals = 0;
+    {
+        std::lock_guard<std::mutex> lock(bench.recordMutex);
+        for (const std::string& line : bench.logs) {
+            if (line.find("reading it again failed") != std::string::npos) ++refusals;
+        }
+    }
+    CHECK_EQ(refusals, 1);
+}
+
+// Needs root, like the test above.
+TEST(ADifferentKeyInstallsTheProgramSignedByItEvenWhenTheInstalledCopyHasTheSameIdentity) {
+    if (::geteuid() != 0) {
+        std::fprintf(stderr, "SKIP ADifferentKeyInstallsTheProgramSignedByItEvenWhenTheInstalledCopyHasTheSameIdentity: not root\n");
+        return;
+    }
+    Bench bench;
+    bench.pinnedKey = PinnedKeyLoadResult();
+    bench.watchTrustDir = true;
+    bench.makeExecutor();
+    std::string error;
+    CHECK(StoreCoordinatorPublicKey(bench.trustDir(), member(parseJson(fixture("keys.json")), "coordinatorPublicKey"),
+                                    &error));
+    const std::string firstDocument = signedProgram(twoEntryProgram(bench));
+    bench.network.programEnvelope = getEnvelope(firstDocument);
+    bench.tick();
+    CHECK_EQ(readFile(bench.installPath()), firstDocument);
+
+    const std::string otherSeed(64, '7');
+    ProgramSpec resigned = twoEntryProgram(bench);
+    resigned.signerSeedHex = otherSeed;
+    const std::string resignedDocument = signedProgram(resigned);
+    CHECK(resignedDocument != firstDocument);
+    bench.network.programEnvelope = getEnvelope(resignedDocument);
+    CHECK(StoreCoordinatorPublicKey(bench.trustDir(), keyFromHex(otherSeed).publicKeyBase64, &error));
+    for (int i = 0; i < 3; ++i) bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+
+    CHECK_EQ(readFile(bench.installPath()), resignedDocument);
 }
 
 TEST(ABoundaryNoNodeAcceptedSaysSoAndTheNextOneThatStartsRestoresTheNotice) {
