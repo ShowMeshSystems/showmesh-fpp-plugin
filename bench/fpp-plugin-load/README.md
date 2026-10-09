@@ -161,6 +161,7 @@ Flags:
 | `--id ID` | Isolates this run. Default `local`. See below. |
 | `--port PORT` | Host port for the container's HTTP API. Default `8190`. |
 | `--prebuilt` | Use the private prebuilt FPP 9 fixture image instead of a source build. Refused for `fpp10` and for `--cpu arm64`. |
+| `--keep` | Leave the container, network and media volume up after the run, to debug. Run `--down` afterwards. |
 | `--down` | Tear this run down and exit, including its named media volume. |
 | `-h`, `--help` | Full flag list. |
 
@@ -171,8 +172,9 @@ than 8090 so this bench and the sibling multisync bench can run at the same
 time.
 
 `docker`, `curl`, and `jq` are hard requirements; a missing one is a failure,
-never a silent skip. A normal run **leaves the container running**, the same
-asymmetry the sibling bench documents, because the image build is expensive.
+never a silent skip. A run removes its container, network and media volume
+when it ends; `--keep` leaves them up for debugging. The image build is
+expensive, so the built image is kept.
 
 ## Per-run isolation
 
@@ -426,8 +428,11 @@ before it reaches the compose files; FPP 10 is source build only.
 
 ## Tearing down
 
-A normal run leaves its container running on purpose. Tear one run down,
-including its named media volume, without touching any other run:
+A run removes its container, network and media volume when it ends, by any
+exit path: pass, fail, error or interrupt. The exit status is still the test
+result. If the removal fails, the script prints what is left and the `--down`
+command for it. Pass `--keep` to leave a run up for debugging, then tear it
+down, including its named media volume, without touching any other run:
 
 ```
 scripts/test-plugin-load-fpp.sh --id <id> --down

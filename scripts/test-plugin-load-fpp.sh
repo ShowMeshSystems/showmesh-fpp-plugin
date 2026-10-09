@@ -28,6 +28,7 @@ BENCH_USE_PREBUILT="${BENCH_USE_PREBUILT:-0}"
 # (FPP 9 only), an unrelated thing.
 ADAPTER_OBJECT=""
 DOWN=0
+KEEP=0
 
 usage() {
     cat <<EOF
@@ -55,15 +56,19 @@ Usage: $(basename "$0") [options]
                  in-container. Only valid with --major fpp10. Runs a single
                  assertion, that fppd's ABI gate accepts the object and
                  loads the plugin; skips the rest of the assertion suite.
+  --keep         Leave the container, network and media volume up when the
+                 run ends, to debug a failure. Run with --down afterwards;
+                 until then they stay on this host.
   --down         Tear this run down and exit. Removes the container, the
                  network AND the named media volume (docker compose down -v),
                  so the next run with this --id starts from a clean fppd
                  state. Leaves other runs (different --id) untouched.
   -h, --help     This message.
 
-Leaves the container running at the end of a normal run; the image build
-is expensive and this mirrors the sibling repo's own bench. Run with
---down when you are done with this --id.
+By default the run removes its container, network and media volume when it
+ends, whether it passed, failed or was interrupted. The exit status is the
+test result either way. If that removal fails, the script says what is left
+behind and the --down command that removes it. The built image is kept.
 EOF
 }
 
@@ -75,6 +80,7 @@ while [ $# -gt 0 ]; do
         --cpu) BENCH_CPU="$2"; shift 2 ;;
         --prebuilt) BENCH_USE_PREBUILT=1; shift ;;
         --adapter-object) ADAPTER_OBJECT="$2"; shift 2 ;;
+        --keep) KEEP=1; shift ;;
         --down) DOWN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -320,9 +326,28 @@ on_exit() {
     local rc=$?
     print_summary || true
     rm -f "/tmp/showmesh-bench-invoke.$$" "/tmp/showmesh-bench-unload.$$" 2>/dev/null || true
+    teardown_run
     exit "$rc"
 }
 trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Runs only once this run has reached `up`, so an early abort never removes a
+# run kept earlier under the same --id. -v for the reason --down uses it.
+RUN_STARTED=0
+teardown_run() {
+    if [ "$RUN_STARTED" != "1" ]; then
+        return 0
+    fi
+    if [ "$KEEP" = "1" ]; then
+        echo "test-plugin-load-fpp: --keep: leaving $CONTAINER, its network and its media volume up; remove them with: $0 --id $BENCH_ID --down"
+        return 0
+    fi
+    if ! "${COMPOSE[@]}" down -v >/dev/null 2>&1; then
+        echo "test-plugin-load-fpp: could not remove the container, network and media volume of run $BENCH_ID; they are still on this host. Remove them with: $0 --id $BENCH_ID --down" >&2
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Bring the container up
@@ -342,6 +367,7 @@ echo "test-plugin-load-fpp: FPP major=$BENCH_FPP_MAJOR tag=$FPP_TAG commit=$FPP_
 # stale apache/php pid file that crash-loops a plain second `up -d` lives, while
 # keeping the built image and the named media volume.
 echo "test-plugin-load-fpp: docker compose up -d --force-recreate"
+RUN_STARTED=1
 "${COMPOSE[@]}" up -d --force-recreate
 
 # The image is guaranteed to exist now, built or pulled by the up above, so
