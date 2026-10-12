@@ -7,14 +7,20 @@ namespace showmesh {
 
 const char* const kExcludedRangesPath = "/showmesh/brightness/excluded-ranges";
 const char* const kExcludedRangesLanPath = "/api/plugin-apis/showmesh/brightness/excluded-ranges";
+const char* const kChannelRangesPath = "/showmesh/brightness/channel-ranges";
+const char* const kChannelRangesLanPath = "/api/plugin-apis/showmesh/brightness/channel-ranges";
 
 namespace {
 
-const char* const kRightForm = R"(; send {"excludedRanges":[{"startChannel":1,"channelCount":512}]})";
+std::string keyOf(RangeList list) { return list == RangeList::kApply ? "channelRanges" : "excludedRanges"; }
 
-ExcludedRangesRequest refused(const std::string& detail) {
-    ExcludedRangesRequest request;
-    request.refusal = refuseExcludedRanges(detail);
+std::string rightForm(RangeList list) {
+    return "; send {\"" + keyOf(list) + R"(":[{"startChannel":1,"channelCount":512}]})";
+}
+
+RangesRequest refused(RangeList list, const std::string& detail) {
+    RangesRequest request;
+    request.refusal = refuseRanges(list, detail);
     return request;
 }
 
@@ -30,7 +36,7 @@ bool channelNumber(const json::Value& value, std::uint32_t* out) {
 
 }  // namespace
 
-json::Value excludedRangesValue(const std::vector<ChannelRange>& ranges) {
+json::Value rangesValue(const std::vector<ChannelRange>& ranges) {
     std::vector<json::Value> items;
     for (const ChannelRange& r : ranges) {
         std::vector<json::Value::Member> members;
@@ -41,49 +47,50 @@ json::Value excludedRangesValue(const std::vector<ChannelRange>& ranges) {
     return json::Value::makeArray(std::move(items));
 }
 
-ExcludedRangesResponse refuseExcludedRanges(const std::string& detail, int status) {
+RangesResponse refuseRanges(RangeList list, const std::string& detail, int status) {
     std::vector<json::Value::Member> members;
     members.emplace_back("schemaVersion", json::Value::makeNumber(kExcludedRangesSchemaVersion));
     members.emplace_back("applied", json::Value::makeBool(false));
-    members.emplace_back("error", json::Value::makeString(status == 400 ? detail + kRightForm : detail));
+    members.emplace_back("error", json::Value::makeString(status == 400 ? detail + rightForm(list) : detail));
     json::CanonicalResult rendered = json::canonicalize(json::Value::makeObject(std::move(members)));
     if (!rendered.ok) {
-        return ExcludedRangesResponse{
+        return RangesResponse{
             status, R"({"applied":false,"error":"the refusal could not be rendered","schemaVersion":1})"};
     }
-    return ExcludedRangesResponse{status, rendered.text};
+    return RangesResponse{status, rendered.text};
 }
 
-ExcludedRangesResponse renderExcludedRanges(const std::vector<ChannelRange>& ranges) {
+RangesResponse renderRanges(RangeList list, const std::vector<ChannelRange>& ranges) {
     std::vector<json::Value::Member> members;
     members.emplace_back("schemaVersion", json::Value::makeNumber(kExcludedRangesSchemaVersion));
-    members.emplace_back("excludedRanges", excludedRangesValue(ranges));
+    members.emplace_back(keyOf(list), rangesValue(ranges));
     json::CanonicalResult rendered = json::canonicalize(json::Value::makeObject(std::move(members)));
-    if (!rendered.ok) return refuseExcludedRanges("the excluded ranges could not be rendered", 500);
-    return ExcludedRangesResponse{200, rendered.text};
+    if (!rendered.ok) return refuseRanges(list, "the channel list could not be rendered", 500);
+    return RangesResponse{200, rendered.text};
 }
 
-ExcludedRangesRequest parseExcludedRangesRequest(const std::string& body) {
-    if (body.size() > kExcludedRangesBodyLimitBytes) return refused("the request body is too large");
+RangesRequest parseRangesRequest(RangeList list, const std::string& body) {
+    const std::string key = keyOf(list);
+    if (body.size() > kExcludedRangesBodyLimitBytes) return refused(list, "the request body is too large");
 
     json::ParseResult parsed = json::parse(body);
-    if (!parsed.ok || parsed.value.type() != json::Type::kObject) return refused("the body is not a JSON object");
+    if (!parsed.ok || parsed.value.type() != json::Type::kObject) return refused(list, "the body is not a JSON object");
 
-    const json::Value* list = nullptr;
+    const json::Value* items = nullptr;
     for (const json::Value::Member& m : parsed.value.members()) {
-        if (m.first == "excludedRanges") {
-            list = &m.second;
+        if (m.first == key) {
+            items = &m.second;
         } else if (m.first != "schemaVersion") {
-            return refused("unknown key \"" + m.first + "\"");
+            return refused(list, "unknown key \"" + m.first + "\"");
         }
     }
-    if (list == nullptr || list->type() != json::Type::kArray) return refused("excludedRanges must be a list");
+    if (items == nullptr || items->type() != json::Type::kArray) return refused(list, key + " must be a list");
 
-    ExcludedRangesRequest request;
-    for (const json::Value& item : list->items()) {
-        const std::string where = "excludedRanges[" + std::to_string(request.ranges.size()) + "]";
+    RangesRequest request;
+    for (const json::Value& item : items->items()) {
+        const std::string where = key + "[" + std::to_string(request.ranges.size()) + "]";
         if (item.type() != json::Type::kObject || item.members().size() != 2) {
-            return refused(where + " must hold exactly startChannel and channelCount");
+            return refused(list, where + " must hold exactly startChannel and channelCount");
         }
         ChannelRange range;
         bool haveStart = false;
@@ -92,9 +99,9 @@ ExcludedRangesRequest parseExcludedRangesRequest(const std::string& body) {
             if (m.first == "startChannel") haveStart = channelNumber(m.second, &range.startChannel);
             if (m.first == "channelCount") haveCount = channelNumber(m.second, &range.channelCount);
         }
-        if (!haveStart || !haveCount) return refused(where + " needs whole numbers of 1 or more");
+        if (!haveStart || !haveCount) return refused(list, where + " needs whole numbers of 1 or more");
         if (static_cast<double>(range.startChannel) + static_cast<double>(range.channelCount) > 4294967295.0) {
-            return refused(where + " runs past the last channel");
+            return refused(list, where + " runs past the last channel");
         }
         request.ranges.push_back(range);
     }

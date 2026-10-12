@@ -125,24 +125,33 @@ std::vector<std::string> configureChannelRangesFrom(const ChannelRangeSources& s
                       "; keeping the previous excluded channels");
     }
 
-    config.apply = parseChannelRangesSetting(sources.applySetting);
+    configureApplyRanges(parseChannelRangesSetting(sources.applySetting), sources.outputRanges, config.exclude,
+                         totalChannels, engine, &log);
+    return log;
+}
+
+void configureApplyRanges(const std::vector<ChannelRange>& setting, const std::vector<ChannelRange>& outputRanges,
+                          const std::vector<ChannelRange>& exclude, std::uint32_t totalChannels,
+                          BrightnessEngine* engine, std::vector<std::string>* log) {
+    RangeConfig config;
+    config.exclude = exclude;
+    config.apply = setting;
     if (!config.apply.empty()) {
         const ValidationResult result = engine->configureRanges(config, totalChannels);
-        if (result.ok) return log;
-        log.push_back("ShowMeshChannelRanges setting rejected: " + result.error + "; falling back to output ranges");
+        if (result.ok) return;
+        log->push_back("ShowMeshChannelRanges setting rejected: " + result.error + "; falling back to output ranges");
     }
 
-    config.apply = sources.outputRanges;
+    config.apply = outputRanges;
     if (!config.apply.empty()) {
         const ValidationResult result = engine->configureRanges(config, totalChannels);
-        if (result.ok) return log;
-        log.push_back("GetOutputRanges() produced ranges the engine rejected: " + result.error +
-                      "; using the full channel buffer");
+        if (result.ok) return;
+        log->push_back("GetOutputRanges() produced ranges the engine rejected: " + result.error +
+                       "; using the full channel buffer");
     }
 
     config.apply.assign(1, ChannelRange{1, totalChannels});
     engine->configureRanges(config, totalChannels);
-    return log;
 }
 
 }  // namespace showmesh

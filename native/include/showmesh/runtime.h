@@ -357,7 +357,11 @@ class ShowMeshRuntime {
     // Serves the excluded-ranges write registered beside the two routes
     // above. Synchronous for the same reason. store runs with engineMutex_
     // released: FPP calls this plugin's setting listener from inside it.
-    ExcludedRangesResponse applyExcludedRanges(const std::string& body, const ExcludedRangesStore& store);
+    RangesResponse applyExcludedRanges(const std::string& body, const RangesStore& store);
+
+    // Serves the channel-ranges write the same way. An empty list clears the
+    // setting; the answer is then the list the next source gave the engine.
+    RangesResponse applyChannelRanges(const std::string& body, const RangesStore& store);
 
     // Serves one contract section 3.9 republish. Called from fppd's own
     // web thread, and synchronous for exactly the reason
@@ -500,6 +504,9 @@ class ShowMeshRuntime {
     void setTestHookBeforeWait(std::function<void()> hook) { testHookBeforeWait_ = std::move(hook); }
 
  private:
+    // The body of both range writes: validate, store, apply, answer.
+    RangesResponse applyRangesWrite(RangeList list, const std::string& body, const RangesStore& store);
+
     void workerLoop();
     // True when the recorder asked for this callback's coordinator posts to be skipped.
     bool notifyFallbackRecorder(PlaylistAction action, const CallbackEvidence& evidence, const std::string& entryKey,
@@ -530,6 +537,12 @@ class ShowMeshRuntime {
     // The exclude setting value last logged as rejected, so one bad value
     // is logged once. Guarded by engineMutex_.
     std::string lastRejectedExcludeSetting_;
+    // FPP's output spans as the adapter last read them, which the apply
+    // list falls back to when its setting is cleared. Guarded by engineMutex_.
+    std::vector<ChannelRange> lastOutputRanges_;
+    // Serializes the two range writes. Taken before engineMutex_, never by
+    // the setting listener, which FPP calls from inside a write's store.
+    std::mutex rangesWriteMutex_;
     BrightnessEngine engine_;
     CallbackHandoff handoff_;
     SequenceState sequence_;

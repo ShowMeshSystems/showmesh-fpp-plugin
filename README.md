@@ -191,6 +191,14 @@ change the list on a running player: FPP's own setting save hands `fppd` a
 value cut off at its first comma, so a list of two or more ranges saved that
 way applies in full only after `fppd` restarts.
 
+The apply list, `ShowMeshChannelRanges`, is written the same way and for the
+same reason, with `PUT /showmesh/brightness/channel-ranges` and the body
+`{"channelRanges":[{"startChannel":1,"channelCount":512}]}`. Unlike a
+hand-edited setting, the route refuses a bad list whole. An empty list clears
+the setting, and the apply list then comes from FPP's output ranges, or the
+whole channel buffer when there are none. The answer and the brightness `GET`
+document report the list in force as `channelRanges`.
+
 Full state, including any active fade and the weather gate, is what nodes
 exchange and what is persisted: never a relative adjustment, so a duplicated
 or delayed payload is harmless and a stale or unreadable one is rejected

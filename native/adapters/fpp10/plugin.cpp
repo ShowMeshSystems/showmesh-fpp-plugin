@@ -212,6 +212,15 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
             },
             { drogon::Put });
         FPPPlugins::registerPluginApi(
+            showmesh::kChannelRangesPath,
+            [this](const HttpRequestPtr& req, HttpCallback&& callback) {
+                // Synchronous for the same reason as the gain route above.
+                const showmesh::ChannelRangesResponse result = runtime_.applyChannelRanges(
+                    getRequestContent(req), showmesh::adapter::storeChannelRangesSetting);
+                callback(makeStringResponse(result.body, result.status, "application/json"));
+            },
+            { drogon::Put });
+        FPPPlugins::registerPluginApi(
             showmesh::kDefinitionRepublishPath,
             [this](const HttpRequestPtr& req, HttpCallback&& callback) {
                 // Synchronous for the same reason. This handler records
@@ -249,6 +258,7 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         FPPPlugins::unregisterPluginApi(showmesh::kTransitionGainPath);
         FPPPlugins::unregisterPluginApi(showmesh::kWeatherGatePath);
         FPPPlugins::unregisterPluginApi(showmesh::kExcludedRangesPath);
+        FPPPlugins::unregisterPluginApi(showmesh::kChannelRangesPath);
         FPPPlugins::unregisterPluginApi(showmesh::kDefinitionRepublishPath);
         FPPPlugins::unregisterPluginApi(showmesh::kBrightnessQueryPath);
     }

@@ -270,7 +270,7 @@ RESULTS_STATUS=()
 if [ -n "$ADAPTER_OBJECT" ]; then
     EXPECTED_ASSERTIONS=1
 else
-    EXPECTED_ASSERTIONS=12
+    EXPECTED_ASSERTIONS=13
 fi
 SUMMARY_PRINTED=0
 SUMMARY_FAILED=0
@@ -1129,6 +1129,88 @@ a12() {
 }
 
 # ---------------------------------------------------------------------------
+# A13: the channels the ceiling applies to, written through the plugin
+#
+# Runs straight after A12, with the 0xff test pattern still on channels 1-48.
+# Writes two ranges, so the stored setting must carry a comma.
+# ---------------------------------------------------------------------------
+
+A13_NAME="A13_channel_ranges_route_stores_the_full_list"
+APPLY_SETTING="ShowMeshChannelRanges"
+
+put_channel_ranges() {
+    curl_retrying -sS -o "/tmp/showmesh-bench-channels.$$" -w '%{http_code}' \
+        -X PUT "http://localhost:${BENCH_HTTP_PORT}/api/plugin-apis/showmesh/brightness/channel-ranges" \
+        -H 'Content-Type: application/json' -d "$1" || true
+}
+
+stored_apply_setting() {
+    docker exec "$CONTAINER" grep "^${APPLY_SETTING} = " /home/fpp/media/settings 2>/dev/null || true
+}
+
+a13() {
+    local out="/tmp/showmesh-bench-channels.$$" code body bytes stored query refused
+    local full half
+    full="$(scaled_byte_hex 100)"
+    half="$(scaled_byte_hex 50)"
+    invoke_command 50 0 >/dev/null; invoke_command_body >/dev/null
+
+    code="$(put_channel_ranges '{"channelRanges":[{"startChannel":1,"channelCount":24},{"startChannel":37,"channelCount":12}]}')"
+    body="$(cat "$out" 2>/dev/null || true)"
+    if [ "$code" != "200" ] || [ "$body" != '{"channelRanges":[{"channelCount":24,"startChannel":1},{"channelCount":12,"startChannel":37}],"schemaVersion":1}' ]; then
+        rm -f "$out"
+        record "$A13_NAME" "FAIL" "PUT channel-ranges returned $code: $(printf '%s' "$body" | head -c 200)"
+        return
+    fi
+    stored="$(stored_apply_setting)"
+    if [ "$stored" != "${APPLY_SETTING} = \"1-24,37-12\"" ]; then
+        rm -f "$out"
+        record "$A13_NAME" "FAIL" "FPP's settings file holds '$stored', want the stored value 1-24,37-12"
+        return
+    fi
+    if ! bytes="$(capture_channels_1_and_25)" || [ "$bytes" != "$half $full" ]; then
+        rm -f "$out"
+        record "$A13_NAME" "FAIL" "at ceiling 50 applied to channels 1-24 and 37-48, channels 1 and 25 were '${bytes:-no capture}', want '$half $full'"
+        return
+    fi
+    query="$(curl_retrying -sS "http://localhost:${BENCH_HTTP_PORT}/api/plugin-apis/showmesh/brightness" || true)"
+    case "$query" in
+        *'"channelRanges":[{"channelCount":24,"startChannel":1},{"channelCount":12,"startChannel":37}]'*) ;;
+        *)
+            rm -f "$out"
+            record "$A13_NAME" "FAIL" "the brightness query does not report both ranges: $(printf '%s' "$query" | head -c 300)"
+            return
+            ;;
+    esac
+
+    refused="$(put_channel_ranges '{"channelRanges":"1-24,37-12"}')"
+    body="$(cat "$out" 2>/dev/null || true)"
+    case "$refused $body" in
+        400*'send {'*) ;;
+        *)
+            rm -f "$out"
+            record "$A13_NAME" "FAIL" "a malformed body returned $refused: $(printf '%s' "$body" | head -c 200)"
+            return
+            ;;
+    esac
+
+    # Cleared again, so the rest of the run applies the ceiling to FPP's output ranges.
+    code="$(put_channel_ranges '{"channelRanges":[]}')"
+    rm -f "$out"
+    stored="$(stored_apply_setting)"
+    if [ "$code" != "200" ] || [ "$stored" != "${APPLY_SETTING} = \"\"" ]; then
+        record "$A13_NAME" "FAIL" "clearing the list returned $code and FPP's settings file holds '$stored', want an empty value"
+        return
+    fi
+    if ! bytes="$(capture_channels_1_and_25)" || [ "$bytes" != "$half $half" ]; then
+        record "$A13_NAME" "FAIL" "with the list cleared, channels 1 and 25 were '${bytes:-no capture}', want '$half $half'"
+        return
+    fi
+    invoke_command 100 0 >/dev/null; invoke_command_body >/dev/null
+    record "$A13_NAME" "PASS" "FPP's settings file held ${APPLY_SETTING} = \"1-24,37-12\" after one PUT; at ceiling 50 the wire carried 0x$half on channel 1 and 0x$full on channel 25, the query reported both ranges, a malformed body was refused 400, and clearing the list scaled channel 25 again"
+}
+
+# ---------------------------------------------------------------------------
 # A6: clean teardown
 # ---------------------------------------------------------------------------
 
@@ -1528,6 +1610,7 @@ if [ -z "$ADAPTER_OBJECT" ]; then
     a3
     a4_a5
     a12
+    a13
     a6
     a7
     a8

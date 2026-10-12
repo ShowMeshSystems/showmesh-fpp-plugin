@@ -48,4 +48,10 @@ struct ChannelRangeSources {
 std::vector<std::string> configureChannelRangesFrom(const ChannelRangeSources& sources, std::uint32_t totalChannels,
                                                     BrightnessEngine* engine, std::string* lastRejectedExclude);
 
+// Configures engine with the first apply list it accepts: setting, else
+// outputRanges, else the whole buffer. Appends a line to log for each rejection.
+void configureApplyRanges(const std::vector<ChannelRange>& setting, const std::vector<ChannelRange>& outputRanges,
+                          const std::vector<ChannelRange>& exclude, std::uint32_t totalChannels,
+                          BrightnessEngine* engine, std::vector<std::string>* log);
+
 }  // namespace showmesh
