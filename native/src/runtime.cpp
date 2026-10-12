@@ -223,31 +223,52 @@ WeatherGateResponse ShowMeshRuntime::weatherGateState() {
 std::vector<std::string> ShowMeshRuntime::configureChannelRanges(const ChannelRangeSources& sources,
                                                                  std::uint32_t totalChannels) {
     std::lock_guard<std::mutex> lock(engineMutex_);
+    lastOutputRanges_ = sources.outputRanges;
     return configureChannelRangesFrom(sources, totalChannels, &engine_, &lastRejectedExcludeSetting_);
 }
 
-ExcludedRangesResponse ShowMeshRuntime::applyExcludedRanges(const std::string& body, const ExcludedRangesStore& store) {
-    const ExcludedRangesRequest request = parseExcludedRangesRequest(body);
+RangesResponse ShowMeshRuntime::applyChannelRanges(const std::string& body, const RangesStore& store) {
+    return applyRangesWrite(RangeList::kApply, body, store);
+}
+
+RangesResponse ShowMeshRuntime::applyExcludedRanges(const std::string& body, const RangesStore& store) {
+    return applyRangesWrite(RangeList::kExclude, body, store);
+}
+
+RangesResponse ShowMeshRuntime::applyRangesWrite(RangeList list, const std::string& body, const RangesStore& store) {
+    const RangesRequest request = parseRangesRequest(list, body);
     if (!request.ok) return request.refusal;
-    RangeConfig excludeOnly;
-    excludeOnly.exclude = request.ranges;
+    const bool apply = list == RangeList::kApply;
+    // Held from validation to the answer, so two writes cannot interleave
+    // one's stored setting with the other's applied list.
+    std::lock_guard<std::mutex> write(rangesWriteMutex_);
+    RangeConfig only;
+    (apply ? only.apply : only.exclude) = request.ranges;
     {
         std::lock_guard<std::mutex> lock(engineMutex_);
-        const ValidationResult valid = validateRanges(excludeOnly, engine_.totalChannels());
-        if (!valid.ok) return refuseExcludedRanges(valid.error);
+        const ValidationResult valid = validateRanges(only, engine_.totalChannels());
+        if (!valid.ok) return refuseRanges(list, valid.error);
     }
     // Stored before it is applied, so a value that cannot be kept across a
     // restart is never the one running now.
     if (store && !store(formatChannelRangesSetting(request.ranges))) {
-        return refuseExcludedRanges("the excluded channels could not be saved; check the FPP log", 500);
+        return refuseRanges(list, apply ? "the channels could not be saved; check the FPP log"
+                                        : "the excluded channels could not be saved; check the FPP log",
+                            500);
     }
     std::lock_guard<std::mutex> lock(engineMutex_);
+    if (apply) {
+        std::vector<std::string> unused;
+        configureApplyRanges(request.ranges, lastOutputRanges_, engine_.ranges().exclude, engine_.totalChannels(),
+                             &engine_, &unused);
+        return renderRanges(list, engine_.ranges().apply);
+    }
     RangeConfig config = engine_.ranges();
     config.exclude = request.ranges;
     const ValidationResult applied = engine_.configureRanges(config, engine_.totalChannels());
-    if (!applied.ok) return refuseExcludedRanges(applied.error);
+    if (!applied.ok) return refuseRanges(list, applied.error);
     lastRejectedExcludeSetting_.clear();
-    return renderExcludedRanges(engine_.ranges().exclude);
+    return renderRanges(list, engine_.ranges().exclude);
 }
 
 void ShowMeshRuntime::RuntimeSweepRecord::requestSweep() {

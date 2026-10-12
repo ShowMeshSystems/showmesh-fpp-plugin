@@ -69,10 +69,15 @@ inline void configureChannelRanges(ShowMeshRuntime* runtime, std::uint32_t total
     }
 }
 
-// The excluded-ranges write's store: persist = true writes FPP's settings
-// file and then calls this plugin's own listener, which applies the value.
+// The two range writes' stores: persist = true writes FPP's settings file
+// and then calls this plugin's own listener, which applies the value.
 inline bool storeExcludeChannelRangesSetting(const std::string& value) {
     setSetting(kExcludeChannelRangesSettingName, value, true);
+    return true;
+}
+
+inline bool storeChannelRangesSetting(const std::string& value) {
+    setSetting(kChannelRangesSettingName, value, true);
     return true;
 }
 

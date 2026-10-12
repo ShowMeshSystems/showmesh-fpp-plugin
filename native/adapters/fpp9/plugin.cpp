@@ -195,6 +195,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         ws->register_resource(showmesh::kTransitionGainPath, &gainResource_, false);
         ws->register_resource(showmesh::kWeatherGatePath, &weatherGateResource_, false);
         ws->register_resource(showmesh::kExcludedRangesPath, &excludedRangesResource_, false);
+        ws->register_resource(showmesh::kChannelRangesPath, &channelRangesResource_, false);
         ws->register_resource(showmesh::kDefinitionRepublishPath, &republishResource_, false);
         ws->register_resource(showmesh::kBrightnessQueryPath, &brightnessQueryResource_, false);
     }
@@ -208,6 +209,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         ws->unregister_resource(showmesh::kTransitionGainPath);
         ws->unregister_resource(showmesh::kWeatherGatePath);
         ws->unregister_resource(showmesh::kExcludedRangesPath);
+        ws->unregister_resource(showmesh::kChannelRangesPath);
         ws->unregister_resource(showmesh::kDefinitionRepublishPath);
         ws->unregister_resource(showmesh::kBrightnessQueryPath);
     }
@@ -268,25 +270,28 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         showmesh::ShowMeshRuntime* runtime_;
     };
 
-    // The libhttpserver side of the excluded-ranges write, a member for the
-    // same lifetime reason gainResource_ is.
-    class ExcludedRangesResource : public httpserver::http_resource {
+    // The libhttpserver side of the two range writes, members for the same
+    // lifetime reason gainResource_ is. excluded picks which list it writes.
+    class RangesResource : public httpserver::http_resource {
      public:
-        explicit ExcludedRangesResource(showmesh::ShowMeshRuntime* runtime) : runtime_(runtime) {
+        RangesResource(showmesh::ShowMeshRuntime* runtime, bool excluded) : runtime_(runtime), excluded_(excluded) {
             disallow_all();
             set_allowing("PUT", true);
         }
 
         std::shared_ptr<httpserver::http_response> render_PUT(const httpserver::http_request& req) override {
             // Synchronous, for the same reason render_POST above is.
-            const showmesh::ExcludedRangesResponse result = runtime_->applyExcludedRanges(
-                std::string(req.get_content()), showmesh::adapter::storeExcludeChannelRangesSetting);
+            const std::string body(req.get_content());
+            const showmesh::RangesResponse result = excluded_
+                ? runtime_->applyExcludedRanges(body, showmesh::adapter::storeExcludeChannelRangesSetting)
+                : runtime_->applyChannelRanges(body, showmesh::adapter::storeChannelRangesSetting);
             return std::shared_ptr<httpserver::http_response>(new httpserver::string_response(
                 result.body, result.status, "application/json"));
         }
 
      private:
         showmesh::ShowMeshRuntime* runtime_;
+        bool excluded_;
     };
 
     // The libhttpserver side of the republish route, a member for the same
@@ -396,7 +401,8 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // declaration order, so this captures a runtime_ that already exists.
     TransitionGainResource gainResource_{&runtime_};
     WeatherGateResource weatherGateResource_{&runtime_};
-    ExcludedRangesResource excludedRangesResource_{&runtime_};
+    RangesResource excludedRangesResource_{&runtime_, true};
+    RangesResource channelRangesResource_{&runtime_, false};
     DefinitionRepublishResource republishResource_{&runtime_};
     BrightnessQueryResource brightnessQueryResource_{&runtime_};
     Command* command_ = nullptr;
