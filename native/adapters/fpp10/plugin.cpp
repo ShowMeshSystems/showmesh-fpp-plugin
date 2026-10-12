@@ -32,10 +32,16 @@
 #include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
 #include "showmesh/definition_republish.h"
+#include "showmesh/excluded_ranges.h"
 #include "showmesh/transition_gain.h"
 #include "showmesh/weather_gate.h"
 
 namespace {
+
+// Both range settings reconfigure the engine the same way, so they share
+// one listener body and are withdrawn together.
+constexpr const char* kRangeSettingNames[] = {showmesh::adapter::kChannelRangesSettingName,
+                                              showmesh::adapter::kExcludeChannelRangesSettingName};
 
 showmesh::TimeMillis nowMillis() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -92,7 +98,7 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         logBrightnessRestartTrust(runtime_.brightnessRestartTrust(), safeCeilingPercent_);
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
-        showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
+        showmesh::adapter::configureChannelRanges(&runtime_, FPPD_MAX_CHANNELS);
         // start() before registering the settings listener: start() spawns
         // the worker thread and can throw, and a throwing constructor never
         // runs this object's destructor, so a listener registered first
@@ -103,11 +109,11 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
                    "ShowMesh brightness state flush failed; the darker-safe restart guarantee may not hold\n");
         });
         runtime_.start();
-        registerSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName,
-                                  [this](const std::string&) {
-                                      showmesh::adapter::configureChannelRanges(&*runtime_.brightness(),
-                                                                                FPPD_MAX_CHANNELS);
-                                  });
+        for (const char* setting : kRangeSettingNames) {
+            registerSettingsListener(showmesh::kPluginName, setting, [this](const std::string&) {
+                showmesh::adapter::configureChannelRanges(&runtime_, FPPD_MAX_CHANNELS);
+            });
+        }
     }
 
     // If shutdown() ran, the quiesce thread has already done the work and
@@ -150,7 +156,9 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         // plugin once this returns, and a settings change arriving before
         // the thread ran would otherwise reach a listener whose runtime_
         // is about to be stopped.
-        unregisterSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName);
+        for (const char* setting : kRangeSettingNames) {
+            unregisterSettingsListener(showmesh::kPluginName, setting);
+        }
         withdrawCommand();
         quiesceThread_ = std::thread([this] {
             quiesce();
@@ -195,6 +203,15 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
             },
             { drogon::Get, drogon::Post });
         FPPPlugins::registerPluginApi(
+            showmesh::kExcludedRangesPath,
+            [this](const HttpRequestPtr& req, HttpCallback&& callback) {
+                // Synchronous for the same reason as the gain route above.
+                const showmesh::ExcludedRangesResponse result = runtime_.applyExcludedRanges(
+                    getRequestContent(req), showmesh::adapter::storeExcludeChannelRangesSetting);
+                callback(makeStringResponse(result.body, result.status, "application/json"));
+            },
+            { drogon::Put });
+        FPPPlugins::registerPluginApi(
             showmesh::kDefinitionRepublishPath,
             [this](const HttpRequestPtr& req, HttpCallback&& callback) {
                 // Synchronous for the same reason. This handler records
@@ -231,6 +248,7 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
     void unregisterApis() override {
         FPPPlugins::unregisterPluginApi(showmesh::kTransitionGainPath);
         FPPPlugins::unregisterPluginApi(showmesh::kWeatherGatePath);
+        FPPPlugins::unregisterPluginApi(showmesh::kExcludedRangesPath);
         FPPPlugins::unregisterPluginApi(showmesh::kDefinitionRepublishPath);
         FPPPlugins::unregisterPluginApi(showmesh::kBrightnessQueryPath);
     }
@@ -263,7 +281,9 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         // stopped, and command_ is nulled out at the end), which is what
         // lets the destructor fall back to calling this directly on the
         // rare path where shutdown() never ran.
-        unregisterSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName);
+        for (const char* setting : kRangeSettingNames) {
+            unregisterSettingsListener(showmesh::kPluginName, setting);
+        }
         // stop() joins the worker before either flush runs, so neither
         // flush races the worker thread's own access to sequence_ or
         // engine_ (flushSequenceState() and flushBrightnessState() both

@@ -15,7 +15,9 @@
 #include "showmesh/brightness_query.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/callback_handoff.h"
+#include "showmesh/channel_ranges_setting.h"
 #include "showmesh/definition_republish.h"
+#include "showmesh/excluded_ranges.h"
 #include "showmesh/playlist_identity.h"
 #include "showmesh/sequence_store.h"
 #include "showmesh/transition_gain.h"
@@ -347,6 +349,16 @@ class ShowMeshRuntime {
     // never a write.
     WeatherGateResponse weatherGateState();
 
+    // Configures the engine's channel ranges from what the adapter read out
+    // of FPP, under engineMutex_, and returns the lines the adapter logs.
+    // Called at construction and from each setting listener.
+    std::vector<std::string> configureChannelRanges(const ChannelRangeSources& sources, std::uint32_t totalChannels);
+
+    // Serves the excluded-ranges write registered beside the two routes
+    // above. Synchronous for the same reason. store runs with engineMutex_
+    // released: FPP calls this plugin's setting listener from inside it.
+    ExcludedRangesResponse applyExcludedRanges(const std::string& body, const ExcludedRangesStore& store);
+
     // Serves one contract section 3.9 republish. Called from fppd's own
     // web thread, and synchronous for exactly the reason
     // applyTransitionGain() is. It clears the publisher's held set and
@@ -515,6 +527,9 @@ class ShowMeshRuntime {
     // rather than a gap, because a restart has already lost the fade the
     // key was protecting.
     std::string lastTransitionGainRequestId_;
+    // The exclude setting value last logged as rejected, so one bad value
+    // is logged once. Guarded by engineMutex_.
+    std::string lastRejectedExcludeSetting_;
     BrightnessEngine engine_;
     CallbackHandoff handoff_;
     SequenceState sequence_;

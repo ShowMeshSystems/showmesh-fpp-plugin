@@ -173,6 +173,24 @@ max(stored revision + 1, the given revision), so a coordinator that restarts
 its numbering can still close the gate. The response and the `GET` document
 report it as `weatherGateRevision`.
 
+The `ShowMeshExcludeChannelRanges` FPP setting lists channels the ceiling and
+the gain never change, in the same `start-count` form as
+`ShowMeshChannelRanges` (`1-512,1025-512`). It is for DMX fixtures, where a
+channel carries pan, tilt, a gobo or a colour wheel position rather than a
+brightness. It is removed from whichever apply list is in force, and a change
+takes effect without a restart. Unlike the apply setting, one bad entry
+rejects the whole value: it is logged once and the previous exclusions stay
+in force. A closed weather gate still forces these channels to 0. The list is
+written with `PUT /showmesh/brightness/excluded-ranges`, registered beside
+the two routes above and unauthenticated in the same way, with the body
+`{"excludedRanges":[{"startChannel":1,"channelCount":512}]}`; an empty list
+clears it. A valid write stores the setting, rendered from the validated
+numbers, and answers with the list the engine now holds. The brightness `GET`
+document reports the same list as `excludedRanges`. The route is the way to
+change the list on a running player: FPP's own setting save hands `fppd` a
+value cut off at its first comma, so a list of two or more ranges saved that
+way applies in full only after `fppd` restarts.
+
 Full state, including any active fade and the weather gate, is what nodes
 exchange and what is persisted: never a relative adjustment, so a duplicated
 or delayed payload is harmless and a stale or unreadable one is rejected

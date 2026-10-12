@@ -30,6 +30,7 @@ class http_resource {
     void set_allowing(const std::string& verb, bool allowed);
     virtual std::shared_ptr<http_response> render_GET(const http_request& request);
     virtual std::shared_ptr<http_response> render_POST(const http_request& request);
+    virtual std::shared_ptr<http_response> render_PUT(const http_request& request);
 };
 
 class webserver {

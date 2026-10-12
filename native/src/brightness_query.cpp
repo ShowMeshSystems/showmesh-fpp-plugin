@@ -4,6 +4,7 @@
 #include <utility>
 #include <vector>
 
+#include "showmesh/excluded_ranges.h"
 #include "showmesh/json.h"
 
 namespace showmesh {
@@ -25,6 +26,7 @@ BrightnessQueryResponse renderBrightnessQuery(const BrightnessEngine& engine, Ti
     members.emplace_back("effectiveOutput", json::Value::makeNumber(engine.effectivePercentAt(now)));
     members.emplace_back("fadeActive", json::Value::makeBool(engine.fadingAt(now)));
     members.emplace_back("weatherGateClosed", json::Value::makeBool(engine.weatherGateClosed()));
+    members.emplace_back("excludedRanges", excludedRangesValue(engine.ranges().exclude));
     members.emplace_back("updatedAtMillis", json::Value::makeNumber(static_cast<double>(now)));
     json::CanonicalResult rendered = json::canonicalize(json::Value::makeObject(std::move(members)));
     return brightnessQueryResponseFor(rendered);

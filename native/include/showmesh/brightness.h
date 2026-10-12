@@ -152,6 +152,9 @@ class BrightnessEngine {
     // Returned by value: EngineAccessor's lock releases at the end of the
     // calling expression, so a reference into ranges_ would outlive it.
     RangeConfig ranges() const { return ranges_; }
+    // The channel count the ranges were last validated against; 0 before
+    // the first configureRanges call.
+    std::uint32_t totalChannels() const { return totalChannels_; }
 
     // The persistent per-node identity carried in captureState() and
     // compared in adoptState(). Set once by the adapter; empty when the

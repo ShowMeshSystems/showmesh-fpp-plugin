@@ -306,6 +306,7 @@ persistence and the FPP 10 shutdown-predicate changes in place:
 | `A6_clean_teardown` | `fppd` exits after the stop signal with the plugin still resident and writes no crash signature to the log tail taken after that signal; on FPP 10, additionally that a runtime unload returns `loaded:false` **and** withdraws the plugin's registered command, and that a second shutdown with the plugin unloaded is also clean. | PASS | PASS |
 | `A7_no_second_multisync_listener` | Exactly one UDP 32320 socket exists, held by `fppd`, both before and after a restart. | PASS | PASS |
 | `A8_restart_survival` | The command is registered again after a container recreate, and that restart's own log tail carries the load line with no load-failure line. | PASS | PASS |
+| `A12_excluded_ranges_untouched_on_the_wire` | With channels 1-24 excluded through `PUT /api/plugin-apis/showmesh/brightness/excluded-ranges` at ceiling 50, the wire carries `0xff` on channel 1 and `0x80` on channel 25; FPP's settings file holds `ShowMeshExcludeChannelRanges = "1-24"`, the brightness `GET` reports the range, a malformed body is refused `400`, and clearing the list scales channel 1 again. | PASS | PASS |
 | `A10_restart_resumes_saved_fallback_state` | With a saved fallback state on disk for a playlist FPP's scheduler is playing, fppd is restarted in place (`fppd_stop`, `fppd_start`), the scheduler starts the playlist again, and the plugin's own status says `fallback` under that playlist. | PASS | PASS |
 | `A11_idle_restart_hands_back_after_settle_window` | With the same saved state and FPP idle, the plugin's status says `fallback` after the restart, then `normal` no sooner than the 30 second settle window, and the state file is removed. | PASS | PASS |
 
@@ -317,6 +318,10 @@ anywhere in this repository are from one run, on 2026-10-06 at commit
 callback came 23 ms (FPP 9.5.3) and 33 ms (FPP 10.0) after the plugin loaded,
 and the idle hand-back came 30.029 s (FPP 9.5.3) and 30.021 s (FPP 10.0) after
 it. All eleven assertions passed on both majors in that run.
+
+`A12` was added on 2026-10-12 and observed that day on an arm64 Mac with
+`--cpu arm64`, natively, on both majors; all twelve assertions passed in those
+two runs.
 
 `A10` writes the saved state file itself, while the running plugin is in
 `normal`, and then restarts fppd. It shows that a plugin starting with that file
