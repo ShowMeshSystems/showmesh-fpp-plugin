@@ -31,6 +31,7 @@
 #include "safe_ceiling.h"
 #include "section_names.h"
 #include "showmesh/definition_republish.h"
+#include "showmesh/excluded_ranges.h"
 #include "showmesh/transition_gain.h"
 #include "showmesh/brightness_query.h"
 #include "showmesh/weather_gate.h"
@@ -38,6 +39,11 @@
 #include "showmesh/runtime.h"
 
 namespace {
+
+// Both range settings reconfigure the engine the same way, so they share
+// one listener body and are withdrawn together.
+constexpr const char* kRangeSettingNames[] = {showmesh::adapter::kChannelRangesSettingName,
+                                              showmesh::adapter::kExcludeChannelRangesSettingName};
 
 showmesh::TimeMillis nowMillis() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -94,7 +100,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         logBrightnessRestartTrust(runtime_.brightnessRestartTrust(), safeCeilingPercent_);
         command_ = new showmesh::adapter::SetBrightnessCeilingCommand(&runtime_);
         CommandManager::INSTANCE.addCommand(command_);
-        showmesh::adapter::configureChannelRanges(&*runtime_.brightness(), FPPD_MAX_CHANNELS);
+        showmesh::adapter::configureChannelRanges(&runtime_, FPPD_MAX_CHANNELS);
         // start() before registering the settings listener: start() spawns
         // the worker thread and can throw, and a throwing constructor never
         // runs this object's destructor, so a listener registered first
@@ -105,11 +111,11 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
                    "ShowMesh brightness state flush failed; the darker-safe restart guarantee may not hold\n");
         });
         runtime_.start();
-        registerSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName,
-                                  [this](const std::string&) {
-                                      showmesh::adapter::configureChannelRanges(&*runtime_.brightness(),
-                                                                                FPPD_MAX_CHANNELS);
-                                  });
+        for (const char* setting : kRangeSettingNames) {
+            registerSettingsListener(showmesh::kPluginName, setting, [this](const std::string&) {
+                showmesh::adapter::configureChannelRanges(&runtime_, FPPD_MAX_CHANNELS);
+            });
+        }
     }
 
     ~ShowMeshFpp9Plugin() override {
@@ -123,7 +129,9 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         // case it is in, so the settings-registry call is guarded rather
         // than assumed safe.
         try {
-            unregisterSettingsListener(showmesh::kPluginName, showmesh::adapter::kChannelRangesSettingName);
+            for (const char* setting : kRangeSettingNames) {
+                unregisterSettingsListener(showmesh::kPluginName, setting);
+            }
         } catch (...) {
         }
         runtime_.stop();
@@ -186,6 +194,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         if (ws == nullptr) return;
         ws->register_resource(showmesh::kTransitionGainPath, &gainResource_, false);
         ws->register_resource(showmesh::kWeatherGatePath, &weatherGateResource_, false);
+        ws->register_resource(showmesh::kExcludedRangesPath, &excludedRangesResource_, false);
         ws->register_resource(showmesh::kDefinitionRepublishPath, &republishResource_, false);
         ws->register_resource(showmesh::kBrightnessQueryPath, &brightnessQueryResource_, false);
     }
@@ -198,6 +207,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         if (ws == nullptr) return;
         ws->unregister_resource(showmesh::kTransitionGainPath);
         ws->unregister_resource(showmesh::kWeatherGatePath);
+        ws->unregister_resource(showmesh::kExcludedRangesPath);
         ws->unregister_resource(showmesh::kDefinitionRepublishPath);
         ws->unregister_resource(showmesh::kBrightnessQueryPath);
     }
@@ -250,6 +260,27 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         std::shared_ptr<httpserver::http_response> render_POST(const httpserver::http_request& req) override {
             // Synchronous, for the same reason render_POST above is.
             const showmesh::WeatherGateResponse result = runtime_->applyWeatherGate(std::string(req.get_content()));
+            return std::shared_ptr<httpserver::http_response>(new httpserver::string_response(
+                result.body, result.status, "application/json"));
+        }
+
+     private:
+        showmesh::ShowMeshRuntime* runtime_;
+    };
+
+    // The libhttpserver side of the excluded-ranges write, a member for the
+    // same lifetime reason gainResource_ is.
+    class ExcludedRangesResource : public httpserver::http_resource {
+     public:
+        explicit ExcludedRangesResource(showmesh::ShowMeshRuntime* runtime) : runtime_(runtime) {
+            disallow_all();
+            set_allowing("PUT", true);
+        }
+
+        std::shared_ptr<httpserver::http_response> render_PUT(const httpserver::http_request& req) override {
+            // Synchronous, for the same reason render_POST above is.
+            const showmesh::ExcludedRangesResponse result = runtime_->applyExcludedRanges(
+                std::string(req.get_content()), showmesh::adapter::storeExcludeChannelRangesSetting);
             return std::shared_ptr<httpserver::http_response>(new httpserver::string_response(
                 result.body, result.status, "application/json"));
         }
@@ -365,6 +396,7 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     // declaration order, so this captures a runtime_ that already exists.
     TransitionGainResource gainResource_{&runtime_};
     WeatherGateResource weatherGateResource_{&runtime_};
+    ExcludedRangesResource excludedRangesResource_{&runtime_};
     DefinitionRepublishResource republishResource_{&runtime_};
     BrightnessQueryResource brightnessQueryResource_{&runtime_};
     Command* command_ = nullptr;

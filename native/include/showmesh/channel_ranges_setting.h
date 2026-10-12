@@ -20,4 +20,32 @@ namespace showmesh {
 // start + count would overflow uint32_t and wrap ChannelRange::endExclusive().
 std::vector<ChannelRange> parseChannelRangesSetting(const std::string& value);
 
+struct ChannelRangesParse {
+    bool ok = true;
+    std::vector<ChannelRange> ranges;
+    std::string error;
+};
+
+// The "ShowMeshExcludeChannelRanges" form of the same syntax: one bad token
+// fails the whole value, because a skipped token would leave a DMX fixture
+// scaled with nothing said. An empty value is valid and means no exclusions.
+ChannelRangesParse parseChannelRangesSettingStrict(const std::string& value);
+
+// Renders ranges back into the setting syntax, "start-count,start-count".
+std::string formatChannelRangesSetting(const std::vector<ChannelRange>& ranges);
+
+// What an adapter reads from FPP before configuring the engine's ranges.
+struct ChannelRangeSources {
+    std::string applySetting;
+    std::string excludeSetting;
+    // FPP's own output spans, already one-based.
+    std::vector<ChannelRange> outputRanges;
+};
+
+// Configures engine and returns the lines the adapter logs. Apply list:
+// applySetting, else outputRanges, else the whole buffer. A rejected exclude
+// value keeps the engine's exclusions and is logged once per value.
+std::vector<std::string> configureChannelRangesFrom(const ChannelRangeSources& sources, std::uint32_t totalChannels,
+                                                    BrightnessEngine* engine, std::string* lastRejectedExclude);
+
 }  // namespace showmesh

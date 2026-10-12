@@ -220,6 +220,36 @@ WeatherGateResponse ShowMeshRuntime::weatherGateState() {
     return renderWeatherGateState(&engine_, clock_());
 }
 
+std::vector<std::string> ShowMeshRuntime::configureChannelRanges(const ChannelRangeSources& sources,
+                                                                 std::uint32_t totalChannels) {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    return configureChannelRangesFrom(sources, totalChannels, &engine_, &lastRejectedExcludeSetting_);
+}
+
+ExcludedRangesResponse ShowMeshRuntime::applyExcludedRanges(const std::string& body, const ExcludedRangesStore& store) {
+    const ExcludedRangesRequest request = parseExcludedRangesRequest(body);
+    if (!request.ok) return request.refusal;
+    RangeConfig excludeOnly;
+    excludeOnly.exclude = request.ranges;
+    {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        const ValidationResult valid = validateRanges(excludeOnly, engine_.totalChannels());
+        if (!valid.ok) return refuseExcludedRanges(valid.error);
+    }
+    // Stored before it is applied, so a value that cannot be kept across a
+    // restart is never the one running now.
+    if (store && !store(formatChannelRangesSetting(request.ranges))) {
+        return refuseExcludedRanges("the excluded channels could not be saved; check the FPP log", 500);
+    }
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    RangeConfig config = engine_.ranges();
+    config.exclude = request.ranges;
+    const ValidationResult applied = engine_.configureRanges(config, engine_.totalChannels());
+    if (!applied.ok) return refuseExcludedRanges(applied.error);
+    lastRejectedExcludeSetting_.clear();
+    return renderExcludedRanges(engine_.ranges().exclude);
+}
+
 void ShowMeshRuntime::RuntimeSweepRecord::requestSweep() {
     runtime_->sweepRequested_.fetch_add(1);
     // Woken the same way an observation wakes it, so the sweep starts now

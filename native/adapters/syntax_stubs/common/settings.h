@@ -6,6 +6,7 @@
 // Stub. See ../README.md.
 
 std::string getSetting(const std::string& name);
+int setSetting(const std::string& key, const std::string& value, bool persist = false);
 void registerSettingsListener(const std::string& pluginName, const std::string& settingName,
                               std::function<void(const std::string&)> callback);
 void unregisterSettingsListener(const std::string& pluginName, const std::string& settingName);

@@ -1260,3 +1260,40 @@ TEST(AGateRevisionOutsideItsDomainFailsTheDecode) {
     CHECK(decoded.ok);
     CHECK_EQ(decoded.state.weatherGateRevision, showmesh::kMaxWeatherGateRevision);
 }
+
+TEST(ACeilingOf30LeavesAnExcludedDmxUniverseByteIdentical) {
+    BrightnessEngine engine;
+    RangeConfig config;
+    config.apply.push_back(ChannelRange{1, 2048});
+    config.exclude.push_back(ChannelRange{513, 512});  // the second universe
+    CHECK(engine.configureRanges(config, 2048).ok);
+    CHECK(engine.setCeiling(30, 0, kT0).ok);
+
+    std::vector<std::uint8_t> data(2048);
+    for (std::size_t i = 0; i < data.size(); ++i) data[i] = static_cast<std::uint8_t>(i * 7 + 3);
+    const std::vector<std::uint8_t> before = data;
+    engine.applyToFrame(data.data(), data.size(), kT0);
+
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        const bool excluded = i >= 512 && i < 1024;
+        const int want = excluded ? before[i] : (before[i] * 30 + 50) / 100;
+        CHECK_EQ(static_cast<int>(data[i]), want);
+    }
+}
+
+TEST(AnExclusionOverlappingAnApplyRangeProtectsOnlyTheOverlap) {
+    BrightnessEngine engine;
+    RangeConfig config;
+    config.apply.push_back(ChannelRange{1, 600});
+    config.exclude.push_back(ChannelRange{513, 512});  // channels 513-1024, past the apply range's end
+    CHECK(engine.configureRanges(config, 2048).ok);
+    CHECK(engine.setCeiling(30, 0, kT0).ok);
+
+    std::vector<std::uint8_t> data = frame(2048, 200);
+    engine.applyToFrame(data.data(), data.size(), kT0);
+    CHECK_EQ(static_cast<int>(data[0]), 60);
+    CHECK_EQ(static_cast<int>(data[511]), 60);    // channel 512, the last one scaled
+    CHECK_EQ(static_cast<int>(data[512]), 200);   // channel 513, excluded
+    CHECK_EQ(static_cast<int>(data[599]), 200);   // channel 600, excluded inside the apply range
+    CHECK_EQ(static_cast<int>(data[1024]), 200);  // outside every apply range
+}

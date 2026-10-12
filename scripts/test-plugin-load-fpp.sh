@@ -270,7 +270,7 @@ RESULTS_STATUS=()
 if [ -n "$ADAPTER_OBJECT" ]; then
     EXPECTED_ASSERTIONS=1
 else
-    EXPECTED_ASSERTIONS=11
+    EXPECTED_ASSERTIONS=12
 fi
 SUMMARY_PRINTED=0
 SUMMARY_FAILED=0
@@ -1042,6 +1042,93 @@ a5_fade() {
 }
 
 # ---------------------------------------------------------------------------
+# A12: channels the ceiling never changes
+#
+# Runs straight after A4/A5, which leave the 0xff test pattern on channels
+# 1-48. Excludes channels 1-24 through the LAN address and reads the wire.
+# ---------------------------------------------------------------------------
+
+A12_NAME="A12_excluded_ranges_untouched_on_the_wire"
+EXCLUDE_SETTING="ShowMeshExcludeChannelRanges"
+
+put_excluded_ranges() {
+    curl_retrying -sS -o "/tmp/showmesh-bench-excluded.$$" -w '%{http_code}' \
+        -X PUT "http://localhost:${BENCH_HTTP_PORT}/api/plugin-apis/showmesh/brightness/excluded-ranges" \
+        -H 'Content-Type: application/json' -d "$1" || true
+}
+
+stored_exclude_setting() {
+    docker exec "$CONTAINER" grep "^${EXCLUDE_SETTING} = " /home/fpp/media/settings 2>/dev/null || true
+}
+
+# Prints the wire bytes for channel 1 and channel 25 from a fresh capture.
+capture_channels_1_and_25() {
+    start_capture 3 || return 1
+    wait_capture || true
+    local payload
+    payload="$(ddp_payload_hex "$(read_capture | tail -1)")"
+    [ -n "$payload" ] || return 1
+    echo "${payload:0:2} ${payload:48:2}" | tr '[:upper:]' '[:lower:]'
+}
+
+a12() {
+    local out="/tmp/showmesh-bench-excluded.$$" code body bytes stored query refused
+    local full half
+    full="$(scaled_byte_hex 100)"
+    half="$(scaled_byte_hex 50)"
+    invoke_command 50 0 >/dev/null; invoke_command_body >/dev/null
+
+    code="$(put_excluded_ranges '{"excludedRanges":[{"startChannel":1,"channelCount":24}]}')"
+    body="$(cat "$out" 2>/dev/null || true)"
+    if [ "$code" != "200" ] || [ "$body" != '{"excludedRanges":[{"channelCount":24,"startChannel":1}],"schemaVersion":1}' ]; then
+        rm -f "$out"
+        record "$A12_NAME" "FAIL" "PUT excluded-ranges returned $code: $(printf '%s' "$body" | head -c 200)"
+        return
+    fi
+    if ! bytes="$(capture_channels_1_and_25)" || [ "$bytes" != "$full $half" ]; then
+        rm -f "$out"
+        record "$A12_NAME" "FAIL" "at ceiling 50 with channels 1-24 excluded, channels 1 and 25 were '${bytes:-no capture}', want '$full $half'"
+        return
+    fi
+    stored="$(stored_exclude_setting)"
+    query="$(curl_retrying -sS "http://localhost:${BENCH_HTTP_PORT}/api/plugin-apis/showmesh/brightness" || true)"
+    if [ "$stored" != "${EXCLUDE_SETTING} = \"1-24\"" ]; then
+        rm -f "$out"
+        record "$A12_NAME" "FAIL" "FPP's settings file holds '$stored', want the stored value 1-24"
+        return
+    fi
+    case "$query" in
+        *'"excludedRanges":[{"channelCount":24,"startChannel":1}]'*) ;;
+        *)
+            rm -f "$out"
+            record "$A12_NAME" "FAIL" "the brightness query does not report the excluded range: $(printf '%s' "$query" | head -c 300)"
+            return
+            ;;
+    esac
+
+    refused="$(put_excluded_ranges '{"excludedRanges":"1-24"}')"
+    body="$(cat "$out" 2>/dev/null || true)"
+    case "$refused $body" in
+        400*'send {'*) ;;
+        *)
+            rm -f "$out"
+            record "$A12_NAME" "FAIL" "a malformed body returned $refused: $(printf '%s' "$body" | head -c 200)"
+            return
+            ;;
+    esac
+
+    # Cleared again, so nothing later in the run sees an exclusion.
+    code="$(put_excluded_ranges '{"excludedRanges":[]}')"
+    rm -f "$out"
+    if [ "$code" != "200" ] || ! bytes="$(capture_channels_1_and_25)" || [ "$bytes" != "$half $half" ]; then
+        record "$A12_NAME" "FAIL" "clearing the list returned $code and channels 1 and 25 were '${bytes:-no capture}', want '$half $half'"
+        return
+    fi
+    invoke_command 100 0 >/dev/null; invoke_command_body >/dev/null
+    record "$A12_NAME" "PASS" "with channels 1-24 excluded at ceiling 50 the wire carried 0x$full on channel 1 and 0x$half on channel 25; the setting was stored as 1-24, the query reported it, a malformed body was refused 400, and clearing the list scaled channel 1 again"
+}
+
+# ---------------------------------------------------------------------------
 # A6: clean teardown
 # ---------------------------------------------------------------------------
 
@@ -1440,6 +1527,7 @@ if [ -z "$ADAPTER_OBJECT" ]; then
     a2
     a3
     a4_a5
+    a12
     a6
     a7
     a8

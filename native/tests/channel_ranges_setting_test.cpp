@@ -119,3 +119,112 @@ TEST(WholeUint32MaxAsAStartIsAcceptedWhenCountIsOne) {
     const std::vector<ChannelRange> got = parseChannelRangesSetting("4294967294-1");
     CHECK(sameRanges(got, {ChannelRange{4294967294u, 1u}}));
 }
+
+TEST(TheStrictFormFailsTheWholeValueOnOneBadToken) {
+    const showmesh::ChannelRangesParse good = showmesh::parseChannelRangesSettingStrict("1-512, 1025-512");
+    CHECK(good.ok);
+    CHECK(sameRanges(good.ranges, {ChannelRange{1, 512}, ChannelRange{1025, 512}}));
+
+    for (const char* bad : {"1-512,abc", "1-512,", "1-0", "0-5", "5", "1-512;1025-512", "+1-5", "4294967295-1"}) {
+        const showmesh::ChannelRangesParse parsed = showmesh::parseChannelRangesSettingStrict(bad);
+        CHECK(!parsed.ok);
+        CHECK(parsed.ranges.empty());
+        CHECK(parsed.error.find("start-count pair such as 1-512") != std::string::npos);
+    }
+}
+
+TEST(AnEmptyStrictValueIsValidAndHoldsNoRanges) {
+    CHECK(showmesh::parseChannelRangesSettingStrict("").ok);
+    CHECK(showmesh::parseChannelRangesSettingStrict("  ").ranges.empty());
+    CHECK(showmesh::parseChannelRangesSettingStrict("  ").ok);
+}
+
+TEST(FormattedRangesParseBackToTheSameRanges) {
+    const std::vector<ChannelRange> ranges = {ChannelRange{1, 512}, ChannelRange{1025, 512}};
+    const std::string text = showmesh::formatChannelRangesSetting(ranges);
+    CHECK_EQ(text, std::string("1-512,1025-512"));
+    CHECK(sameRanges(showmesh::parseChannelRangesSettingStrict(text).ranges, ranges));
+    CHECK_EQ(showmesh::formatChannelRangesSetting({}), std::string());
+}
+
+namespace {
+
+// Scales a frame of 200s at a ceiling of 30 and reports one channel, one-based.
+int scaledChannel(showmesh::BrightnessEngine* engine, std::size_t channel) {
+    std::vector<std::uint8_t> data(4096, 200);
+    engine->applyToFrame(data.data(), data.size(), 1'800'000'000'000);
+    return data[channel - 1];
+}
+
+}  // namespace
+
+TEST(TheExcludeSettingAppliesToEveryApplyListSource) {
+    showmesh::ChannelRangeSources fromSetting;
+    fromSetting.applySetting = "1-2048";
+    showmesh::ChannelRangeSources fromOutputs;
+    fromOutputs.outputRanges = {ChannelRange{1, 2048}};
+    const showmesh::ChannelRangeSources fromFullBuffer;
+
+    for (showmesh::ChannelRangeSources sources : {fromSetting, fromOutputs, fromFullBuffer}) {
+        sources.excludeSetting = "513-512";
+        showmesh::BrightnessEngine engine;
+        std::string lastRejected;
+        CHECK(engine.setCeiling(30, 0, 1'800'000'000'000).ok);
+        CHECK(showmesh::configureChannelRangesFrom(sources, 4096, &engine, &lastRejected).empty());
+        CHECK(sameRanges(engine.ranges().exclude, {ChannelRange{513, 512}}));
+        CHECK_EQ(scaledChannel(&engine, 512), 60);
+        CHECK_EQ(scaledChannel(&engine, 513), 200);
+        CHECK_EQ(scaledChannel(&engine, 1024), 200);
+        CHECK_EQ(scaledChannel(&engine, 1025), 60);
+    }
+}
+
+TEST(ARejectedExcludeSettingKeepsThePreviousExclusionsAndIsLoggedOnce) {
+    showmesh::BrightnessEngine engine;
+    std::string lastRejected;
+    showmesh::ChannelRangeSources sources;
+    sources.excludeSetting = "513-512";
+    CHECK(showmesh::configureChannelRangesFrom(sources, 4096, &engine, &lastRejected).empty());
+
+    // Unparseable, overlapping, and past the buffer: each keeps 513-512.
+    for (const char* bad : {"513-512,oops", "1-100,50-100", "4000-512"}) {
+        sources.excludeSetting = bad;
+        const std::vector<std::string> first = showmesh::configureChannelRangesFrom(sources, 4096, &engine, &lastRejected);
+        CHECK_EQ(first.size(), std::size_t(1));
+        CHECK(first[0].find("ShowMeshExcludeChannelRanges setting rejected: ") == 0);
+        CHECK(first[0].find("keeping the previous excluded channels") != std::string::npos);
+        CHECK(showmesh::configureChannelRangesFrom(sources, 4096, &engine, &lastRejected).empty());
+        CHECK(sameRanges(engine.ranges().exclude, {ChannelRange{513, 512}}));
+    }
+
+    // An empty value is the operator clearing the list, not a failure.
+    sources.excludeSetting = "";
+    CHECK(showmesh::configureChannelRangesFrom(sources, 4096, &engine, &lastRejected).empty());
+    CHECK(engine.ranges().exclude.empty());
+}
+
+TEST(ARejectedApplySettingStillFallsBackToOutputRangesWithTheExclusions) {
+    showmesh::BrightnessEngine engine;
+    std::string lastRejected;
+    showmesh::ChannelRangeSources sources;
+    sources.applySetting = "1-100,50-100";
+    sources.excludeSetting = "10-5";
+    sources.outputRanges = {ChannelRange{1, 64}};
+    const std::vector<std::string> log = showmesh::configureChannelRangesFrom(sources, 4096, &engine, &lastRejected);
+    CHECK_EQ(log.size(), std::size_t(1));
+    CHECK(log[0].find("ShowMeshChannelRanges setting rejected: ") == 0);
+    CHECK(sameRanges(engine.ranges().apply, {ChannelRange{1, 64}}));
+    CHECK(sameRanges(engine.ranges().exclude, {ChannelRange{10, 5}}));
+}
+
+TEST(AClosedWeatherGateStillDarkensAnExcludedChannel) {
+    showmesh::BrightnessEngine engine;
+    std::string lastRejected;
+    showmesh::ChannelRangeSources sources;
+    sources.excludeSetting = "513-512";
+    CHECK(showmesh::configureChannelRangesFrom(sources, 4096, &engine, &lastRejected).empty());
+    CHECK_EQ(scaledChannel(&engine, 600), 200);
+    engine.setWeatherGate(true, 1, 1'800'000'000'000);
+    CHECK_EQ(scaledChannel(&engine, 600), 0);
+    CHECK_EQ(scaledChannel(&engine, 1), 0);
+}
