@@ -91,6 +91,17 @@ TEST(BrightnessStoreThenLoadRoundTrips) {
     CHECK_EQ(loaded.state.revision, static_cast<std::uint64_t>(7));
 }
 
+TEST(BrightnessStoreRoundTripsCeilingChangedAt) {
+    TempDir dir;
+    BrightnessFileStore store(dir.path());
+    BrightnessState state = sampleState(42.0);
+    state.ceilingChangedAtMillis = 1'800'000'001'234;
+    CHECK(store.store(state));
+    BrightnessStateLoad loaded = store.load();
+    CHECK(loaded.ok);
+    CHECK_EQ(loaded.state.ceilingChangedAtMillis, static_cast<showmesh::TimeMillis>(1'800'000'001'234));
+}
+
 TEST(BrightnessStoreAlwaysOverwritesEvenWithADarkerValue) {
     // Unlike the sequence store, there is no monotonic floor here: the
     // store's only job is durability, not judging which value is "newer".

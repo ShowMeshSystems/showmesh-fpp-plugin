@@ -125,6 +125,7 @@ std::string encodeBrightnessState(const BrightnessState& state) {
     addNumber(&members, "persistedAtMillis", static_cast<double>(state.persistedAtMillis));
     members.emplace_back("weatherGateClosed", json::Value::makeBool(state.weatherGateClosed));
     addNumber(&members, "weatherGateRevision", static_cast<double>(state.weatherGateRevision));
+    addNumber(&members, "ceilingChangedAtMillis", static_cast<double>(state.ceilingChangedAtMillis));
 
     json::CanonicalResult canonical = json::canonicalize(json::Value::makeObject(std::move(members)));
     return canonical.ok ? canonical.text : std::string();
@@ -173,6 +174,11 @@ BrightnessStateDecode decodeBrightnessState(const std::string& text) {
             return result;
         }
         s.weatherGateRevision = static_cast<std::uint64_t>(gateRevision);
+    }
+    // Optional: a record or peer from before the field existed reads as never set.
+    if (member(parsed.value, "ceilingChangedAtMillis") != nullptr &&
+        !readMillis(parsed.value, "ceilingChangedAtMillis", &s.ceilingChangedAtMillis, &result.error)) {
+        return result;
     }
 
     s.schemaVersion = static_cast<int>(schemaVersion);

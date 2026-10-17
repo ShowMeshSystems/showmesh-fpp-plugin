@@ -219,6 +219,18 @@ field existed decodes with it absent, which is treated as "not mentioned"
 rather than "open": for a peer payload that means no change, and for a persisted record it means no
 record has ever said closed.
 
+The worker thread sends this full state over MultiSync with
+`MultiSync::SendPluginData` once at start and whenever the engine's revision
+changes, playing or idle, and only where FPP has MultiSync enabled. A remote
+never has it enabled, so it never sends; it still receives and adopts. The
+frame thread neither encodes nor sends. The brightness `GET` also reports
+`ceilingTarget`, `ceilingFadeEndMillis` (0 when the ceiling is not fading) and
+`ceilingChangedAtMillis`: when the ceiling was last deliberately set, by the
+FPP action, or the sending peer's own value when its state is adopted. A
+safe-ceiling settle and a restore from the persisted
+record leave it unchanged; it is persisted with the rest of the state and
+reads as 0 from a record or peer that predates it.
+
 **Playlist identity.** The canonical playlist hash is SHA-256 over the RFC 8785
 canonicalization of the complete definition FPP returned, with no field
 removed. Both the canonicalizer and the hash are implemented here; the number
@@ -374,8 +386,8 @@ With both records unreadable the gate restarts open at revision 0.
 `ShowMeshRuntime::applyWeatherGate()` also
 flushes brightness state synchronously on an applied write, unlike the
 transition-gain write: a closed gate must survive a restart even when `fppd`
-is not currently outputting frames and would otherwise never reach the
-per-frame dirty mark `modifyChannelData` relies on.
+is not currently outputting frames, and the worker's revision check runs on
+its own poll.
 
 ## Fallback executor
 

@@ -121,6 +121,9 @@ struct BrightnessState {
     bool weatherGateClosed = false;
     // Issued by the coordinator; orders peer gate adoption. Missing reads as 0.
     std::uint64_t weatherGateRevision = 0;
+    // When the ceiling was last deliberately set; see
+    // BrightnessEngine::ceilingChangedAtMillis. Missing reads as 0.
+    TimeMillis ceilingChangedAtMillis = 0;
 };
 
 // The largest gate revision a coordinator write or peer payload may carry:
@@ -183,6 +186,13 @@ class BrightnessEngine {
     ValidationResult setGain(int targetPercent, std::int64_t fadeSeconds, TimeMillis now);
 
     double ceilingAt(TimeMillis now) const { return ceiling_.valueAt(now); }
+    double ceilingTarget() const { return ceiling_.target(); }
+    // When the ceiling fade in progress ends, or 0 when the ceiling is not fading at now.
+    TimeMillis ceilingFadeEndMillisAt(TimeMillis now) const { return ceiling_.fadingAt(now) ? ceiling_.endMillis() : 0; }
+    // Stamped by setCeiling; an adoption takes the sender's own value. A
+    // safe-ceiling settle never changes it, and a restore only brings back
+    // the persisted value. 0 when never set.
+    TimeMillis ceilingChangedAtMillis() const { return ceilingChangedAtMillis_; }
     double gainAt(TimeMillis now) const { return gain_.valueAt(now); }
 
     // The composed percentage actually applied to channel data: 0 whenever
@@ -273,6 +283,7 @@ class BrightnessEngine {
     std::uint32_t totalChannels_ = 0;
     std::uint64_t revision_ = 0;
     TimeMillis stateChangedAtMillis_ = 0;
+    TimeMillis ceilingChangedAtMillis_ = 0;
     std::string instanceId_;
     double lastAppliedCeiling_ = 100.0;
     double lastAppliedGain_ = 100.0;

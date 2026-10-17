@@ -68,3 +68,23 @@ TEST(AQueryThatCannotBeRenderedAnswers500WithNoNumbers) {
     CHECK_EQ(response.status, 500);
     CHECK(response.body.empty());
 }
+
+TEST(TheQueryRouteReportsTheCeilingTargetFadeEndAndChangeTime) {
+    BrightnessEngine fresh;
+    const BrightnessQueryResponse never = renderBrightnessQuery(fresh, 1000);
+    CHECK(contains(never.body, "\"ceilingTarget\":100"));
+    CHECK(contains(never.body, "\"ceilingFadeEndMillis\":0"));
+    CHECK(contains(never.body, "\"ceilingChangedAtMillis\":0"));
+
+    BrightnessEngine engine;
+    engine.setCeiling(80, 10, 1000);
+    const BrightnessQueryResponse fading = renderBrightnessQuery(engine, 5000);
+    CHECK(contains(fading.body, "\"ceilingTarget\":80"));
+    CHECK(contains(fading.body, "\"ceilingFadeEndMillis\":11000"));
+    CHECK(contains(fading.body, "\"ceilingChangedAtMillis\":1000"));
+
+    const BrightnessQueryResponse settled = renderBrightnessQuery(engine, 11000);
+    CHECK(contains(settled.body, "\"ceilingTarget\":80"));
+    CHECK(contains(settled.body, "\"ceilingFadeEndMillis\":0"));
+    CHECK(contains(settled.body, "\"ceilingChangedAtMillis\":1000"));
+}

@@ -1318,8 +1318,8 @@ TEST(AConfiguredNonDefaultSafeCeilingIsHonoredOnAnUntrustedRestart) {
 }
 
 // The settle must bump the revision the same way a local command
-// does, and the runtime's own publish path (encodeFullState(), what the
-// adapters' publishFullStateIfChanged() sends over MultiSync) must carry
+// does, and the runtime's own publish path (encodeFullState(), what
+// the worker's publishBrightnessIfChanged() sends over MultiSync) must carry
 // that bumped revision rather than the zero a fresh engine starts at.
 // Before this change, settleDarkAfterUntrustedRestart() touched neither
 // revision_ nor stateChangedAtMillis_, so a settled node's full state
@@ -1353,7 +1353,7 @@ TEST(AnUntrustedRestartSettleBumpsTheRevisionAndPublishesFullState) {
     const TimeMillis settledStateChangedAt = restarted.brightness()->captureState(gNow).stateChangedAtMillis;
     CHECK(settledStateChangedAt != 0);
 
-    // encodeFullState() is exactly what the adapters' publishFullStateIfChanged
+    // encodeFullState() is exactly what publishBrightnessIfChanged
     // sends over MultiSync once the revision differs from the last one
     // published; decoding the payload it produces here proves the
     // settle's bumped revision genuinely reaches that path.
@@ -1493,8 +1493,8 @@ TEST(ARestartMidATrustedUpFadeNeverComesBackBrighterThanWhatWasApplied) {
     gNow = savedNow;
 }
 
-// The F3 regression: publishFullStateIfChanged() runs on FPP's per-frame
-// output thread, so it must never perform the store's write itself.
+// The F3 regression: a caller on FPP's per-frame output thread must
+// never perform the store's write itself.
 // markBrightnessDirty() is the seam it calls instead: a cheap flag set
 // plus a wakeup, never touching disk. flushBrightnessIfDirty() is what
 // the worker thread calls to actually do the write; exercising it
@@ -1921,4 +1921,101 @@ TEST(AnUnreadablePrimaryRestoresTheGateFromTheBackupInBothDirections) {
     const RestartedGate lost = gateAfterRestart({true}, true, true);
     CHECK(!lost.closed);
     CHECK_EQ(lost.revision, std::uint64_t{0});
+}
+
+namespace {
+
+struct RecordingSender {
+    std::mutex mutex;
+    bool enabled = true;
+    int enabledAsked = 0;
+    std::vector<std::string> sent;
+
+    ShowMeshRuntime::FullStateSender bind() {
+        return ShowMeshRuntime::FullStateSender{
+            [this] {
+                std::lock_guard<std::mutex> lock(mutex);
+                ++enabledAsked;
+                return enabled;
+            },
+            [this](const std::string& payload) {
+                std::lock_guard<std::mutex> lock(mutex);
+                sent.push_back(payload);
+            }};
+    }
+    std::size_t sentCount() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return sent.size();
+    }
+};
+
+bool waitForSentCount(RecordingSender& sender, std::size_t want) {
+    for (int i = 0; i < 400; ++i) {
+        if (sender.sentCount() >= want) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST(TheFullStateIsSentAtStartAndOnEachRevisionChangeNotPerFrame) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    RecordingSender sender;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+    runtime.setFullStateSender(sender.bind());
+
+    CHECK(runtime.publishBrightnessIfChanged());
+    CHECK_EQ(sender.sentCount(), static_cast<std::size_t>(1));
+    CHECK(!runtime.publishBrightnessIfChanged());
+    CHECK_EQ(sender.sentCount(), static_cast<std::size_t>(1));
+
+    CHECK(runtime.applyBrightnessCommand("40", "0").ok);
+    std::vector<std::uint8_t> frame(16, 200);
+    runtime.modifyChannelData(frame.data(), frame.size());
+    CHECK_EQ(sender.sentCount(), static_cast<std::size_t>(1));
+
+    CHECK(runtime.publishBrightnessIfChanged());
+    CHECK_EQ(sender.sentCount(), static_cast<std::size_t>(2));
+    showmesh::BrightnessStateDecode decoded = showmesh::decodeBrightnessState(sender.sent.back());
+    CHECK(decoded.ok);
+    CHECK_NEAR(decoded.state.ceilingTarget, 40.0, 1e-9);
+    CHECK_EQ(decoded.state.ceilingChangedAtMillis, gNow);
+}
+
+TEST(NoFullStateIsSentWhereMultiSyncIsDisabled) {
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    RecordingSender sender;
+    sender.enabled = false;
+    ShowMeshRuntime runtime(&definitions, &sink, testClock);
+    runtime.setFullStateSender(sender.bind());
+
+    CHECK(runtime.publishBrightnessIfChanged());
+    CHECK(runtime.applyBrightnessCommand("40", "0").ok);
+    CHECK(runtime.publishBrightnessIfChanged());
+    CHECK_EQ(sender.sentCount(), static_cast<std::size_t>(0));
+    CHECK_EQ(sender.enabledAsked, 2);
+}
+
+TEST(TheWorkerSendsAtStartAndWhenACommandChangesTheCeilingWhileIdle) {
+    TempDir dir;
+    FakeDefinitions definitions;
+    RecordingSink sink;
+    RecordingSender sender;
+    BrightnessFileStore store(dir.path());
+    ShowMeshRuntime runtime(&definitions, &sink, testClock, nullptr, nullptr, &store);
+    runtime.setFullStateSender(sender.bind());
+    runtime.start();
+    CHECK(waitForSentCount(sender, 1));
+
+    // No frames are output: the worker alone sends and persists the change.
+    CHECK(runtime.applyBrightnessCommand("30", "0").ok);
+    CHECK(waitForSentCount(sender, 2));
+    runtime.stop();
+    showmesh::BrightnessStateLoad loaded = store.load();
+    CHECK(loaded.ok);
+    CHECK_NEAR(loaded.state.ceilingTarget, 30.0, 1e-9);
+    CHECK_EQ(loaded.state.ceilingChangedAtMillis, gNow);
 }

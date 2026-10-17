@@ -22,6 +22,11 @@ BrightnessQueryResponse renderBrightnessQuery(const BrightnessEngine& engine, Ti
     std::vector<json::Value::Member> members;
     members.emplace_back("schemaVersion", json::Value::makeNumber(kBrightnessQuerySchemaVersion));
     members.emplace_back("ceiling", json::Value::makeNumber(std::lround(engine.ceilingAt(now))));
+    members.emplace_back("ceilingTarget", json::Value::makeNumber(std::lround(engine.ceilingTarget())));
+    members.emplace_back("ceilingFadeEndMillis",
+                         json::Value::makeNumber(static_cast<double>(engine.ceilingFadeEndMillisAt(now))));
+    members.emplace_back("ceilingChangedAtMillis",
+                         json::Value::makeNumber(static_cast<double>(engine.ceilingChangedAtMillis())));
     members.emplace_back("transitionGain", json::Value::makeNumber(std::lround(engine.gainAt(now))));
     members.emplace_back("effectiveOutput", json::Value::makeNumber(engine.effectivePercentAt(now)));
     members.emplace_back("fadeActive", json::Value::makeBool(engine.fadingAt(now)));
