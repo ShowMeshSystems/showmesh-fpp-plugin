@@ -129,6 +129,7 @@ ValidationResult BrightnessEngine::setCeiling(int targetPercent, std::int64_t fa
     if (!result.ok) return result;
     ceiling_.fadeTo(static_cast<double>(targetPercent), fadeSeconds * 1000, now);
     bumpRevision(now);
+    ceilingChangedAtMillis_ = stateChangedAtMillis_;
     return ValidationResult{};
 }
 
@@ -237,6 +238,7 @@ BrightnessState BrightnessEngine::captureState(TimeMillis now) const {
     s.persistedAtMillis = now;
     s.weatherGateClosed = gateClosed_;
     s.weatherGateRevision = gateRevision_;
+    s.ceilingChangedAtMillis = ceilingChangedAtMillis_;
     return s;
 }
 
@@ -320,6 +322,10 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state, TimeMil
     if (!newer) {
         return StateAdoption::kRejectedStaleRevision;
     }
+    const bool ceilingChanged = clampPercent(state.ceilingTarget) != ceiling_.target() ||
+                                state.ceilingFadeStartMillis != ceiling_.startMillis() ||
+                                state.ceilingFadeEndMillis != ceiling_.endMillis();
+    if (ceilingChanged) ceilingChangedAtMillis_ = state.stateChangedAtMillis;
     ceiling_.restore(clampPercent(state.ceilingStart), clampPercent(state.ceilingTarget), state.ceilingFadeStartMillis,
                      state.ceilingFadeEndMillis);
     gain_.restore(clampPercent(state.gainStart), clampPercent(state.gainTarget), state.gainFadeStartMillis,
@@ -410,6 +416,7 @@ StateAdoption BrightnessEngine::restoreFromPersisted(const BrightnessState& stat
 
     revision_ = state.revision;
     stateChangedAtMillis_ = state.stateChangedAtMillis;
+    ceilingChangedAtMillis_ = timestampIsPlausible(state.ceilingChangedAtMillis) ? state.ceilingChangedAtMillis : 0;
     instanceId_ = state.instanceId;
     // This is the node's own prior state, resumed after a restart, so the
     // stored ordering key's instanceId matches instanceId_ here, unlike

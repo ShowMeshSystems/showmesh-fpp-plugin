@@ -265,7 +265,7 @@ class EngineAccessor {
 // callbacks into it, and does nothing else.
 //
 // engine_ is reached from three fppd threads: the output thread
-// (modifyChannelData, encodeFullState), FPP's command thread
+// (modifyChannelData), FPP's command thread
 // (applyBrightnessCommand), and the MultiSync thread
 // (adoptEncodedFullState). engineMutex_ is held across every mutation and
 // every read of engine_, including through EngineAccessor, because
@@ -437,12 +437,9 @@ class ShowMeshRuntime {
 
     // Marks the engine's brightness state as needing to be persisted,
     // without touching disk itself: sets a flag and wakes the worker
-    // thread, the same handoff observeCallback() already uses. Called
-    // from FPP's per-frame output thread (via the adapters'
-    // publishFullStateIfChanged) so the write flushBrightnessState()
-    // actually does -- a full read, a SHA-256, two fsyncs, a rename --
-    // never runs inside the output thread's frame budget. The worker
-    // thread performs the write; see flushBrightnessIfDirty().
+    // thread, the same handoff observeCallback() already uses, so the
+    // write flushBrightnessState() does never runs on a caller's thread.
+    // The worker thread performs the write; see flushBrightnessIfDirty().
     void markBrightnessDirty();
 
     // What the worker thread calls once per loop iteration: flushes if
@@ -461,6 +458,20 @@ class ShowMeshRuntime {
     void setBrightnessFlushFailureHandler(std::function<void()> handler) {
         brightnessFlushFailureHandler_ = std::move(handler);
     }
+
+    // The adapter's MultiSync send of the full brightness state. The worker
+    // asks enabled() before each send so a host FPP cannot send from (a
+    // remote) never calls send. Set before start(); unset sends nothing.
+    struct FullStateSender {
+        std::function<bool()> enabled;
+        std::function<void(const std::string&)> send;
+    };
+    void setFullStateSender(FullStateSender sender) { fullStateSender_ = std::move(sender); }
+
+    // Worker thread: on the first call and whenever the engine's revision
+    // changed since the last one, marks brightness dirty (on a change) and
+    // sends the full state. Returns false when there was nothing to do.
+    bool publishBrightnessIfChanged();
 
     // Set once, at construction, from what brightnessStore_->load() found
     // (or from BrightnessFileStore's default when no store is
@@ -508,6 +519,8 @@ class ShowMeshRuntime {
     RangesResponse applyRangesWrite(RangeList list, const std::string& body, const RangesStore& store);
 
     void workerLoop();
+    // Ends the worker's wait now rather than at its 250ms poll.
+    void wakeWorker();
     // True when the recorder asked for this callback's coordinator posts to be skipped.
     bool notifyFallbackRecorder(PlaylistAction action, const CallbackEvidence& evidence, const std::string& entryKey,
                                 const std::string& playlistName);
@@ -563,6 +576,10 @@ class ShowMeshRuntime {
     bool brightnessDirty_ = false;
     // See setBrightnessFlushFailureHandler().
     std::function<void()> brightnessFlushFailureHandler_;
+    FullStateSender fullStateSender_;
+    // Worker thread only; see publishBrightnessIfChanged().
+    bool brightnessPublishedOnce_ = false;
+    std::uint64_t publishedBrightnessRevision_ = 0;
     // Guarded by engineMutex_; touched only inside flushBrightnessState().
     // Lets a redundant flush at an unchanged revision -- the operator-
     // command flush followed by the next frame's now-stale dirty mark --

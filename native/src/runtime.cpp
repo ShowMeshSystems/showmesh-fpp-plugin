@@ -161,6 +161,7 @@ CommandOutcome ShowMeshRuntime::applyBrightnessCommand(const std::string& target
     if (!result.ok) {
         return CommandOutcome{false, result.error};
     }
+    wakeWorker();
     if (seconds == 0) {
         return CommandOutcome{true, "brightness ceiling set to " + std::to_string(percent) + " percent"};
     }
@@ -316,6 +317,7 @@ StateAdoption ShowMeshRuntime::adoptEncodedFullState(const std::uint8_t* data, i
     }
     // Persisted by the worker now, not at the next frame, which an idle host may never output.
     if (gateAdopted) markBrightnessDirty();
+    if (result == StateAdoption::kAdopted) wakeWorker();
     return result;
 }
 
@@ -523,6 +525,36 @@ void ShowMeshRuntime::markBrightnessDirty() {
     wake_.notify_one();
 }
 
+void ShowMeshRuntime::wakeWorker() {
+    {
+        std::lock_guard<std::mutex> lock(wakeMutex_);
+        hasWork_ = true;
+    }
+    wake_.notify_one();
+}
+
+bool ShowMeshRuntime::publishBrightnessIfChanged() {
+    std::string payload;
+    bool changed;
+    {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        const std::uint64_t revision = engine_.revision();
+        changed = revision != publishedBrightnessRevision_;
+        if (brightnessPublishedOnce_ && !changed) return false;
+        brightnessPublishedOnce_ = true;
+        publishedBrightnessRevision_ = revision;
+        payload = encodeBrightnessState(engine_.captureState(clock_()));
+    }
+    if (changed) {
+        std::lock_guard<std::mutex> lock(wakeMutex_);
+        brightnessDirty_ = true;
+    }
+    if (payload.empty() || !fullStateSender_.send) return true;
+    if (fullStateSender_.enabled && !fullStateSender_.enabled()) return true;
+    fullStateSender_.send(payload);
+    return true;
+}
+
 bool ShowMeshRuntime::flushBrightnessIfDirty() {
     bool dirty;
     {
@@ -608,6 +640,7 @@ void ShowMeshRuntime::workerLoop() {
         }
         // Off the frame thread and the command thread: see
         // markBrightnessDirty() and flushBrightnessState().
+        publishBrightnessIfChanged();
         flushBrightnessIfDirty();
         maybeSweepDefinitions();
         // Config reload is a local file stat plus, at most, an occasional

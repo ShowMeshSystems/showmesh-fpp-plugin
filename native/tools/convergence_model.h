@@ -13,7 +13,7 @@
 // schedule (skewing its private lastAppliedCeiling/lastAppliedGain
 // independently of every other node), and broadcasts its full state to
 // every other node whenever its own revision() changes, exactly as the
-// adapters' publishFullStateIfChanged would. Delivery is a discrete-event
+// runtime's publishBrightnessIfChanged would. Delivery is a discrete-event
 // queue: a message can be duplicated, delivered out of order, and delayed
 // by a random amount, and receiving one can itself trigger a further
 // broadcast (an adoption bumps revision()), which is how a real gossip

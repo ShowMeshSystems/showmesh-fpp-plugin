@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "MultiSync.h"
 #include "Plugin.h"
 #include "Plugins.h"
 #include "fpphttp.h"
@@ -108,6 +109,16 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
             LogErr(VB_PLUGIN,
                    "ShowMesh brightness state flush failed; the darker-safe restart guarantee may not hold\n");
         });
+        // MultiSync::SendPluginData sends over the network; PluginManager's
+        // multiSyncData only reaches plugins on this host. FPP opens the send
+        // socket only where MultiSync is enabled, which a remote never is.
+        runtime_.setFullStateSender(showmesh::ShowMeshRuntime::FullStateSender{
+            [] { return MultiSync::INSTANCE.isMultiSyncEnabled(); },
+            [](const std::string& payload) {
+                MultiSync::INSTANCE.SendPluginData(showmesh::kPluginName,
+                                                   reinterpret_cast<const uint8_t*>(payload.data()),
+                                                   static_cast<int>(payload.size()));
+            }});
         runtime_.start();
         for (const char* setting : kRangeSettingNames) {
             registerSettingsListener(showmesh::kPluginName, setting, [this](const std::string&) {
@@ -276,7 +287,6 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
 
     void modifyChannelData(int, uint8_t* seqData) override {
         runtime_.modifyChannelData(seqData, FPPD_MAX_CHANNELS);
-        publishFullStateIfChanged();
     }
 
     void multiSyncData(const uint8_t* data, int len) override { runtime_.adoptEncodedFullState(data, len); }
@@ -317,39 +327,6 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         command_ = nullptr;
     }
 
-    void publishFullStateIfChanged() {
-        const std::uint64_t revision = runtime_.brightness()->revision();
-        if (revision == publishedRevision_) return;
-        publishedRevision_ = revision;
-        // Marked dirty here, on a revision change, not only at teardown.
-        // A revision bumps when a target changes (a command, or an adopted
-        // full state), never per interpolated frame, so this is a rare
-        // mark and not an SD-wear problem: the sequence store already
-        // writes more often than this, once per accepted playlist event.
-        //
-        // Teardown alone was not enough. On FPP 9 there is no unload or
-        // shutdown hook at all, so the only flush was in the destructor,
-        // and an fppd killed by a signal never runs it: setting a ceiling
-        // and then stopping fppd gracefully was observed to persist
-        // nothing, leaving the darker-safe restart guarantee not holding
-        // on the version the deployed fleet runs. Marking dirty on change
-        // makes the guarantee independent of how the process ends. The
-        // persisted record carries the fade window, so one write at the
-        // start of a fade is enough to restore it darker-safely.
-        //
-        // This is markBrightnessDirty(), not a direct flush: this method
-        // runs on FPP's per-frame output thread, and the store's write is
-        // a full read, a SHA-256, two fsyncs, and a rename against an SD
-        // card -- work that must never run inside the frame budget. The
-        // worker thread performs the actual write.
-        runtime_.markBrightnessDirty();
-        std::string payload = runtime_.encodeFullState();
-        if (payload.empty()) return;
-        PluginManager::INSTANCE.multiSyncData(showmesh::kPluginName,
-                                              reinterpret_cast<uint8_t*>(&payload[0]),
-                                              static_cast<int>(payload.size()));
-    }
-
     showmesh::adapter::FppDefinitionSource definitions_;
     // Declared before runtime_ so it is constructed first: member
     // initialization follows declaration order regardless of the
@@ -378,7 +355,6 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
     int safeCeilingPercent_;
     showmesh::ShowMeshRuntime runtime_;
     Command* command_ = nullptr;
-    std::uint64_t publishedRevision_ = 0;
     // shutdown()'s background quiesce thread and its readiness flag. See
     // shutdown() and the destructor.
     std::thread quiesceThread_;

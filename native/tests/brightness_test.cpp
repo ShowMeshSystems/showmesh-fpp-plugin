@@ -1297,3 +1297,89 @@ TEST(AnExclusionOverlappingAnApplyRangeProtectsOnlyTheOverlap) {
     CHECK_EQ(static_cast<int>(data[599]), 200);   // channel 600, excluded inside the apply range
     CHECK_EQ(static_cast<int>(data[1024]), 200);  // outside every apply range
 }
+
+TEST(SetCeilingStampsCeilingChangedAtWithTheOrderingTime) {
+    BrightnessEngine engine;
+    CHECK_EQ(engine.ceilingChangedAtMillis(), static_cast<TimeMillis>(0));
+    CHECK(engine.setCeiling(40, 0, kT0).ok);
+    CHECK_EQ(engine.ceilingChangedAtMillis(), kT0);
+    // Same millisecond: the ordering time moves past the previous one, and the stamp follows it.
+    CHECK(engine.setCeiling(30, 0, kT0).ok);
+    CHECK_EQ(engine.ceilingChangedAtMillis(), kT0 + 1);
+    CHECK_EQ(engine.ceilingChangedAtMillis(), engine.captureState(kT0).stateChangedAtMillis);
+    // Gain and the weather gate are not the ceiling.
+    CHECK(engine.setGain(50, 0, kT0 + 5000).ok);
+    engine.setWeatherGate(true, 1, kT0 + 6000);
+    CHECK_EQ(engine.ceilingChangedAtMillis(), kT0 + 1);
+}
+
+TEST(AdoptionStampsCeilingChangedAtOnlyWhenTheCeilingChanges) {
+    BrightnessEngine peer;
+    peer.setInstanceId("node-peer");
+    BrightnessEngine engine;
+    engine.setInstanceId("node-self");
+
+    // A peer that changed only its gain leaves the ceiling where this node has it.
+    CHECK(peer.setGain(70, 0, kT0).ok);
+    CHECK(engine.adoptState(peer.captureState(kT0), kT0) == StateAdoption::kAdopted);
+    CHECK_EQ(engine.ceilingChangedAtMillis(), static_cast<TimeMillis>(0));
+
+    CHECK(peer.setCeiling(40, 0, kT0 + 1000).ok);
+    BrightnessState published = peer.captureState(kT0 + 1000);
+    // The adopted state's ordering time, not the peer's own stamp field.
+    published.ceilingChangedAtMillis = 0;
+    CHECK(engine.adoptState(published, kT0 + 1000) == StateAdoption::kAdopted);
+    CHECK_EQ(engine.ceilingChangedAtMillis(), published.stateChangedAtMillis);
+
+    CHECK(peer.setGain(20, 0, kT0 + 2000).ok);
+    CHECK(engine.adoptState(peer.captureState(kT0 + 2000), kT0 + 2000) == StateAdoption::kAdopted);
+    CHECK_EQ(engine.ceilingChangedAtMillis(), published.stateChangedAtMillis);
+
+    // Same target, new fade window: a change.
+    CHECK(peer.setCeiling(40, 30, kT0 + 3000).ok);
+    const BrightnessState fading = peer.captureState(kT0 + 3000);
+    CHECK(engine.adoptState(fading, kT0 + 3000) == StateAdoption::kAdopted);
+    CHECK_EQ(engine.ceilingChangedAtMillis(), fading.stateChangedAtMillis);
+}
+
+TEST(SettleAndRestoreLeaveCeilingChangedAtAlone) {
+    BrightnessEngine fresh;
+    fresh.settleSafeAfterUntrustedRestart(25, kT0);
+    CHECK_EQ(fresh.ceilingChangedAtMillis(), static_cast<TimeMillis>(0));
+
+    BrightnessEngine before;
+    CHECK(before.setCeiling(60, 0, kT0).ok);
+    const BrightnessState persisted = before.captureState(kT0 + 1000);
+    CHECK_EQ(persisted.ceilingChangedAtMillis, kT0);
+
+    BrightnessEngine after;
+    CHECK(after.restoreFromPersisted(persisted, kT0 + 50'000) == StateAdoption::kAdopted);
+    CHECK_EQ(after.ceilingChangedAtMillis(), kT0);
+    after.settleSafeAfterUntrustedRestart(25, kT0 + 60'000);
+    CHECK_EQ(after.ceilingChangedAtMillis(), kT0);
+
+    BrightnessState neverSet = persisted;
+    neverSet.ceilingChangedAtMillis = 0;
+    BrightnessEngine restored;
+    CHECK(restored.restoreFromPersisted(neverSet, kT0 + 50'000) == StateAdoption::kAdopted);
+    CHECK_EQ(restored.ceilingChangedAtMillis(), static_cast<TimeMillis>(0));
+}
+
+TEST(TheCodecCarriesCeilingChangedAtAndReadsItsAbsenceAsZero) {
+    BrightnessEngine engine;
+    CHECK(engine.setCeiling(60, 0, kT0).ok);
+    const std::string encoded = showmesh::encodeBrightnessState(engine.captureState(kT0));
+    CHECK(encoded.find("\"ceilingChangedAtMillis\":1800000000000") != std::string::npos);
+    showmesh::BrightnessStateDecode decoded = showmesh::decodeBrightnessState(encoded);
+    CHECK(decoded.ok);
+    CHECK_EQ(decoded.state.ceilingChangedAtMillis, kT0);
+
+    const std::string field = "\"ceilingChangedAtMillis\":1800000000000,";
+    std::string older = encoded;
+    const std::size_t at = older.find(field);
+    CHECK(at != std::string::npos);
+    older.erase(at, field.size());
+    decoded = showmesh::decodeBrightnessState(older);
+    CHECK(decoded.ok);
+    CHECK_EQ(decoded.state.ceilingChangedAtMillis, static_cast<TimeMillis>(0));
+}
