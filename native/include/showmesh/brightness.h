@@ -189,9 +189,9 @@ class BrightnessEngine {
     double ceilingTarget() const { return ceiling_.target(); }
     // When the ceiling fade in progress ends, or 0 when the ceiling is not fading at now.
     TimeMillis ceilingFadeEndMillisAt(TimeMillis now) const { return ceiling_.fadingAt(now) ? ceiling_.endMillis() : 0; }
-    // Stamped by setCeiling and by an adoption that changes the ceiling's
-    // target or fade window. A safe-ceiling settle never changes it, and a
-    // restore only brings back the persisted value. 0 when never set.
+    // Stamped by setCeiling; an adoption takes the sender's own value. A
+    // safe-ceiling settle never changes it, and a restore only brings back
+    // the persisted value. 0 when never set.
     TimeMillis ceilingChangedAtMillis() const { return ceilingChangedAtMillis_; }
     double gainAt(TimeMillis now) const { return gain_.valueAt(now); }
 

@@ -226,8 +226,8 @@ never has it enabled, so it never sends; it still receives and adopts. The
 frame thread neither encodes nor sends. The brightness `GET` also reports
 `ceilingTarget`, `ceilingFadeEndMillis` (0 when the ceiling is not fading) and
 `ceilingChangedAtMillis`: when the ceiling was last deliberately set, by the
-FPP action or by an adopted peer state that changed the ceiling, which carries
-that state's time. A safe-ceiling settle and a restore from the persisted
+FPP action, or the sending peer's own value when its state is adopted. A
+safe-ceiling settle and a restore from the persisted
 record leave it unchanged; it is persisted with the rest of the state and
 reads as 0 from a record or peer that predates it.
 

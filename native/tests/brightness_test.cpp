@@ -1313,33 +1313,40 @@ TEST(SetCeilingStampsCeilingChangedAtWithTheOrderingTime) {
     CHECK_EQ(engine.ceilingChangedAtMillis(), kT0 + 1);
 }
 
-TEST(AdoptionStampsCeilingChangedAtOnlyWhenTheCeilingChanges) {
+TEST(AdoptionTakesTheSendersCeilingChangedAt) {
     BrightnessEngine peer;
     peer.setInstanceId("node-peer");
     BrightnessEngine engine;
     engine.setInstanceId("node-self");
 
-    // A peer that changed only its gain leaves the ceiling where this node has it.
-    CHECK(peer.setGain(70, 0, kT0).ok);
+    CHECK(peer.setCeiling(40, 0, kT0).ok);
     CHECK(engine.adoptState(peer.captureState(kT0), kT0) == StateAdoption::kAdopted);
-    CHECK_EQ(engine.ceilingChangedAtMillis(), static_cast<TimeMillis>(0));
+    CHECK_EQ(engine.ceilingChangedAtMillis(), kT0);
 
-    CHECK(peer.setCeiling(40, 0, kT0 + 1000).ok);
-    BrightnessState published = peer.captureState(kT0 + 1000);
-    // The adopted state's ordering time, not the peer's own stamp field.
-    published.ceilingChangedAtMillis = 0;
-    CHECK(engine.adoptState(published, kT0 + 1000) == StateAdoption::kAdopted);
-    CHECK_EQ(engine.ceilingChangedAtMillis(), published.stateChangedAtMillis);
-
+    // A later gain change on the peer carries the same ceiling stamp.
     CHECK(peer.setGain(20, 0, kT0 + 2000).ok);
     CHECK(engine.adoptState(peer.captureState(kT0 + 2000), kT0 + 2000) == StateAdoption::kAdopted);
-    CHECK_EQ(engine.ceilingChangedAtMillis(), published.stateChangedAtMillis);
+    CHECK_EQ(engine.ceilingChangedAtMillis(), kT0);
 
-    // Same target, new fade window: a change.
-    CHECK(peer.setCeiling(40, 30, kT0 + 3000).ok);
-    const BrightnessState fading = peer.captureState(kT0 + 3000);
-    CHECK(engine.adoptState(fading, kT0 + 3000) == StateAdoption::kAdopted);
-    CHECK_EQ(engine.ceilingChangedAtMillis(), fading.stateChangedAtMillis);
+    // A payload from before the field existed reads as never set.
+    CHECK(peer.setCeiling(30, 0, kT0 + 3000).ok);
+    BrightnessState old = peer.captureState(kT0 + 3000);
+    old.ceilingChangedAtMillis = 0;
+    CHECK(engine.adoptState(old, kT0 + 3000) == StateAdoption::kAdopted);
+    CHECK_EQ(engine.ceilingChangedAtMillis(), static_cast<TimeMillis>(0));
+}
+
+TEST(AdoptingAPeersSafeSettleIsNotADeliberateChange) {
+    BrightnessEngine restarted;
+    restarted.setInstanceId("node-player");
+    CHECK(restarted.setCeiling(80, 0, kT0).ok);
+    restarted.settleSafeAfterUntrustedRestart(25, kT0 + 60000);
+
+    BrightnessEngine remote;
+    remote.setInstanceId("node-remote");
+    CHECK(remote.adoptState(restarted.captureState(kT0 + 60000), kT0 + 60000) == StateAdoption::kAdopted);
+    CHECK_EQ(static_cast<int>(remote.ceilingTarget()), 25);
+    CHECK_EQ(remote.ceilingChangedAtMillis(), kT0);
 }
 
 TEST(SettleAndRestoreLeaveCeilingChangedAtAlone) {

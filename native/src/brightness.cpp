@@ -322,10 +322,8 @@ StateAdoption BrightnessEngine::adoptState(const BrightnessState& state, TimeMil
     if (!newer) {
         return StateAdoption::kRejectedStaleRevision;
     }
-    const bool ceilingChanged = clampPercent(state.ceilingTarget) != ceiling_.target() ||
-                                state.ceilingFadeStartMillis != ceiling_.startMillis() ||
-                                state.ceilingFadeEndMillis != ceiling_.endMillis();
-    if (ceilingChanged) ceilingChangedAtMillis_ = state.stateChangedAtMillis;
+    // The sender's own stamp, so a peer's safe-ceiling settle never reads as a deliberate change here.
+    ceilingChangedAtMillis_ = timestampIsPlausible(state.ceilingChangedAtMillis) ? state.ceilingChangedAtMillis : 0;
     ceiling_.restore(clampPercent(state.ceilingStart), clampPercent(state.ceilingTarget), state.ceilingFadeStartMillis,
                      state.ceilingFadeEndMillis);
     gain_.restore(clampPercent(state.gainStart), clampPercent(state.gainTarget), state.gainFadeStartMillis,
