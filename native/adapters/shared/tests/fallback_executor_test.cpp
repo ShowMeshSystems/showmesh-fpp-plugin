@@ -422,6 +422,7 @@ class Bench {
         options.detector = detectorConfig;
         options.randomBytes = fixtureRandom;
         options.notifier = &notifier;
+        options.commandTargets = commandTargets;
         options.log = [this](bool, const std::string& line) {
             std::lock_guard<std::mutex> lock(recordMutex);
             logs.push_back(line);
@@ -484,6 +485,7 @@ class Bench {
 
     PinnedKeyLoadResult pinnedKey = fixturePinnedKey();
     bool watchTrustDir = false;
+    showmesh::CommandTargetLists* commandTargets = nullptr;
     OutageDetectorConfig detectorConfig;
     FakeNetwork network;
     RecordingNotifier notifier;
@@ -3269,4 +3271,23 @@ TEST(BothShippingAdaptersConstructTheDeliveryAndHandItsRecorderToTheRuntime) {
     CHECK(delivery.find("Player::INSTANCE") == std::string::npos);
     CHECK(delivery.find("showmesh::fallback::FallbackExecutor executor_;") != std::string::npos);
     CHECK(delivery.find("recorder() { return &executor_; }") != std::string::npos);
+}
+
+TEST(TheCommandTargetListsAreFetchedOnlyAfterAProgramFetchThatReachedTheCoordinator) {
+    Bench bench;
+    showmesh::CommandTargetLists lists(bench.stateDir() + "/command-targets.json");
+    bench.commandTargets = &lists;
+    bench.makeExecutor();
+    bench.network.programEnvelope = getEnvelope(fixture("program.json"));
+    const std::string macroRoute = "/api/v1/config/show.macro";
+    bench.tick();
+    CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(1));
+    CHECK_EQ(bench.network.count("GET", macroRoute), static_cast<std::size_t>(1));
+
+    bench.network.programFetchUnreachable = true;
+    for (TimeMillis waited = 0; waited < kProgramRefetchIntervalMillis; waited += kHypothesisProbeIntervalMillis) {
+        bench.advanceAndTick(kHypothesisProbeIntervalMillis);
+    }
+    CHECK_EQ(bench.network.count("GET", kProgramRoute), static_cast<std::size_t>(2));
+    CHECK_EQ(bench.network.count("GET", macroRoute), static_cast<std::size_t>(1));
 }

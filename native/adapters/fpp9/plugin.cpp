@@ -35,6 +35,7 @@
 #include "showmesh/excluded_ranges.h"
 #include "showmesh/transition_gain.h"
 #include "showmesh/brightness_query.h"
+#include "showmesh/command_targets.h"
 #include "showmesh/weather_gate.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
@@ -208,6 +209,8 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         ws->register_resource(showmesh::kChannelRangesPath, &channelRangesResource_, false);
         ws->register_resource(showmesh::kDefinitionRepublishPath, &republishResource_, false);
         ws->register_resource(showmesh::kBrightnessQueryPath, &brightnessQueryResource_, false);
+        ws->register_resource(showmesh::kCommandTargetMacrosPath, &macrosResource_, false);
+        ws->register_resource(showmesh::kCommandTargetActionsPath, &actionsResource_, false);
     }
 
     // FPP 9 has no runtime unload endpoint, so this runs only on the
@@ -222,6 +225,8 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         ws->unregister_resource(showmesh::kChannelRangesPath);
         ws->unregister_resource(showmesh::kDefinitionRepublishPath);
         ws->unregister_resource(showmesh::kBrightnessQueryPath);
+        ws->unregister_resource(showmesh::kCommandTargetMacrosPath);
+        ws->unregister_resource(showmesh::kCommandTargetActionsPath);
     }
 
  private:
@@ -347,6 +352,25 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
         showmesh::ShowMeshRuntime* runtime_;
     };
 
+    // The macro and action lists for FPP's command editor, served from memory.
+    class CommandTargetsResource : public httpserver::http_resource {
+     public:
+        CommandTargetsResource(const showmesh::CommandTargetLists* lists, bool macros)
+            : lists_(lists), macros_(macros) {
+            disallow_all();
+            set_allowing("GET", true);
+        }
+
+        std::shared_ptr<httpserver::http_response> render_GET(const httpserver::http_request&) override {
+            return std::shared_ptr<httpserver::http_response>(new httpserver::string_response(
+                macros_ ? lists_->macrosBody() : lists_->actionsBody(), 200, "application/json"));
+        }
+
+     private:
+        const showmesh::CommandTargetLists* lists_;
+        bool macros_;
+    };
+
     showmesh::adapter::FppDefinitionSource definitions_;
     // Declared before runtime_ so it is constructed first: member
     // initialization follows declaration order regardless of the
@@ -382,6 +406,8 @@ class ShowMeshFpp9Plugin : public FPPPlugin {
     RangesResource channelRangesResource_{&runtime_, false};
     DefinitionRepublishResource republishResource_{&runtime_};
     BrightnessQueryResource brightnessQueryResource_{&runtime_};
+    CommandTargetsResource macrosResource_{&fallbackDelivery_.commandTargets(), true};
+    CommandTargetsResource actionsResource_{&fallbackDelivery_.commandTargets(), false};
     Command* command_ = nullptr;
 };
 

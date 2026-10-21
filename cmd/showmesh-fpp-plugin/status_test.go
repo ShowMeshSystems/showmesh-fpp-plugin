@@ -52,8 +52,8 @@ func TestCmdStatusNoRecordYet(t *testing.T) {
 	if code != exitOK {
 		t.Errorf("exit code = %d, want %d (no record yet is not an error)", code, exitOK)
 	}
-	if !strings.Contains(stdout.String(), "no run has been attempted") {
-		t.Errorf("stdout = %q, want it to say no run has been attempted", stdout.String())
+	if !strings.Contains(stdout.String(), "no run or action has been attempted") {
+		t.Errorf("stdout = %q, want it to say no run or action has been attempted", stdout.String())
 	}
 }
 
