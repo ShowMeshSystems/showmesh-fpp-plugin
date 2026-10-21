@@ -12,6 +12,8 @@
 #include "fallback_pinned_key_loader.h"
 #include "fallback_program_installer.h"
 #include "settings.h"
+#include "showmesh/atomic_write.h"
+#include "showmesh/command_targets.h"
 #include "showmesh/coordinator_config.h"
 #include "showmesh/runtime.h"
 #include "showmesh/sequence_store.h"
@@ -69,19 +71,24 @@ class FallbackActivationDelivery {
     FallbackActivationDelivery(showmesh::Clock clock, std::string fppInstanceUuid,
                                std::string credentialDir = showmesh::resolveCredentialDir(),
                                std::string trustDir = showmesh::resolveTrustDir())
-        : executor_(makeOptions(clock, std::move(fppInstanceUuid), std::move(credentialDir), std::move(trustDir),
-                                &notifier_),
+        : commandTargets_(showmesh::joinPath(showmesh::resolveSequenceStateDir(), showmesh::kCommandTargetsFilename)),
+          executor_(makeOptions(clock, std::move(fppInstanceUuid), std::move(credentialDir), std::move(trustDir),
+                                &notifier_, &commandTargets_),
                     &transport_) {}
 
     // What ShowMeshRuntime drives: every drained playlist callback, and the
     // start and stop of the executor's own background thread.
     showmesh::FallbackActivationRecorder* recorder() { return &executor_; }
 
+    // What the macro and action routes serve. Reads memory only.
+    const showmesh::CommandTargetLists& commandTargets() const { return commandTargets_; }
+
  private:
     static showmesh::fallback::FallbackExecutorOptions makeOptions(showmesh::Clock clock, std::string fppInstanceUuid,
                                                                     std::string credentialDir,
                                                                     std::string trustDir,
-                                                                    showmesh::fallback::FallbackStateNotifier* notifier) {
+                                                                    showmesh::fallback::FallbackStateNotifier* notifier,
+                                                                    showmesh::CommandTargetLists* commandTargets) {
         showmesh::fallback::FallbackExecutorOptions options;
         options.clock = clock;
         options.fppInstanceUuid = std::move(fppInstanceUuid);
@@ -92,6 +99,7 @@ class FallbackActivationDelivery {
         options.installPath = showmesh::fallback::DefaultFallbackProgramPath();
         options.detector = resolveOutageDetectorConfig();
         options.notifier = notifier;
+        options.commandTargets = commandTargets;
         options.log = [](bool isError, const std::string& line) {
             if (isError) {
                 LogErr(VB_PLUGIN, "%s%s\n", kFallbackActivationLogPrefix, line.c_str());
@@ -102,9 +110,10 @@ class FallbackActivationDelivery {
         return options;
     }
 
-    // Declared before executor_, which holds pointers to both from construction.
+    // Declared before executor_, which holds pointers to all three from construction.
     CurlHttpTransport transport_;
     WarningHolderFallbackStateNotifier notifier_;
+    showmesh::CommandTargetLists commandTargets_;
     showmesh::fallback::FallbackExecutor executor_;
 };
 

@@ -30,6 +30,7 @@
 #include "safe_ceiling.h"
 #include "section_names.h"
 #include "showmesh/brightness_query.h"
+#include "showmesh/command_targets.h"
 #include "showmesh/brightness_store.h"
 #include "showmesh/runtime.h"
 #include "showmesh/definition_republish.h"
@@ -253,6 +254,19 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
                 callback(makeStringResponse(result.body, result.status, "application/json"));
             },
             { drogon::Get });
+        // The macro and action lists for FPP's command editor, served from memory.
+        FPPPlugins::registerPluginApi(
+            showmesh::kCommandTargetMacrosPath,
+            [this](const HttpRequestPtr&, HttpCallback&& callback) {
+                callback(makeStringResponse(fallbackDelivery_.commandTargets().macrosBody(), 200, "application/json"));
+            },
+            { drogon::Get });
+        FPPPlugins::registerPluginApi(
+            showmesh::kCommandTargetActionsPath,
+            [this](const HttpRequestPtr&, HttpCallback&& callback) {
+                callback(makeStringResponse(fallbackDelivery_.commandTargets().actionsBody(), 200, "application/json"));
+            },
+            { drogon::Get });
     }
 
     // FPP calls this before shutdown() on both teardown paths
@@ -272,6 +286,8 @@ class ShowMeshFpp10Plugin : public FPPPlugin {
         FPPPlugins::unregisterPluginApi(showmesh::kChannelRangesPath);
         FPPPlugins::unregisterPluginApi(showmesh::kDefinitionRepublishPath);
         FPPPlugins::unregisterPluginApi(showmesh::kBrightnessQueryPath);
+        FPPPlugins::unregisterPluginApi(showmesh::kCommandTargetMacrosPath);
+        FPPPlugins::unregisterPluginApi(showmesh::kCommandTargetActionsPath);
     }
 
     void playlistCallback(const Json::Value& playlist, const std::string& action, const std::string& section,
