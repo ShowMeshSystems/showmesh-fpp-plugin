@@ -99,9 +99,10 @@ Commands:
   night <command> send a night lifecycle command (prepare-site,
                   run-readiness, start-preshow, start-night,
                   request-final-show, fade-out-night,
-                  power-down-presentation) and record the outcome
-                  locally in night-status.json; prepare-site takes
-                  --stop-playlists to also stop what FPP is playing
+                  power-down-presentation, end-session) and record the
+                  outcome locally in night-status.json; prepare-site takes
+                  --stop-playlists to also stop what FPP is playing;
+                  power-down-presentation takes --force
   status          print the local record of the most recent run or
                   action attempt
   version         show this binary's version

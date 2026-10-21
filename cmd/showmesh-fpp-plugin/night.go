@@ -13,9 +13,8 @@ import (
 	"time"
 )
 
-// nightCommands are the lifecycle commands an FPP schedule may invoke.
-// Operator recovery commands (end-session, resume-show) are deliberately
-// absent: they are not calendar intents and stay with the operator.
+// nightCommands are the commands FPP may send. end-session lets a schedule abandon a stuck
+// night; resume-show stays with the operator.
 var nightCommands = []string{
 	"prepare-site",
 	"run-readiness",
@@ -24,6 +23,7 @@ var nightCommands = []string{
 	"request-final-show",
 	"fade-out-night",
 	"power-down-presentation",
+	"end-session",
 }
 
 func isNightCommand(name string) bool {
@@ -82,11 +82,13 @@ func writeNightStatus(configDir string, rec nightStatusRecord) error {
 	return writeJSONFile(nightStatusPath(configDir), rec)
 }
 
-// nightRequestBody is the empty object, or {"stopFppPlayback":true} when
-// stopPlaylists is set. Only prepare-site is ever sent the latter.
-func nightRequestBody(stopPlaylists bool) []byte {
+// nightRequestBody is {}, {"stopFppPlayback":true}, or {"force":true}.
+func nightRequestBody(stopPlaylists, force bool) []byte {
 	if stopPlaylists {
 		return []byte(`{"stopFppPlayback":true}`)
+	}
+	if force {
+		return []byte(`{"force":true}`)
 	}
 	return []byte("{}")
 }
@@ -94,11 +96,11 @@ func nightRequestBody(stopPlaylists bool) []byte {
 // submitNightCommand POSTs a request body (see nightRequestBody) to
 // <coordinatorURL>/api/v1/night/commands/<command> and classifies the outcome.
 // A 2xx is trusted only when the body names the command that was sent.
-func submitNightCommand(ctx context.Context, httpClient *http.Client, coordinatorURL *url.URL, token, command string, stopPlaylists bool) nightSubmitResult {
+func submitNightCommand(ctx context.Context, httpClient *http.Client, coordinatorURL *url.URL, token, command string, stopPlaylists, force bool) nightSubmitResult {
 	u := *coordinatorURL
 	u.Path = strings.TrimRight(u.Path, "/") + "/api/v1/night/commands/" + command
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(nightRequestBody(stopPlaylists)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(nightRequestBody(stopPlaylists, force)))
 	if err != nil {
 		return nightSubmitResult{Class: classUnreachable, TransportErr: fmt.Errorf("building request: %w", err)}
 	}
@@ -147,10 +149,11 @@ func cmdNight(args []string, stdout, stderr io.Writer, clock func() time.Time) i
 	fs.SetOutput(stderr)
 	var configDirFlag string
 	var timeout time.Duration
-	var stopPlaylists bool
+	var stopPlaylists, force bool
 	fs.StringVar(&configDirFlag, "config-dir", "", "override this plugin's state directory; never the credential")
 	fs.DurationVar(&timeout, "timeout", defaultRunTimeout, "request timeout for the night command")
 	fs.BoolVar(&stopPlaylists, "stop-playlists", false, "prepare-site only: also stop whatever FPP is playing; from inside a playlist this stops that playlist too")
+	fs.BoolVar(&force, "force", false, "power-down-presentation only: power down now without waiting for the show, the fade, or FPP to confirm the stop")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "usage: showmesh-fpp-plugin night <command> [flags]")
 		_, _ = fmt.Fprintf(stderr, "\nSend one night lifecycle command to the coordinator and record the outcome locally.\nCommands: %s\n", strings.Join(nightCommands, ", "))
@@ -176,6 +179,10 @@ func cmdNight(args []string, stdout, stderr io.Writer, clock func() time.Time) i
 		_, _ = fmt.Fprintf(stderr, "showmesh-fpp-plugin night: --stop-playlists applies only to prepare-site, not %s.\n", command)
 		return exitUsage
 	}
+	if force && command != "power-down-presentation" {
+		_, _ = fmt.Fprintf(stderr, "showmesh-fpp-plugin night: --force applies only to power-down-presentation, not %s.\n", command)
+		return exitUsage
+	}
 	configDir := resolveConfigDir(configDirFlag)
 	now := clock()
 
@@ -193,7 +200,7 @@ func cmdNight(args []string, stdout, stderr io.Writer, clock func() time.Time) i
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	result := submitNightCommand(ctx, newNonRedirectingHTTPClient(timeout), coordinatorURL, token, command, stopPlaylists)
+	result := submitNightCommand(ctx, newNonRedirectingHTTPClient(timeout), coordinatorURL, token, command, stopPlaylists, force)
 	return reportNightResult(stdout, stderr, configDir, command, now, result)
 }
 

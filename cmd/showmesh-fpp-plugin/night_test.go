@@ -154,7 +154,7 @@ func TestCmdNightUnconfirmedBodyIsNotAccepted(t *testing.T) {
 }
 
 func TestCmdNightRejectsCommandsOutsideTheSchedule(t *testing.T) {
-	for _, args := range [][]string{{"night"}, {"night", "end-session"}, {"night", "resume-show"}, {"night", "start-night", "extra"}, {"night", "start-night", "extra", "--stop-playlists"}} {
+	for _, args := range [][]string{{"night"}, {"night", "resume-show"}, {"night", "start-night", "extra"}, {"night", "start-night", "extra", "--stop-playlists"}} {
 		var stdout, stderr bytes.Buffer
 		if code := run(args, &stdout, &stderr, time.Now); code != exitUsage {
 			t.Fatalf("%v: exit %d", args, code)
@@ -203,6 +203,36 @@ func TestCmdNightStopPlaylistsIsRefusedOnEveryOtherCommand(t *testing.T) {
 				t.Fatalf("%v: exit %d body %q stderr %q, want a usage refusal and no request", args, code, body, stderr)
 			}
 		}
+	}
+}
+
+func TestCmdNightPowerDownPresentationForceCarriesTheFlag(t *testing.T) {
+	for _, args := range [][]string{{"--force", "power-down-presentation"}, {"power-down-presentation", "--force"}} {
+		body, code, stderr := nightRequestBodyFor(t, args...)
+		if code != exitOK || body != `{"force":true}` {
+			t.Fatalf("%v: exit %d body %q stderr %q", args, code, body, stderr)
+		}
+	}
+}
+
+func TestCmdNightForceIsRefusedOnEveryOtherCommand(t *testing.T) {
+	for _, command := range nightCommands {
+		if command == "power-down-presentation" {
+			continue
+		}
+		for _, args := range [][]string{{"--force", command}, {command, "--force"}} {
+			body, code, stderr := nightRequestBodyFor(t, args...)
+			if code != exitUsage || body != "" || !strings.Contains(stderr, "applies only to power-down-presentation") {
+				t.Fatalf("%v: exit %d body %q stderr %q, want a usage refusal and no request", args, code, body, stderr)
+			}
+		}
+	}
+}
+
+func TestCmdNightEndSessionIsAccepted(t *testing.T) {
+	body, code, stderr := nightRequestBodyFor(t, "end-session")
+	if code != exitOK || body != "{}" {
+		t.Fatalf("exit %d body %q stderr %q, want exit 0 and the body {}", code, body, stderr)
 	}
 }
 
