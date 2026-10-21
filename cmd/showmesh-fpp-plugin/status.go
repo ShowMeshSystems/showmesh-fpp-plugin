@@ -48,6 +48,8 @@ type statusRecord struct {
 	// distinct value, not an omission standing in for "unknown".
 	HTTPStatus int    `json:"httpStatus"`
 	RunID      string `json:"runId,omitempty"`
+	// Outcome is an action's outcome when the coordinator answered: confirmed, failed, refused, unconfirmed, unconfirmable or pending.
+	Outcome string `json:"outcome,omitempty"`
 	// Message is the operator-facing summary: what class this attempt
 	// fell into and why, in the operator's own terms, never a repo path,
 	// doc reference, ADR number, or research-record id. See
@@ -90,7 +92,7 @@ func cmdStatus(args []string, stdout, stderr io.Writer, _ func() time.Time) int 
 	fs.StringVar(&output, "output", outputText, "output format: text|json")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "usage: showmesh-fpp-plugin status [flags]")
-		_, _ = fmt.Fprintln(stderr, "\nPrint the local record of this plugin's most recent macro run attempt.")
+		_, _ = fmt.Fprintln(stderr, "\nPrint the local record of this plugin's most recent macro run or action attempt.")
 		_, _ = fmt.Fprintln(stderr, "Reads only this host's own filesystem; makes no network call.")
 		fs.PrintDefaults()
 	}
@@ -112,7 +114,7 @@ func cmdStatus(args []string, stdout, stderr io.Writer, _ func() time.Time) int 
 		if output == outputJSON {
 			_, _ = fmt.Fprintln(stdout, `{"recorded":false}`)
 		} else {
-			_, _ = fmt.Fprintln(stdout, "no run has been attempted yet; no status record exists")
+			_, _ = fmt.Fprintln(stdout, "no run or action has been attempted yet; no status record exists")
 		}
 		return exitOK
 	}
@@ -137,6 +139,9 @@ func cmdStatus(args []string, stdout, stderr io.Writer, _ func() time.Time) int 
 	}
 	if rec.RunID != "" {
 		_, _ = fmt.Fprintf(stdout, "run id:  %s\n", rec.RunID)
+	}
+	if rec.Outcome != "" {
+		_, _ = fmt.Fprintf(stdout, "outcome: %s\n", rec.Outcome)
 	}
 	_, _ = fmt.Fprintf(stdout, "detail:  %s\n", rec.Message)
 	if rec.CredentialDirNote != "" {

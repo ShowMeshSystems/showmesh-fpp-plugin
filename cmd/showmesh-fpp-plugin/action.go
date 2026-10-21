@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// actionInvocationRequest is the whole body of POST /api/v1/actions/{id}/invocations; the server refuses any other key.
+// actionInvocationRequest is the body of POST /api/v1/actions/{id}/invocations; this program never pins requestedRevision.
 type actionInvocationRequest struct {
 	IdempotencyKey string `json:"idempotencyKey"`
 }
@@ -22,7 +22,7 @@ type actionInvocationRequest struct {
 type actionInvocationResult struct {
 	ID            string  `json:"id"`
 	ActionID      string  `json:"actionId"`
-	Revision      int     `json:"revision"`
+	Revision      int64   `json:"revision"`
 	Replay        bool    `json:"replay"`
 	State         string  `json:"state"`
 	Outcome       *string `json:"outcome"`
@@ -33,6 +33,9 @@ type actionInvocationResult struct {
 type actionInvocationResponse struct {
 	Result actionInvocationResult `json:"result"`
 }
+
+// defaultActionTimeout outlasts the coordinator's 150 s invocation deadline, since it answers only once the action resolves.
+const defaultActionTimeout = 170 * time.Second
 
 // actionResult is one invocation attempt, classified like submitResult.
 type actionResult struct {
@@ -110,7 +113,7 @@ func cmdAction(args []string, stdout, stderr io.Writer, clock func() time.Time) 
 	var configDirFlag string
 	var timeout time.Duration
 	fs.StringVar(&configDirFlag, "config-dir", "", "override this plugin's state directory (config.json, status.json); never the credential")
-	fs.DurationVar(&timeout, "timeout", defaultRunTimeout, "request timeout for the invocation")
+	fs.DurationVar(&timeout, "timeout", defaultActionTimeout, "request timeout for the invocation")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "usage: showmesh-fpp-plugin action [flags] [--] <actionId>")
 		_, _ = fmt.Fprintln(stderr, "\nInvoke one stored action on this plugin's configured coordinator, and record")
@@ -152,23 +155,19 @@ func cmdAction(args []string, stdout, stderr io.Writer, clock func() time.Time) 
 	result := submitActionInvocation(ctx, newNonRedirectingHTTPClient(timeout), coordinatorURL, token, actionID, key)
 
 	rec := statusRecord{Timestamp: now, ActionID: actionID, Class: result.Class, HTTPStatus: result.HTTPStatus, CredentialDirNote: credentialDirNote}
-	code := exitOK
+	var code int
 	switch result.Class {
 	case classOK:
-		inv := result.Invocation
-		rec.Message = fmt.Sprintf("action %q accepted as invocation %s (revision %d), %s", actionID, inv.ID, inv.Revision, actionOutcomeText(inv))
-		if inv.Replay {
-			rec.Message += "; this idempotency key was already used, so the ORIGINAL invocation was returned rather than a new one"
-		}
+		rec.Outcome, rec.Message, code = actionOutcomeReport(actionID, result.Invocation)
 	case classRefused:
 		code = exitRefused
-		rec.Message = fmt.Sprintf("action %q: the coordinator answered and refused this caller (%s)", actionID, problemDetailText(result.asSubmitResult()))
+		rec.Message = fmt.Sprintf("The coordinator refused this plugin's credential for action %q (%s). Check the credential installed for this plugin.", actionID, problemDetailText(result.asSubmitResult()))
 	case classRejected:
 		code = exitRejected
-		rec.Message = fmt.Sprintf("action %q: the coordinator answered and declined the request itself (%s); this is NOT a credential problem", actionID, problemDetailText(result.asSubmitResult()))
+		rec.Message = fmt.Sprintf("The coordinator declined action %q: %s", actionID, problemDetailText(result.asSubmitResult()))
 	default:
 		code = exitUnreachable
-		rec.Message = fmt.Sprintf("action %q: the coordinator could not be reached, or answered with a server error (%s)", actionID, problemDetailText(result.asSubmitResult()))
+		rec.Message = fmt.Sprintf("The coordinator could not be reached for action %q (%s). The action may still have run, so check the ShowMesh UI before running it again.", actionID, problemDetailText(result.asSubmitResult()))
 	}
 	if err := writeStatus(configDir, rec); err != nil {
 		_, _ = fmt.Fprintf(stderr, "showmesh-fpp-plugin action: also failed to write the local status record: %v\n", err)
@@ -181,11 +180,35 @@ func cmdAction(args []string, stdout, stderr io.Writer, clock func() time.Time) 
 	return code
 }
 
-func actionOutcomeText(inv *actionInvocationResult) string {
-	if inv.Outcome == nil {
-		return "outcome pending: " + inv.OutcomeReason
+// actionOutcomeReport turns a 200's outcome into the recorded outcome, the operator message and the exit code.
+func actionOutcomeReport(actionID string, inv *actionInvocationResult) (string, string, int) {
+	outcome := "pending"
+	if inv.Outcome != nil {
+		outcome = *inv.Outcome
 	}
-	return "outcome " + *inv.Outcome + ": " + inv.OutcomeReason
+	var msg string
+	code := exitActionUnconfirmed
+	switch outcome {
+	case "confirmed":
+		msg, code = fmt.Sprintf("Action %q ran and was confirmed.", actionID), exitOK
+	case "failed":
+		msg, code = fmt.Sprintf("Action %q failed.", actionID), exitActionFailed
+	case "refused":
+		msg, code = fmt.Sprintf("ShowMesh refused to run action %q.", actionID), exitActionRefused
+	case "unconfirmable":
+		msg, code = fmt.Sprintf("Action %q was sent, but ShowMesh cannot confirm that it took effect.", actionID), exitActionUnconfirmable
+	case "pending":
+		msg = fmt.Sprintf("Action %q was sent and is not confirmed yet. Check its result in the ShowMesh UI.", actionID)
+	default:
+		msg = fmt.Sprintf("Action %q was sent but not confirmed. Check its result in the ShowMesh UI.", actionID)
+	}
+	if inv.OutcomeReason != "" {
+		msg += " " + inv.OutcomeReason
+	}
+	if inv.Replay {
+		msg += " This answer is for an earlier identical request, so the action did not run again."
+	}
+	return outcome, msg, code
 }
 
 // reportActionLocalError records an attempt that never reached the coordinator.

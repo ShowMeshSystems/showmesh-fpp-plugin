@@ -34,6 +34,12 @@ const (
 	exitRefused     = 3
 	exitRejected    = 4
 	exitUnreachable = 5
+	// The action exit codes report an outcome other than confirmed, from a
+	// coordinator that answered 200; "pending" and "unconfirmed" share one.
+	exitActionUnconfirmed   = 6
+	exitActionUnconfirmable = 7
+	exitActionRefused       = 8
+	exitActionFailed        = 9
 )
 
 const (
@@ -87,15 +93,17 @@ Usage:
 
 Commands:
   run <macroId>   submit a macro run and record the outcome locally
-  action <actionId> invoke one stored action and record the outcome
-                  locally
+  action <actionId>
+                  invoke one stored action, wait for its outcome, and
+                  record it locally
   night <command> send a night lifecycle command (prepare-site,
                   run-readiness, start-preshow, start-night,
                   request-final-show, fade-out-night,
                   power-down-presentation) and record the outcome
                   locally in night-status.json; prepare-site takes
                   --stop-playlists to also stop what FPP is playing
-  status          print the local record of the most recent run attempt
+  status          print the local record of the most recent run or
+                  action attempt
   version         show this binary's version
   help            show this help
 

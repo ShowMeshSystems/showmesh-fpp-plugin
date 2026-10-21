@@ -68,8 +68,52 @@ func TestCmdActionOK(t *testing.T) {
 	if st.Class != classOK || st.ActionID != "blackout" || st.MacroID != "" || st.HTTPStatus != 200 {
 		t.Errorf("status = %+v", st)
 	}
-	if !strings.Contains(st.Message, "inv-1") || !strings.Contains(st.Message, "confirmed") {
-		t.Errorf("message = %q", st.Message)
+	if st.Outcome != "confirmed" || !strings.Contains(st.Message, "confirmed") || !strings.Contains(st.Message, "device acknowledged") {
+		t.Errorf("status = %+v", st)
+	}
+}
+
+func TestCmdActionOutcomeSetsExitCode(t *testing.T) {
+	cases := []struct {
+		outcome  any
+		wantExit int
+		wantText string
+	}{
+		{"failed", exitActionFailed, "failed"},
+		{"refused", exitActionRefused, "refused"},
+		{"unconfirmed", exitActionUnconfirmed, "not confirmed"},
+		{"unconfirmable", exitActionUnconfirmable, "cannot confirm"},
+		{nil, exitActionUnconfirmed, "not confirmed yet"},
+	}
+	for _, tc := range cases {
+		body := actionOKBody("inv-1", "blackout")
+		body["result"].(map[string]any)["outcome"] = tc.outcome
+		body["result"].(map[string]any)["outcomeReason"] = "the reason"
+		srv := actionServer(t, (&actionRecorder{}).handler(http.StatusOK, body))
+		dir := setupPlugin(t, srv, "tok")
+
+		var stdout, stderr bytes.Buffer
+		code := cmdAction([]string{"--config-dir", dir, "blackout"}, &stdout, &stderr, time.Now)
+		if code != tc.wantExit {
+			t.Errorf("%v: exit = %d, want %d", tc.outcome, code, tc.wantExit)
+		}
+		st, _, _ := loadStatus(dir)
+		wantOutcome, _ := tc.outcome.(string)
+		if wantOutcome == "" {
+			wantOutcome = "pending"
+		}
+		if st.Class != classOK || st.Outcome != wantOutcome || !strings.Contains(st.Message, tc.wantText) || !strings.Contains(st.Message, "the reason") {
+			t.Errorf("%v: status = %+v", tc.outcome, st)
+		}
+		if !strings.Contains(stderr.String(), tc.wantText) {
+			t.Errorf("%v: stderr = %q", tc.outcome, stderr.String())
+		}
+	}
+}
+
+func TestDefaultActionTimeoutOutlastsTheCoordinator(t *testing.T) {
+	if defaultActionTimeout <= 150*time.Second {
+		t.Fatalf("defaultActionTimeout = %s, must outlast the coordinator's 150 s invocation deadline", defaultActionTimeout)
 	}
 }
 
@@ -96,7 +140,7 @@ func TestCmdActionRefusalAndNotFound(t *testing.T) {
 		if st.Class != tc.wantClass || st.HTTPStatus != tc.status || !strings.Contains(st.Message, "not allowed") {
 			t.Errorf("%d: status = %+v", tc.status, st)
 		}
-		if tc.status == http.StatusNotFound && !strings.Contains(st.Message, "NOT a credential problem") {
+		if tc.status == http.StatusNotFound && !strings.HasPrefix(st.Message, "The coordinator declined action") {
 			t.Errorf("404 message = %q", st.Message)
 		}
 	}
@@ -117,7 +161,7 @@ func TestCmdActionUnreachable(t *testing.T) {
 		t.Fatalf("exit = %d, want %d", code, exitUnreachable)
 	}
 	st, _, _ := loadStatus(dir)
-	if st.Class != classUnreachable || st.HTTPStatus != 0 {
+	if st.Class != classUnreachable || st.HTTPStatus != 0 || !strings.Contains(st.Message, "may still have run") {
 		t.Errorf("status = %+v", st)
 	}
 }
