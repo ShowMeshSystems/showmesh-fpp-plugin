@@ -13,7 +13,8 @@ import (
 	"time"
 )
 
-// nightCommands are the commands FPP may send; resume-show stays with the operator.
+// nightCommands are the commands FPP may send. end-session lets a schedule abandon a stuck
+// night; resume-show stays with the operator.
 var nightCommands = []string{
 	"prepare-site",
 	"run-readiness",
@@ -152,7 +153,7 @@ func cmdNight(args []string, stdout, stderr io.Writer, clock func() time.Time) i
 	fs.StringVar(&configDirFlag, "config-dir", "", "override this plugin's state directory; never the credential")
 	fs.DurationVar(&timeout, "timeout", defaultRunTimeout, "request timeout for the night command")
 	fs.BoolVar(&stopPlaylists, "stop-playlists", false, "prepare-site only: also stop whatever FPP is playing; from inside a playlist this stops that playlist too")
-	fs.BoolVar(&force, "force", false, "power-down-presentation only: power down even if the show is still running")
+	fs.BoolVar(&force, "force", false, "power-down-presentation only: power down now without waiting for the show, the fade, or FPP to confirm the stop")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "usage: showmesh-fpp-plugin night <command> [flags]")
 		_, _ = fmt.Fprintf(stderr, "\nSend one night lifecycle command to the coordinator and record the outcome locally.\nCommands: %s\n", strings.Join(nightCommands, ", "))
