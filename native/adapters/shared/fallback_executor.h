@@ -29,6 +29,7 @@
 #include "fallback_state_report.h"
 #include "fallback_state_store.h"
 #include "showmesh/atomic_write.h"
+#include "showmesh/command_targets.h"
 #include "showmesh/coordinator_config.h"
 #include "showmesh/http_transport.h"
 #include "showmesh/json.h"
@@ -347,6 +348,8 @@ struct FallbackExecutorOptions {
     // Receives one line per event. isError marks what an operator must act on.
     std::function<void(bool isError, const std::string& line)> log;
     FallbackStateNotifier* notifier = nullptr;
+    // Refreshed with each program fetch when set.
+    showmesh::CommandTargetLists* commandTargets = nullptr;
     // Replaces the real wait between delivery attempts. Tests only.
     DeliveryPause pause;
     // Replaces the write of the state file. Tests only.
@@ -932,6 +935,17 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         if (programPublished_ && key.usable() && registeredNow() && !enrolled && now >= nextRegistrationAtMillis_) {
             if (registerKey(baseUrl, key.key, now)) nextFetchAtMillis_ = now;
         }
+        if (!stopRequested_.load()) refreshCommandTargets(baseUrl);
+    }
+
+    void refreshCommandTargets(const std::string& baseUrl) {
+        if (options_.commandTargets == nullptr) return;
+        const std::string problem = options_.commandTargets->refresh(transport_, &credentials_, baseUrl,
+                                                                     [this] { return stopRequested_.load(); });
+        if (problem == lastCommandTargetsProblem_) return;
+        lastCommandTargetsProblem_ = problem;
+        log(false, problem.empty() ? std::string("macro and action lists fetched")
+                                   : "macro and action lists not fetched, the last ones are kept: " + problem);
     }
 
     // Hand-back step 3: fetch at once, acknowledge the copy then held whether
@@ -1529,6 +1543,7 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
     TimeMillis registrationBackoffMillis_ = 0;
     std::string lastRegistrationAnswer_;
     std::string lastFetchOutcomeLine_;
+    std::string lastCommandTargetsProblem_;
     std::string lastAcknowledged_;
     std::optional<OwedAcknowledgement> owedAcknowledgement_;
     std::string tokenHash_;
