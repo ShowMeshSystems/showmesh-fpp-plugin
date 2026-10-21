@@ -62,6 +62,8 @@ func run(args []string, stdout, stderr io.Writer, clock func() time.Time) int {
 		return exitOK
 	case "run":
 		return cmdRun(rest, stdout, stderr, clock)
+	case "action":
+		return cmdAction(rest, stdout, stderr, clock)
 	case "night":
 		return cmdNight(rest, stdout, stderr, clock)
 	case "status":
@@ -85,6 +87,8 @@ Usage:
 
 Commands:
   run <macroId>   submit a macro run and record the outcome locally
+  action <actionId> invoke one stored action and record the outcome
+                  locally
   night <command> send a night lifecycle command (prepare-site,
                   run-readiness, start-preshow, start-night,
                   request-final-show, fade-out-night,

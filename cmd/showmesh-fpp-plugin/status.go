@@ -40,7 +40,9 @@ type statusRecord struct {
 	SchemaVersion int       `json:"schemaVersion"`
 	Timestamp     time.Time `json:"timestamp"`
 	MacroID       string    `json:"macroId"`
-	Class         string    `json:"class"`
+	// ActionID is set instead of MacroID for an "action" attempt.
+	ActionID string `json:"actionId,omitempty"`
+	Class    string `json:"class"`
 	// HTTPStatus is 0 when there was no HTTP response at all (a transport
 	// failure, or a local error that never made a request) — a real,
 	// distinct value, not an omission standing in for "unknown".
@@ -124,7 +126,11 @@ func cmdStatus(args []string, stdout, stderr io.Writer, _ func() time.Time) int 
 	}
 
 	_, _ = fmt.Fprintf(stdout, "time:    %s\n", rec.Timestamp.Format(time.RFC3339))
-	_, _ = fmt.Fprintf(stdout, "macro:   %s\n", rec.MacroID)
+	if rec.ActionID != "" {
+		_, _ = fmt.Fprintf(stdout, "action:  %s\n", rec.ActionID)
+	} else {
+		_, _ = fmt.Fprintf(stdout, "macro:   %s\n", rec.MacroID)
+	}
 	_, _ = fmt.Fprintf(stdout, "class:   %s\n", rec.Class)
 	if rec.HTTPStatus != 0 {
 		_, _ = fmt.Fprintf(stdout, "http:    %d\n", rec.HTTPStatus)
