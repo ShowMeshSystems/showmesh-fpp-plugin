@@ -92,11 +92,14 @@ TEST(TheShowIsOmittedWhenNoShowListWasFetched) {
     CHECK_EQ(renderCommandTargetOptions(&macros, nullptr, "macros"), std::string(R"({"z1":"Beta"})"));
 }
 
-TEST(VisibleTextIsHtmlEscaped) {
-    const std::vector<ConfigObjectSummary> macros = {{"x", "<b>\"Tom\" & 'Jerry'</b>", "spring"}};
+TEST(VisibleTextCannotOpenATagAndIsOtherwiseUnchanged) {
+    const std::vector<ConfigObjectSummary> macros = {{"x", "<b>Tom & 'Jerry'</b>", "spring"}};
     const std::vector<ConfigObjectSummary> shows = {{"spring", "A&B", ""}};
-    CHECK_EQ(renderCommandTargetOptions(&macros, &shows, "macros"),
-             std::string(R"j({"x":"&lt;b&gt;&quot;Tom&quot; &amp; &#39;Jerry&#39;&lt;/b&gt; (A&amp;B)"})j"));
+    const std::string body = renderCommandTargetOptions(&macros, &shows, "macros");
+    CHECK(body.find('<') == std::string::npos);
+    CHECK(body.find("\xE2\x80\xB9" "b>Tom & 'Jerry'\xE2\x80\xB9/b>") != std::string::npos);
+    CHECK(body.find("(A&B)") != std::string::npos);
+    CHECK(body.find("&amp;") == std::string::npos);
 }
 
 TEST(IdsOutsideTheAllowedCharactersAreDropped) {

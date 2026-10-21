@@ -41,17 +41,15 @@ void parseSummaries(const json::Value& items, std::vector<ConfigObjectSummary>* 
     }
 }
 
-std::string htmlEscape(const std::string& text) {
+// FPP before 10.3 inserts the text as raw HTML and 10.3 escapes it, so only '<', which could open a tag, is swapped.
+std::string withoutTagOpeners(const std::string& text) {
     std::string out;
     out.reserve(text.size());
     for (const char c : text) {
-        switch (c) {
-            case '&': out += "&amp;"; break;
-            case '<': out += "&lt;"; break;
-            case '>': out += "&gt;"; break;
-            case '"': out += "&quot;"; break;
-            case '\'': out += "&#39;"; break;
-            default: out += c;
+        if (c == '<') {
+            out += "\xE2\x80\xB9";
+        } else {
+            out += c;
         }
     }
     return out;
@@ -123,7 +121,7 @@ std::string renderCommandTargetOptions(const std::vector<ConfigObjectSummary>* t
     std::sort(entries.begin(), entries.end());
     std::string body = "{";
     for (const auto& entry : entries) {
-        const std::optional<std::string> text = jsonString(htmlEscape(entry.first));
+        const std::optional<std::string> text = jsonString(withoutTagOpeners(entry.first));
         if (!text) continue;
         if (body.size() > 1) body += ",";
         body += "\"" + entry.second + "\":" + *text;

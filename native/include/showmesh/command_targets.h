@@ -38,7 +38,7 @@ bool parseConfigObjectsList(const std::string& body, std::vector<ConfigObjectSum
 bool isCommandTargetId(const std::string& id);
 
 // Renders {"<id>": "<label> (<show label>)"} ordered by visible text, with
-// the visible text HTML-escaped. targets is null when never fetched; noun
+// each '<' in the visible text replaced by U+2039. targets is null when never fetched; noun
 // is "macros" or "actions" and names the placeholder entry.
 std::string renderCommandTargetOptions(const std::vector<ConfigObjectSummary>* targets,
                                        const std::vector<ConfigObjectSummary>* shows, const std::string& noun);
