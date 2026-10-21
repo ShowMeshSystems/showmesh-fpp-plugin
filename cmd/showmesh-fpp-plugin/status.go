@@ -40,12 +40,16 @@ type statusRecord struct {
 	SchemaVersion int       `json:"schemaVersion"`
 	Timestamp     time.Time `json:"timestamp"`
 	MacroID       string    `json:"macroId"`
-	Class         string    `json:"class"`
+	// ActionID is set instead of MacroID for an "action" attempt.
+	ActionID string `json:"actionId,omitempty"`
+	Class    string `json:"class"`
 	// HTTPStatus is 0 when there was no HTTP response at all (a transport
 	// failure, or a local error that never made a request) — a real,
 	// distinct value, not an omission standing in for "unknown".
 	HTTPStatus int    `json:"httpStatus"`
 	RunID      string `json:"runId,omitempty"`
+	// Outcome is an action's outcome when the coordinator answered: confirmed, failed, refused, unconfirmed, unconfirmable or pending.
+	Outcome string `json:"outcome,omitempty"`
 	// Message is the operator-facing summary: what class this attempt
 	// fell into and why, in the operator's own terms, never a repo path,
 	// doc reference, ADR number, or research-record id. See
@@ -88,7 +92,7 @@ func cmdStatus(args []string, stdout, stderr io.Writer, _ func() time.Time) int 
 	fs.StringVar(&output, "output", outputText, "output format: text|json")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "usage: showmesh-fpp-plugin status [flags]")
-		_, _ = fmt.Fprintln(stderr, "\nPrint the local record of this plugin's most recent macro run attempt.")
+		_, _ = fmt.Fprintln(stderr, "\nPrint the local record of this plugin's most recent macro run or action attempt.")
 		_, _ = fmt.Fprintln(stderr, "Reads only this host's own filesystem; makes no network call.")
 		fs.PrintDefaults()
 	}
@@ -110,7 +114,7 @@ func cmdStatus(args []string, stdout, stderr io.Writer, _ func() time.Time) int 
 		if output == outputJSON {
 			_, _ = fmt.Fprintln(stdout, `{"recorded":false}`)
 		} else {
-			_, _ = fmt.Fprintln(stdout, "no run has been attempted yet; no status record exists")
+			_, _ = fmt.Fprintln(stdout, "no run or action has been attempted yet; no status record exists")
 		}
 		return exitOK
 	}
@@ -124,13 +128,20 @@ func cmdStatus(args []string, stdout, stderr io.Writer, _ func() time.Time) int 
 	}
 
 	_, _ = fmt.Fprintf(stdout, "time:    %s\n", rec.Timestamp.Format(time.RFC3339))
-	_, _ = fmt.Fprintf(stdout, "macro:   %s\n", rec.MacroID)
+	if rec.ActionID != "" {
+		_, _ = fmt.Fprintf(stdout, "action:  %s\n", rec.ActionID)
+	} else {
+		_, _ = fmt.Fprintf(stdout, "macro:   %s\n", rec.MacroID)
+	}
 	_, _ = fmt.Fprintf(stdout, "class:   %s\n", rec.Class)
 	if rec.HTTPStatus != 0 {
 		_, _ = fmt.Fprintf(stdout, "http:    %d\n", rec.HTTPStatus)
 	}
 	if rec.RunID != "" {
 		_, _ = fmt.Fprintf(stdout, "run id:  %s\n", rec.RunID)
+	}
+	if rec.Outcome != "" {
+		_, _ = fmt.Fprintf(stdout, "outcome: %s\n", rec.Outcome)
 	}
 	_, _ = fmt.Fprintf(stdout, "detail:  %s\n", rec.Message)
 	if rec.CredentialDirNote != "" {
