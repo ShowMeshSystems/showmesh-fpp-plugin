@@ -935,7 +935,8 @@ class FallbackExecutor : public showmesh::FallbackActivationRecorder {
         if (programPublished_ && key.usable() && registeredNow() && !enrolled && now >= nextRegistrationAtMillis_) {
             if (registerKey(baseUrl, key.key, now)) nextFetchAtMillis_ = now;
         }
-        if (!stopRequested_.load()) refreshCommandTargets(baseUrl);
+        // Skipped when the fetch could not reach the coordinator, so outage handling is never held up.
+        if (!stopRequested_.load() && lastFetchReachedCoordinator_) refreshCommandTargets(baseUrl);
     }
 
     void refreshCommandTargets(const std::string& baseUrl) {

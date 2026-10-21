@@ -184,6 +184,8 @@ std::string CommandTargetLists::refresh(HttpTransport* transport, CredentialSour
         }
         if (!problem.empty()) {
             problems += (problems.empty() ? "" : "; ") + std::string(kind.first) + ": " + problem;
+            // An unreachable coordinator would only time out again on the next list.
+            if (!response.transportOk) break;
             continue;
         }
         std::lock_guard<std::mutex> lock(mutex_);
