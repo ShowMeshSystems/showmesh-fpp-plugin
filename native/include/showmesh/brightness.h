@@ -184,6 +184,9 @@ class BrightnessEngine {
     // reachable from any FPP action; exposing it there would add a second
     // writer to a value with one owner.
     ValidationResult setGain(int targetPercent, std::int64_t fadeSeconds, TimeMillis now);
+    // setGain on a fixed window in epoch milliseconds: the gain holds until
+    // startMillis and reaches targetPercent at endMillis.
+    ValidationResult setGainBetween(int targetPercent, TimeMillis startMillis, TimeMillis endMillis, TimeMillis now);
 
     double ceilingAt(TimeMillis now) const { return ceiling_.valueAt(now); }
     double ceilingTarget() const { return ceiling_.target(); }
@@ -194,6 +197,7 @@ class BrightnessEngine {
     // the persisted value. 0 when never set.
     TimeMillis ceilingChangedAtMillis() const { return ceilingChangedAtMillis_; }
     double gainAt(TimeMillis now) const { return gain_.valueAt(now); }
+    TimeMillis gainFadeStartMillis() const { return gain_.startMillis(); }
 
     // The composed percentage actually applied to channel data: 0 whenever
     // the weather gate is closed, round(ceiling * gain / 100) otherwise.

@@ -141,6 +141,18 @@ ValidationResult BrightnessEngine::setGain(int targetPercent, std::int64_t fadeS
     return ValidationResult{};
 }
 
+ValidationResult BrightnessEngine::setGainBetween(int targetPercent, TimeMillis startMillis, TimeMillis endMillis,
+                                                  TimeMillis now) {
+    ValidationResult result = validateActionInput(targetPercent, 0);
+    if (!result.ok) return result;
+    if (endMillis - std::max(startMillis, now) > kMaxFadeSeconds * 1000) {
+        return ValidationResult::failure("the fade must be at most 86400 seconds long");
+    }
+    gain_.fadeBetween(static_cast<double>(targetPercent), startMillis, endMillis, now);
+    bumpRevision(now);
+    return ValidationResult{};
+}
+
 int BrightnessEngine::effectivePercentAt(TimeMillis now) const {
     if (gateClosed_) return 0;
     const double composed = ceiling_.valueAt(now) * gain_.valueAt(now) / 100.0;

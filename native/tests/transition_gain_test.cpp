@@ -235,3 +235,57 @@ TEST(ANullEngineIsRefusedRatherThanDereferenced) {
     TransitionGainResponse r = applyTransitionGainRequest(body("50", "0", "req-1"), nullptr, &lastRequestId, kT0);
     CHECK_EQ(r.status, 400);
 }
+
+TEST(AScheduledFadeHoldsUntilItsStartAndEndsOnTime) {
+    Route route;
+    const std::string text = R"({"schemaVersion":1,"targetPercent":0,"fadeSeconds":3,"startsAtMs":)" +
+                             std::to_string(kT0 + 2000) + R"(,"endsAtMs":)" + std::to_string(kT0 + 4500) +
+                             R"(,"requestId":"sched-1"})";
+    TransitionGainResponse r = route.post(text);
+
+    CHECK_EQ(r.status, 200);
+    CHECK(contains(r.body, R"("applied":true)"));
+    CHECK(contains(r.body, R"("endsAtMs":)" + std::to_string(kT0 + 4500)));
+    CHECK(contains(r.body, R"("startsAtMs":)" + std::to_string(kT0 + 2000)));
+    CHECK_EQ(static_cast<int>(route.engine.gainAt(kT0 + 1999)), 100);
+    CHECK_EQ(static_cast<int>(route.engine.gainAt(kT0 + 3250)), 50);
+    CHECK_EQ(static_cast<int>(route.engine.gainAt(kT0 + 4500)), 0);
+}
+
+TEST(AScheduledFadeWhoseStartHasPassedStartsNowAndStillEndsOnTime) {
+    Route route;
+    const std::string text = R"({"schemaVersion":1,"targetPercent":0,"fadeSeconds":2,"startsAtMs":)" +
+                             std::to_string(kT0 - 1000) + R"(,"endsAtMs":)" + std::to_string(kT0 + 1000) +
+                             R"(,"requestId":"sched-2"})";
+    CHECK_EQ(route.post(text).status, 200);
+    CHECK_EQ(static_cast<int>(route.engine.gainAt(kT0)), 100);
+    CHECK_EQ(static_cast<int>(route.engine.gainAt(kT0 + 500)), 50);
+    CHECK_EQ(static_cast<int>(route.engine.gainAt(kT0 + 1000)), 0);
+}
+
+TEST(AScheduledFadeThatAlreadyEndedAppliesAtOnce) {
+    Route route;
+    const std::string text = R"({"schemaVersion":1,"targetPercent":0,"fadeSeconds":2,"endsAtMs":)" +
+                             std::to_string(kT0 - 1) + R"(,"requestId":"sched-3"})";
+    CHECK_EQ(route.post(text).status, 200);
+    CHECK_EQ(static_cast<int>(route.engine.gainAt(kT0)), 0);
+}
+
+TEST(AStartWithoutAnEndIsRefused) {
+    Route route;
+    const std::string text = R"({"schemaVersion":1,"targetPercent":0,"fadeSeconds":2,"startsAtMs":)" +
+                             std::to_string(kT0) + R"(,"requestId":"sched-4"})";
+    TransitionGainResponse r = route.post(text);
+    CHECK_EQ(r.status, 400);
+    CHECK(contains(r.body, "startsAtMs needs endsAtMs"));
+}
+
+TEST(AnImmediateWriteReplacesAScheduledFade) {
+    Route route;
+    const std::string text = R"({"schemaVersion":1,"targetPercent":0,"fadeSeconds":2,"startsAtMs":)" +
+                             std::to_string(kT0 + 2000) + R"(,"endsAtMs":)" + std::to_string(kT0 + 4000) +
+                             R"(,"requestId":"sched-5"})";
+    CHECK_EQ(route.post(text).status, 200);
+    CHECK_EQ(route.post(body("100", "0", "restore-5"), kT0 + 1000).status, 200);
+    CHECK_EQ(static_cast<int>(route.engine.gainAt(kT0 + 3000)), 100);
+}
