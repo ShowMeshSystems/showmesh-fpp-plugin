@@ -40,6 +40,19 @@ class FadingValue {
         endMillis_ = now + durationMillis;
     }
 
+    // Holds the current value until startMillis, then reaches target at
+    // endMillis. A window that has already ended applies target at once.
+    void fadeBetween(double target, TimeMillis startMillis, TimeMillis endMillis, TimeMillis now) {
+        if (endMillis <= now || endMillis <= startMillis) {
+            fadeTo(target, 0, now);
+            return;
+        }
+        start_ = valueAt(now);
+        target_ = target;
+        startMillis_ = startMillis < now ? now : startMillis;
+        endMillis_ = endMillis;
+    }
+
     double valueAt(TimeMillis now) const {
         if (!fading()) {
             return target_;

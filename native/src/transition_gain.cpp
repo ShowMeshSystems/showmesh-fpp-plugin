@@ -34,13 +34,17 @@ TransitionGainResponse refuse(const std::string& detail) {
 // fade is going from and to, read after the write, so a repeat reports the
 // fade already running rather than restarting it.
 TransitionGainResponse renderApplied(bool applied, const BrightnessEngine& engine, int gainStart, int gainTarget,
-                                     long long fadeSeconds, TimeMillis now) {
+                                     long long fadeSeconds, TimeMillis now, TimeMillis endsAtMs = 0) {
     std::vector<json::Value::Member> members;
     members.emplace_back("schemaVersion", json::Value::makeNumber(kTransitionGainSchemaVersion));
     members.emplace_back("applied", json::Value::makeBool(applied));
     members.emplace_back("gainStart", json::Value::makeNumber(gainStart));
     members.emplace_back("gainTarget", json::Value::makeNumber(gainTarget));
     members.emplace_back("fadeSeconds", json::Value::makeNumber(static_cast<double>(fadeSeconds)));
+    if (endsAtMs != 0) {
+        members.emplace_back("startsAtMs", json::Value::makeNumber(static_cast<double>(engine.gainFadeStartMillis())));
+        members.emplace_back("endsAtMs", json::Value::makeNumber(static_cast<double>(endsAtMs)));
+    }
     members.emplace_back("ceiling", json::Value::makeNumber(std::lround(engine.ceilingAt(now))));
     members.emplace_back("effectiveOutput", json::Value::makeNumber(engine.effectivePercentAt(now)));
     json::CanonicalResult rendered = json::canonicalize(json::Value::makeObject(std::move(members)));
@@ -109,6 +113,21 @@ TransitionGainResponse applyTransitionGainRequest(const std::string& body, Brigh
     if (!wholeNumberMember(parsed.value, "targetPercent", &targetPercent, &error)) return refuse(error);
     if (!wholeNumberMember(parsed.value, "fadeSeconds", &fadeSeconds, &error)) return refuse(error);
 
+    // endsAtMs, with an optional startsAtMs, schedules the fade on this
+    // host's clock in epoch milliseconds and takes the place of fadeSeconds.
+    const bool scheduled = memberOf(parsed.value, "endsAtMs") != nullptr;
+    long long startsAtMs = now;
+    long long endsAtMs = 0;
+    if (scheduled) {
+        if (!wholeNumberMember(parsed.value, "endsAtMs", &endsAtMs, &error)) return refuse(error);
+        if (memberOf(parsed.value, "startsAtMs") != nullptr &&
+            !wholeNumberMember(parsed.value, "startsAtMs", &startsAtMs, &error)) {
+            return refuse(error);
+        }
+    } else if (memberOf(parsed.value, "startsAtMs") != nullptr) {
+        return refuse("startsAtMs needs endsAtMs");
+    }
+
     // A repeat of an already-applied id is a no-op that still reports the
     // state, so a caller retrying a response it never saw learns where the
     // fade got to instead of restarting it from wherever it is now.
@@ -120,11 +139,14 @@ TransitionGainResponse applyTransitionGainRequest(const std::string& body, Brigh
     }
 
     const int gainStart = static_cast<int>(std::lround(engine->gainAt(now)));
-    ValidationResult result = engine->setGain(static_cast<int>(targetPercent), fadeSeconds, now);
+    ValidationResult result =
+        scheduled ? engine->setGainBetween(static_cast<int>(targetPercent), startsAtMs, endsAtMs, now)
+                  : engine->setGain(static_cast<int>(targetPercent), fadeSeconds, now);
     if (!result.ok) return refuse(result.error);
 
     *lastRequestId = requestId->string();
-    return renderApplied(true, *engine, gainStart, static_cast<int>(targetPercent), fadeSeconds, now);
+    return renderApplied(true, *engine, gainStart, static_cast<int>(targetPercent), fadeSeconds, now,
+                         scheduled ? endsAtMs : 0);
 }
 
 }  // namespace showmesh
